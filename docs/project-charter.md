@@ -3,7 +3,7 @@
 ## Purpose
 
 Create a native Linux GUI client that implements the Aethos protocol natively (without Swift),
-starting with Ubuntu/Debian and extending to broader desktop/mobile targets later.
+starting with Ubuntu/Debian and extending to broader targets later.
 
 ## Principles
 
@@ -15,17 +15,26 @@ starting with Ubuntu/Debian and extending to broader desktop/mobile targets late
 ## MVP 0 Scope (this repository state)
 
 - Rust GTK GUI scaffold for Linux desktop.
-- Wayfair ID generation in-client.
-- Relay connectivity checks over WebSocket to:
-  - `ws://192.168.1.200:8082`
-  - `ws://192.168.1.200:9082`
+- Wayfair ID generation in-client (UUID v4 placeholder).
+- Relay connectivity checks over WebSocket, derived from configured HTTP relay addresses:
+  - `http://192.168.1.200:8082` -> `ws://192.168.1.200:8082`
+  - `http://192.168.1.200:9082` -> `ws://192.168.1.200:9082`
+- UI status updates for each relay connection attempt.
 - Documentation for next milestones.
+
+## MVP 0 Exit Criteria
+
+- [x] App launches on Linux desktop with GTK.
+- [x] User can generate a Wayfair ID from the GUI.
+- [x] App attempts relay WebSocket connections to both configured endpoints.
+- [x] App surfaces connection status in the GUI for each relay.
+- [x] Project roadmap is documented.
 
 ## Roadmap
 
 ### Milestone 1: Core protocol crate
 
-- Create `aethos-core` module for message models and serialization.
+- Create `aethos-core` for message models and serialization.
 - Add protocol versioning and capability negotiation primitives.
 - Implement deterministic encoding/decoding tests for protocol payloads.
 
@@ -39,7 +48,7 @@ starting with Ubuntu/Debian and extending to broader desktop/mobile targets late
 
 ### Milestone 3: Local identity and storage
 
-- Promote Wayfair ID generation to durable identity lifecycle:
+- Promote Wayfair ID to durable identity lifecycle:
   - Key generation + secure storage.
   - Device profile and peer metadata.
 - Add encrypted local store for session and peer cache.
@@ -61,14 +70,6 @@ starting with Ubuntu/Debian and extending to broader desktop/mobile targets late
 - Debian packaging (`.deb`) and reproducible build pipeline.
 - System integration (desktop files, app icon, auto-start options).
 - Security hardening review and release checklist.
-
-## Engineering checklist
-
-- [ ] Finalize protocol data model from upstream specs.
-- [ ] Finalize relay contract compatibility matrix.
-- [ ] Add unit + integration tests for protocol and relay client.
-- [ ] Add CI checks: `fmt`, `clippy`, tests, build.
-- [ ] Add observability: structured logs + optional tracing.
 
 ## Risks and mitigations
 

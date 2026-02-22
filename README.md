@@ -7,9 +7,17 @@ Native Linux GUI client scaffold for Aethos.
 - Build all Linux work in this repository.
 - Provide a native GUI scaffold for Ubuntu/Debian.
 - Generate a local Wayfair ID.
-- Connect over WebSocket to relay endpoints:
-  - `ws://192.168.1.200:8082`
-  - `ws://192.168.1.200:9082`
+- Communicate with Aethos Relays listening at:
+  - `http://192.168.1.200:8082`
+  - `http://192.168.1.200:9082`
+- Connect over WebSocket to those endpoints (`ws://...` derived from `http://...`).
+
+## Current implementation
+
+- GTK4 desktop UI (Rust).
+- Button to generate a Wayfair ID (UUID v4 for now).
+- Relay status panel showing per-endpoint connection state.
+- Relay probe sends a minimal hello envelope after WebSocket connection.
 
 ## Run
 
@@ -17,8 +25,7 @@ Native Linux GUI client scaffold for Aethos.
 cargo run
 ```
 
-## Notes
+## Next
 
-This is intentionally a minimal MVP scaffold. Protocol-compliant framing, session handling,
-relay contract integration, and peer-to-peer transport orchestration are tracked in
-`docs/project-charter.md`.
+Protocol-compliant message framing, relay contract implementation, identity/key material,
+and peer transport logic are planned in `docs/project-charter.md`.
