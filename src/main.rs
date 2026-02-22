@@ -2,15 +2,18 @@ use gtk4::prelude::*;
 use gtk4::{
     glib, Application, ApplicationWindow, Box as GtkBox, Button, Entry, Label, Orientation,
 };
+use std::net::TcpStream;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
-use tungstenite::{connect, Message};
+use std::time::Duration;
+use tungstenite::{client, Message};
 use url::Url;
 use uuid::Uuid;
 
 const APP_ID: &str = "org.aethos.linux";
 const RELAY_HTTP_PRIMARY: &str = "http://192.168.1.200:8082";
 const RELAY_HTTP_SECONDARY: &str = "http://192.168.1.200:9082";
+const RELAY_CONNECT_TIMEOUT_SECS: u64 = 5;
 
 #[derive(Clone, Debug)]
 struct RelayStatus {
@@ -115,7 +118,7 @@ fn attach_status_poller(
 ) {
     let mut completed = 0;
 
-    glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
+    glib::timeout_add_local(Duration::from_millis(200), move || {
         while let Ok(status) = rx.try_recv() {
             completed += 1;
             let text = format!(
@@ -167,7 +170,29 @@ fn connect_to_relay(relay_ws: &str) -> String {
         return "invalid relay URL".to_string();
     };
 
-    match connect(url.as_str()) {
+    let Some(host) = url.host_str() else {
+        return "relay URL missing host".to_string();
+    };
+
+    let port = url.port_or_known_default().unwrap_or(80);
+
+    let socket_addr = format!("{host}:{port}");
+    let timeout = Duration::from_secs(RELAY_CONNECT_TIMEOUT_SECS);
+
+    let Ok(stream) = TcpStream::connect_timeout(
+        &match socket_addr.parse() {
+            Ok(addr) => addr,
+            Err(err) => return format!("invalid socket address: {err}"),
+        },
+        timeout,
+    ) else {
+        return format!("tcp connection timeout/failure to {socket_addr}");
+    };
+
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+
+    match client(url.as_str(), stream) {
         Ok((mut socket, _response)) => {
             let hello_payload =
                 r#"{"type":"hello","platform":"linux","client":"aethos-linux-mvp0"}"#;
@@ -176,7 +201,7 @@ fn connect_to_relay(relay_ws: &str) -> String {
                 Err(err) => format!("connected; hello send failed: {err}"),
             }
         }
-        Err(err) => format!("connection failed: {err}"),
+        Err(err) => format!("websocket handshake failed: {err}"),
     }
 }
 
