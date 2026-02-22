@@ -15,7 +15,8 @@ Native Linux GUI client scaffold for Aethos.
 ## Current implementation
 
 - GTK4 desktop UI (Rust).
-- Button to generate a Wayfair ID (UUID v4 for now).
+- Button to generate a Wayfair ID (UUID v4 placeholder for MVP0).
+- Editable relay endpoint fields so IP/host values are configurable at runtime.
 - Relay status panel showing per-endpoint connection state.
 - Relay probe sends a minimal hello envelope after WebSocket connection.
 
@@ -24,6 +25,12 @@ Native Linux GUI client scaffold for Aethos.
 ```bash
 cargo run
 ```
+
+## Local relay testing
+
+The default `192.168.1.200` endpoints are only placeholders. In this environment, point the GUI
+relay fields at locally reachable relay instances (for example localhost) and run a relay server
+locally per `aethos-relay` setup instructions.
 
 ## Next
 

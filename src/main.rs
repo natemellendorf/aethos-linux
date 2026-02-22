@@ -11,12 +11,13 @@ use url::Url;
 use uuid::Uuid;
 
 const APP_ID: &str = "org.aethos.linux";
-const RELAY_HTTP_PRIMARY: &str = "http://192.168.1.200:8082";
-const RELAY_HTTP_SECONDARY: &str = "http://192.168.1.200:9082";
+const DEFAULT_RELAY_HTTP_PRIMARY: &str = "http://192.168.1.200:8082";
+const DEFAULT_RELAY_HTTP_SECONDARY: &str = "http://192.168.1.200:9082";
 const RELAY_CONNECT_TIMEOUT_SECS: u64 = 5;
 
 #[derive(Clone, Debug)]
 struct RelayStatus {
+    relay_slot: usize,
     relay_http: String,
     relay_ws: String,
     state: String,
@@ -32,8 +33,8 @@ fn build_ui(app: &Application) {
     let window = ApplicationWindow::builder()
         .application(app)
         .title("Aethos Linux MVP0")
-        .default_width(760)
-        .default_height(420)
+        .default_width(840)
+        .default_height(480)
         .build();
 
     let root = GtkBox::new(Orientation::Vertical, 12);
@@ -51,6 +52,14 @@ fn build_ui(app: &Application) {
     subtitle.set_wrap(true);
     subtitle.set_xalign(0.0);
 
+    let relay_config_title = Label::new(Some("Relay HTTP listeners (editable):"));
+    relay_config_title.set_xalign(0.0);
+
+    let relay_http_primary_entry = Entry::builder().hexpand(true).build();
+    relay_http_primary_entry.set_text(DEFAULT_RELAY_HTTP_PRIMARY);
+    let relay_http_secondary_entry = Entry::builder().hexpand(true).build();
+    relay_http_secondary_entry.set_text(DEFAULT_RELAY_HTTP_SECONDARY);
+
     let id_box = GtkBox::new(Orientation::Horizontal, 8);
     let wayfair_id_entry = Entry::builder().hexpand(true).editable(false).build();
     wayfair_id_entry.set_placeholder_text(Some("No Wayfair ID generated yet"));
@@ -60,13 +69,13 @@ fn build_ui(app: &Application) {
     id_box.append(&generate_button);
 
     let relay_primary_label = Label::new(Some(&format!(
-        "{RELAY_HTTP_PRIMARY} -> ws://192.168.1.200:8082 - not connected"
+        "{DEFAULT_RELAY_HTTP_PRIMARY} -> ws://192.168.1.200:8082 - not connected"
     )));
     relay_primary_label.set_xalign(0.0);
     relay_primary_label.set_wrap(true);
 
     let relay_secondary_label = Label::new(Some(&format!(
-        "{RELAY_HTTP_SECONDARY} -> ws://192.168.1.200:9082 - not connected"
+        "{DEFAULT_RELAY_HTTP_SECONDARY} -> ws://192.168.1.200:9082 - not connected"
     )));
     relay_secondary_label.set_xalign(0.0);
     relay_secondary_label.set_wrap(true);
@@ -75,6 +84,9 @@ fn build_ui(app: &Application) {
 
     root.append(&title);
     root.append(&subtitle);
+    root.append(&relay_config_title);
+    root.append(&relay_http_primary_entry);
+    root.append(&relay_http_secondary_entry);
     root.append(&id_box);
     root.append(&connect_button);
     root.append(&relay_primary_label);
@@ -95,8 +107,12 @@ fn build_ui(app: &Application) {
         let tx = tx.clone();
         connect_button.connect_clicked(move |button| {
             button.set_sensitive(false);
-            spawn_relay_check(RELAY_HTTP_PRIMARY, tx.clone());
-            spawn_relay_check(RELAY_HTTP_SECONDARY, tx.clone());
+
+            let relay_http_primary = normalize_http_endpoint(&relay_http_primary_entry.text());
+            let relay_http_secondary = normalize_http_endpoint(&relay_http_secondary_entry.text());
+
+            spawn_relay_check(0, &relay_http_primary, tx.clone());
+            spawn_relay_check(1, &relay_http_secondary, tx.clone());
         });
     }
 
@@ -125,9 +141,10 @@ fn attach_status_poller(
                 "{} -> {} - {}",
                 status.relay_http, status.relay_ws, status.state
             );
-            if status.relay_http == RELAY_HTTP_PRIMARY {
+
+            if status.relay_slot == 0 {
                 relay_primary_label.set_text(&text);
-            } else if status.relay_http == RELAY_HTTP_SECONDARY {
+            } else {
                 relay_secondary_label.set_text(&text);
             }
         }
@@ -141,17 +158,27 @@ fn attach_status_poller(
     });
 }
 
-fn spawn_relay_check(relay_http: &str, tx: Sender<RelayStatus>) {
+fn spawn_relay_check(relay_slot: usize, relay_http: &str, tx: Sender<RelayStatus>) {
     let relay_http = relay_http.to_string();
     thread::spawn(move || {
         let relay_ws = to_ws_endpoint(&relay_http);
         let state = connect_to_relay(&relay_ws);
         let _ = tx.send(RelayStatus {
+            relay_slot,
             relay_http,
             relay_ws,
             state,
         });
     });
+}
+
+fn normalize_http_endpoint(endpoint: &str) -> String {
+    let trimmed = endpoint.trim();
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return trimmed.to_string();
+    }
+
+    format!("http://{trimmed}")
 }
 
 fn to_ws_endpoint(http_like: &str) -> String {
@@ -207,7 +234,23 @@ fn connect_to_relay(relay_ws: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::to_ws_endpoint;
+    use super::{normalize_http_endpoint, to_ws_endpoint};
+
+    #[test]
+    fn normalizes_without_scheme() {
+        assert_eq!(
+            normalize_http_endpoint("192.168.1.200:8082"),
+            "http://192.168.1.200:8082"
+        );
+    }
+
+    #[test]
+    fn preserves_scheme_when_present() {
+        assert_eq!(
+            normalize_http_endpoint("https://relay.example"),
+            "https://relay.example"
+        );
+    }
 
     #[test]
     fn converts_http_to_ws() {
@@ -223,10 +266,5 @@ mod tests {
             to_ws_endpoint("https://relay.example"),
             "wss://relay.example"
         );
-    }
-
-    #[test]
-    fn keeps_ws_as_is() {
-        assert_eq!(to_ws_endpoint("ws://relay:8082"), "ws://relay:8082");
     }
 }

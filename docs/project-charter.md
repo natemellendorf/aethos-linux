@@ -16,9 +16,8 @@ starting with Ubuntu/Debian and extending to broader targets later.
 
 - Rust GTK GUI scaffold for Linux desktop.
 - Wayfair ID generation in-client (UUID v4 placeholder).
-- Relay connectivity checks over WebSocket, derived from configured HTTP relay addresses:
-  - `http://192.168.1.200:8082` -> `ws://192.168.1.200:8082`
-  - `http://192.168.1.200:9082` -> `ws://192.168.1.200:9082`
+- Relay connectivity checks over WebSocket, derived from configured HTTP relay addresses.
+- Runtime-editable relay endpoint configuration (IP/host and port).
 - UI status updates for each relay connection attempt.
 - Documentation for next milestones.
 
