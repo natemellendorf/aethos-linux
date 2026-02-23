@@ -20,17 +20,61 @@ Native Linux GUI client scaffold for Aethos.
 - Relay status panel showing per-endpoint connection state.
 - Relay probe sends a minimal hello envelope after WebSocket connection.
 
-## Run
+## Prerequisites (Ubuntu/Debian)
+
+Install Rust and GTK4 development packages:
 
 ```bash
+sudo apt update
+sudo apt install -y \
+  build-essential \
+  pkg-config \
+  libgtk-4-dev \
+  libglib2.0-dev \
+  curl
+
+curl https://sh.rustup.rs -sSf | sh -s -- -y
+source "$HOME/.cargo/env"
+```
+
+## Build, run, and test
+
+From this repository root:
+
+```bash
+# Compile
+cargo build
+
+# Run the GUI app
 cargo run
+
+# Run tests
+cargo test
+
+# Formatting / lint checks
+cargo fmt --all
+cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 ## Local relay testing
 
 The default `192.168.1.200` endpoints are only placeholders. In this environment, point the GUI
-relay fields at locally reachable relay instances (for example localhost) and run a relay server
-locally per `aethos-relay` setup instructions.
+relay fields at locally reachable relay instances (for example localhost).
+
+Typical local loop:
+
+```bash
+# Terminal 1: run relay (see aethos-relay README for exact setup)
+# e.g. a local relay listening on 8082/9082
+
+# Terminal 2: run Linux client
+cargo run
+```
+
+Then in the GUI, set relay endpoints to your local relay listeners, for example:
+
+- `http://127.0.0.1:8082`
+- `http://127.0.0.1:9082`
 
 ## Next
 
