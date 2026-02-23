@@ -62,9 +62,9 @@ starting with Ubuntu/Debian and extending to broader targets later.
 
 ### Milestone 4: GUI experience
 
-- Add onboarding flow and identity provisioning UX.
-- Add relay status dashboard and diagnostics.
-- Add conversation/session views for Aethos message exchange.
+- [~] Add onboarding flow and identity provisioning UX (initial onboarding steps + identity rotation UX landed).
+- [~] Add relay status dashboard and diagnostics (tabbed dashboard + diagnostics timeline landed).
+- [~] Add conversation/session views for Aethos message exchange (session list scaffold landed; message exchange pending).
 
 ### Milestone 5: Local radio transports
 
