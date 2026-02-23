@@ -42,6 +42,11 @@ Native Linux GUI client scaffold for Aethos.
 - Added relay diagnostics timeline view to keep a running log of per-relay probe outcomes and dispatcher metadata.
 - Added conversation/session list scaffold to start Milestone 4 session-view groundwork for later message-exchange integration.
 
+## Milestone 5 kickoff
+
+- Added charter-aligned Milestone 5 review and implementation sequence in `docs/milestone-5-kickoff-review.md`.
+- Captured direct-first transport orchestration recommendations before beginning local radio adapter implementation.
+
 ## Identity persistence
 
 Wayfair IDs are stored on disk so they survive app restarts:
