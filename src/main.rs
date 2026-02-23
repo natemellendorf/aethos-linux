@@ -7,12 +7,19 @@ use gtk4::{
     glib, Application, ApplicationWindow, Box as GtkBox, Button, CssProvider, Entry, Label,
     Orientation, STYLE_PROVIDER_PRIORITY_APPLICATION,
 };
+use serde_json::json;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
-use uuid::Uuid;
+use std::time::{Duration, Instant};
 
-use crate::aethos_core::identity_store::{delete_wayfair_id, load_wayfair_id, save_wayfair_id};
-use crate::relay::client::{connect_to_relay, normalize_http_endpoint, to_ws_endpoint};
+use crate::aethos_core::identity_store::{
+    delete_wayfair_id, ensure_local_identity, load_relay_session_cache, regenerate_local_identity,
+    save_relay_session_cache, RelaySessionCache,
+};
+use crate::relay::client::{
+    connect_to_relay, connect_to_relay_with_auth, normalize_http_endpoint, RelayFrame,
+    RelayRequestDispatcher, RelaySessionConfig, RelaySessionManager,
+};
 
 const APP_ID: &str = "org.aethos.linux";
 const DEFAULT_RELAY_HTTP_PRIMARY: &str = "http://192.168.1.200:8082";
@@ -24,6 +31,7 @@ struct RelayStatus {
     relay_http: String,
     relay_ws: String,
     state: String,
+    dispatch: String,
 }
 
 fn main() -> glib::ExitCode {
@@ -37,7 +45,7 @@ fn build_ui(app: &Application) {
 
     let window = ApplicationWindow::builder()
         .application(app)
-        .title("Aethos Linux MVP1")
+        .title("Aethos Waypoint · Linux MVP2")
         .default_width(920)
         .default_height(620)
         .build();
@@ -49,12 +57,12 @@ fn build_ui(app: &Application) {
     root.set_margin_start(20);
     root.set_margin_end(20);
 
-    let header = Label::new(Some("Aethos Waypoint · Linux MVP1"));
+    let header = Label::new(Some("Aethos Waypoint · Linux MVP2"));
     header.add_css_class("header");
     header.set_xalign(0.0);
 
     let subtitle = Label::new(Some(
-        "Cockpit preview: generate identity and probe relay links with native Linux transport.",
+        "Cockpit preview: generate identity and run relay session manager checks with correlation tracking.",
     ));
     subtitle.add_css_class("subtitle");
     subtitle.set_xalign(0.0);
@@ -75,8 +83,8 @@ fn build_ui(app: &Application) {
     let wayfair_id_entry = Entry::builder().hexpand(true).editable(false).build();
     wayfair_id_entry.set_placeholder_text(Some("No Wayfair ID generated yet"));
 
-    if let Ok(Some(existing_id)) = load_wayfair_id() {
-        wayfair_id_entry.set_text(&existing_id);
+    if let Ok(identity) = ensure_local_identity() {
+        wayfair_id_entry.set_text(&identity.wayfair_id);
     }
 
     let generate_button = Button::with_label("Generate Wayfair ID");
@@ -106,6 +114,14 @@ fn build_ui(app: &Application) {
     let connect_button = Button::with_label("Connect to Relays");
     connect_button.add_css_class("action");
 
+    if let Ok(Some(cache)) = load_relay_session_cache() {
+        relay_primary_label.set_text(&format!("Primary relay status: {}", cache.primary_status));
+        relay_secondary_label.set_text(&format!(
+            "Secondary relay status: {}",
+            cache.secondary_status
+        ));
+    }
+
     glass_panel.append(&relay_config_title);
     glass_panel.append(&relay_http_primary_entry);
     glass_panel.append(&relay_http_secondary_entry);
@@ -124,12 +140,9 @@ fn build_ui(app: &Application) {
 
     {
         let wayfair_id_entry = wayfair_id_entry.clone();
-        generate_button.connect_clicked(move |_| {
-            let wayfair_id = Uuid::new_v4().to_string();
-            if let Err(err) = save_wayfair_id(&wayfair_id) {
-                eprintln!("{err}");
-            }
-            wayfair_id_entry.set_text(&wayfair_id);
+        generate_button.connect_clicked(move |_| match regenerate_local_identity() {
+            Ok(identity) => wayfair_id_entry.set_text(&identity.wayfair_id),
+            Err(err) => eprintln!("{err}"),
         });
     }
 
@@ -150,19 +163,21 @@ fn build_ui(app: &Application) {
             button.set_sensitive(false);
 
             if wayfair_id_entry.text().is_empty() {
-                let wayfair_id = Uuid::new_v4().to_string();
-                if let Err(err) = save_wayfair_id(&wayfair_id) {
-                    eprintln!("{err}");
+                match ensure_local_identity() {
+                    Ok(identity) => wayfair_id_entry.set_text(&identity.wayfair_id),
+                    Err(err) => eprintln!("{err}"),
                 }
-                wayfair_id_entry.set_text(&wayfair_id);
             }
 
             let wayfair_id = wayfair_id_entry.text().to_string();
             let relay_http_primary = normalize_http_endpoint(&relay_http_primary_entry.text());
             let relay_http_secondary = normalize_http_endpoint(&relay_http_secondary_entry.text());
 
-            spawn_relay_check(0, &relay_http_primary, &wayfair_id, tx.clone());
-            spawn_relay_check(1, &relay_http_secondary, &wayfair_id, tx.clone());
+            spawn_relay_checks(
+                vec![relay_http_primary, relay_http_secondary],
+                &wayfair_id,
+                tx.clone(),
+            );
         });
     }
 
@@ -176,23 +191,82 @@ fn build_ui(app: &Application) {
     window.present();
 }
 
-fn spawn_relay_check(
-    relay_slot: usize,
-    relay_http: &str,
+fn spawn_relay_checks(
+    relay_http_endpoints: Vec<String>,
     wayfair_id: &str,
     tx: Sender<RelayStatus>,
 ) {
-    let relay_http = relay_http.to_string();
     let wayfair_id = wayfair_id.to_string();
+
     thread::spawn(move || {
-        let relay_ws = to_ws_endpoint(&relay_http);
-        let state = connect_to_relay(&relay_ws, &wayfair_id);
-        let _ = tx.send(RelayStatus {
-            relay_slot,
-            relay_http,
-            relay_ws,
-            state,
-        });
+        let mut session_manager =
+            RelaySessionManager::new(relay_http_endpoints, RelaySessionConfig::default());
+        let mut dispatcher = RelayRequestDispatcher::default();
+
+        let shared_auth = std::env::var("AETHOS_RELAY_AUTH_TOKEN").ok();
+        let relay_count = session_manager.relays().len();
+        for relay_slot in 0..relay_count {
+            session_manager.set_auth_token(relay_slot, shared_auth.clone());
+        }
+
+        let mut completed = 0;
+        while completed < relay_count {
+            let Some(selection) = session_manager.select_relay(Instant::now()) else {
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            };
+
+            let outbound = dispatcher.register_outbound(
+                "hello",
+                json!({"wayfair_id": wayfair_id, "relay_slot": selection.relay_slot}),
+            );
+
+            let state = match selection.auth_token.as_deref() {
+                Some(token) => {
+                    connect_to_relay_with_auth(&selection.relay_ws, &wayfair_id, Some(token))
+                }
+                None => connect_to_relay(&selection.relay_ws, &wayfair_id),
+            };
+
+            if state.starts_with("connected + hello sent") {
+                session_manager.mark_success(selection.relay_slot);
+            } else {
+                session_manager.mark_failure(selection.relay_slot);
+            }
+
+            let response = RelayFrame {
+                correlation_id: outbound.correlation_id,
+                message_type: if state.starts_with("connected + hello sent") {
+                    "hello_ack".to_string()
+                } else {
+                    "hello_error".to_string()
+                },
+                payload: json!({"relay_ws": selection.relay_ws, "state": state}),
+            };
+
+            let dispatch = match dispatcher.resolve_response(response) {
+                Ok(resolved) => {
+                    format!(
+                        "corr={} req={} resp={} pending={} payload={}",
+                        resolved.correlation_id,
+                        resolved.request_message_type,
+                        resolved.response_message_type,
+                        dispatcher.pending_count(),
+                        resolved.payload
+                    )
+                }
+                Err(_) => "dispatcher error: unknown correlation".to_string(),
+            };
+
+            let _ = tx.send(RelayStatus {
+                relay_slot: selection.relay_slot,
+                relay_http: selection.relay_http,
+                relay_ws: selection.relay_ws,
+                state,
+                dispatch,
+            });
+            completed += 1;
+        }
     });
 }
 
@@ -208,8 +282,8 @@ fn attach_status_poller(
         while let Ok(status) = rx.try_recv() {
             completed += 1;
             let text = format!(
-                "{} -> {} · {}",
-                status.relay_http, status.relay_ws, status.state
+                "{} -> {} · {} · {}",
+                status.relay_http, status.relay_ws, status.state, status.dispatch
             );
 
             if status.relay_slot == 0 {
@@ -220,6 +294,15 @@ fn attach_status_poller(
         }
 
         if completed >= 2 {
+            let primary = relay_primary_label.text().to_string();
+            let secondary = relay_secondary_label.text().to_string();
+            if let Err(err) = save_relay_session_cache(&RelaySessionCache {
+                primary_status: primary,
+                secondary_status: secondary,
+            }) {
+                eprintln!("{err}");
+            }
+
             completed = 0;
             connect_button.set_sensitive(true);
         }
