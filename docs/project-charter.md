@@ -56,9 +56,9 @@ starting with Ubuntu/Debian and extending to broader targets later.
 ### Milestone 3: Local identity and storage
 
 - Promote Wayfair ID to durable identity lifecycle:
-  - Key generation + secure storage.
-  - Device profile and peer metadata.
-- Add encrypted local store for session and peer cache.
+  - [x] Key generation + secure storage.
+  - [~] Device profile and peer metadata (device profile landed; peer metadata pending).
+- [~] Add encrypted local store for session and peer cache (session cache landed; peer cache pending).
 
 ### Milestone 4: GUI experience
 

@@ -11,9 +11,11 @@ use serde_json::json;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
-use uuid::Uuid;
 
-use crate::aethos_core::identity_store::{delete_wayfair_id, load_wayfair_id, save_wayfair_id};
+use crate::aethos_core::identity_store::{
+    delete_wayfair_id, ensure_local_identity, load_relay_session_cache, regenerate_local_identity,
+    save_relay_session_cache, RelaySessionCache,
+};
 use crate::relay::client::{
     connect_to_relay, connect_to_relay_with_auth, normalize_http_endpoint, RelayFrame,
     RelayRequestDispatcher, RelaySessionConfig, RelaySessionManager,
@@ -81,8 +83,17 @@ fn build_ui(app: &Application) {
     let wayfair_id_entry = Entry::builder().hexpand(true).editable(false).build();
     wayfair_id_entry.set_placeholder_text(Some("No Wayfair ID generated yet"));
 
-    if let Ok(Some(existing_id)) = load_wayfair_id() {
-        wayfair_id_entry.set_text(&existing_id);
+    let identity_meta_label = Label::new(Some("Identity metadata: unavailable"));
+    identity_meta_label.set_xalign(0.0);
+    identity_meta_label.set_wrap(true);
+
+    if let Ok(identity) = ensure_local_identity() {
+        wayfair_id_entry.set_text(&identity.wayfair_id);
+        let key_preview: String = identity.verifying_key_b64.chars().take(16).collect();
+        identity_meta_label.set_text(&format!(
+            "Identity metadata: device={} · verify_key={}…",
+            identity.device_name, key_preview
+        ));
     }
 
     let generate_button = Button::with_label("Generate Wayfair ID");
@@ -112,10 +123,19 @@ fn build_ui(app: &Application) {
     let connect_button = Button::with_label("Connect to Relays");
     connect_button.add_css_class("action");
 
+    if let Ok(Some(cache)) = load_relay_session_cache() {
+        relay_primary_label.set_text(&format!("Primary relay status: {}", cache.primary_status));
+        relay_secondary_label.set_text(&format!(
+            "Secondary relay status: {}",
+            cache.secondary_status
+        ));
+    }
+
     glass_panel.append(&relay_config_title);
     glass_panel.append(&relay_http_primary_entry);
     glass_panel.append(&relay_http_secondary_entry);
     glass_panel.append(&id_box);
+    glass_panel.append(&identity_meta_label);
     glass_panel.append(&identity_notice);
     glass_panel.append(&connect_button);
     glass_panel.append(&relay_primary_label);
@@ -130,37 +150,52 @@ fn build_ui(app: &Application) {
 
     {
         let wayfair_id_entry = wayfair_id_entry.clone();
-        generate_button.connect_clicked(move |_| {
-            let wayfair_id = Uuid::new_v4().to_string();
-            if let Err(err) = save_wayfair_id(&wayfair_id) {
-                eprintln!("{err}");
+        let identity_meta_label = identity_meta_label.clone();
+        generate_button.connect_clicked(move |_| match regenerate_local_identity() {
+            Ok(identity) => {
+                let key_preview: String = identity.verifying_key_b64.chars().take(16).collect();
+                wayfair_id_entry.set_text(&identity.wayfair_id);
+                identity_meta_label.set_text(&format!(
+                    "Identity metadata: device={} · verify_key={}…",
+                    identity.device_name, key_preview
+                ));
             }
-            wayfair_id_entry.set_text(&wayfair_id);
+            Err(err) => eprintln!("{err}"),
         });
     }
 
     {
         let wayfair_id_entry = wayfair_id_entry.clone();
+        let identity_meta_label = identity_meta_label.clone();
         delete_button.connect_clicked(move |_| {
             if let Err(err) = delete_wayfair_id() {
                 eprintln!("{err}");
             }
             wayfair_id_entry.set_text("");
+            identity_meta_label.set_text("Identity metadata: unavailable");
         });
     }
 
     {
         let tx = tx.clone();
         let wayfair_id_entry = wayfair_id_entry.clone();
+        let identity_meta_label = identity_meta_label.clone();
         connect_button.connect_clicked(move |button| {
             button.set_sensitive(false);
 
             if wayfair_id_entry.text().is_empty() {
-                let wayfair_id = Uuid::new_v4().to_string();
-                if let Err(err) = save_wayfair_id(&wayfair_id) {
-                    eprintln!("{err}");
+                match ensure_local_identity() {
+                    Ok(identity) => {
+                        let key_preview: String =
+                            identity.verifying_key_b64.chars().take(16).collect();
+                        wayfair_id_entry.set_text(&identity.wayfair_id);
+                        identity_meta_label.set_text(&format!(
+                            "Identity metadata: device={} · verify_key={}…",
+                            identity.device_name, key_preview
+                        ));
+                    }
+                    Err(err) => eprintln!("{err}"),
                 }
-                wayfair_id_entry.set_text(&wayfair_id);
             }
 
             let wayfair_id = wayfair_id_entry.text().to_string();
@@ -288,6 +323,15 @@ fn attach_status_poller(
         }
 
         if completed >= 2 {
+            let primary = relay_primary_label.text().to_string();
+            let secondary = relay_secondary_label.text().to_string();
+            if let Err(err) = save_relay_session_cache(&RelaySessionCache {
+                primary_status: primary,
+                secondary_status: secondary,
+            }) {
+                eprintln!("{err}");
+            }
+
             completed = 0;
             connect_button.set_sensitive(true);
         }

@@ -28,6 +28,13 @@ Native Linux GUI client scaffold for Aethos.
 - Added request/response dispatcher primitives with correlation IDs and pending request tracking.
 - Wired the GUI relay check path through session manager selection + dispatcher correlation logging so Milestone 2 primitives are exercised at runtime.
 
+
+## Milestone 3 progress
+
+- Promoted identity persistence to include a generated Ed25519 signing key stored alongside Wayfair ID metadata with secure file permissions on Linux (0600).
+- Added device profile persistence (device name + platform) as part of local identity lifecycle records.
+- Added encrypted local relay session cache storage using ChaCha20-Poly1305 at rest, keyed from local identity material.
+
 ## Identity persistence
 
 Wayfair IDs are stored on disk so they survive app restarts:
