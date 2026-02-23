@@ -1,19 +1,21 @@
+mod aethos_core;
+mod relay;
+
+use gtk4::gdk::Display;
 use gtk4::prelude::*;
 use gtk4::{
-    glib, Application, ApplicationWindow, Box as GtkBox, Button, Entry, Label, Orientation,
+    glib, Application, ApplicationWindow, Box as GtkBox, Button, CssProvider, Entry, Label,
+    Orientation, STYLE_PROVIDER_PRIORITY_APPLICATION,
 };
-use std::net::TcpStream;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
-use std::time::Duration;
-use tungstenite::{client, Message};
-use url::Url;
 use uuid::Uuid;
+
+use crate::relay::client::{connect_to_relay, normalize_http_endpoint, to_ws_endpoint};
 
 const APP_ID: &str = "org.aethos.linux";
 const DEFAULT_RELAY_HTTP_PRIMARY: &str = "http://192.168.1.200:8082";
 const DEFAULT_RELAY_HTTP_SECONDARY: &str = "http://192.168.1.200:9082";
-const RELAY_CONNECT_TIMEOUT_SECS: u64 = 5;
 
 #[derive(Clone, Debug)]
 struct RelayStatus {
@@ -30,27 +32,35 @@ fn main() -> glib::ExitCode {
 }
 
 fn build_ui(app: &Application) {
+    apply_styles();
+
     let window = ApplicationWindow::builder()
         .application(app)
-        .title("Aethos Linux MVP0")
-        .default_width(840)
-        .default_height(480)
+        .title("Aethos Linux MVP1")
+        .default_width(900)
+        .default_height(560)
         .build();
 
     let root = GtkBox::new(Orientation::Vertical, 12);
-    root.set_margin_top(16);
-    root.set_margin_bottom(16);
-    root.set_margin_start(16);
-    root.set_margin_end(16);
+    root.add_css_class("root");
+    root.set_margin_top(20);
+    root.set_margin_bottom(20);
+    root.set_margin_start(20);
+    root.set_margin_end(20);
 
-    let title = Label::new(Some("Aethos Linux Client (MVP 0)"));
-    title.add_css_class("title-2");
+    let header = Label::new(Some("Aethos Waypoint · Linux MVP1"));
+    header.add_css_class("header");
+    header.set_xalign(0.0);
 
     let subtitle = Label::new(Some(
-        "Generate a Wayfair ID and connect over WebSocket to configured Aethos relay endpoints.",
+        "Cockpit preview: generate identity and probe relay links with native Linux transport.",
     ));
-    subtitle.set_wrap(true);
+    subtitle.add_css_class("subtitle");
     subtitle.set_xalign(0.0);
+    subtitle.set_wrap(true);
+
+    let glass_panel = GtkBox::new(Orientation::Vertical, 10);
+    glass_panel.add_css_class("glass-panel");
 
     let relay_config_title = Label::new(Some("Relay HTTP listeners (editable):"));
     relay_config_title.set_xalign(0.0);
@@ -64,34 +74,33 @@ fn build_ui(app: &Application) {
     let wayfair_id_entry = Entry::builder().hexpand(true).editable(false).build();
     wayfair_id_entry.set_placeholder_text(Some("No Wayfair ID generated yet"));
     let generate_button = Button::with_label("Generate Wayfair ID");
+    generate_button.add_css_class("action");
 
     id_box.append(&wayfair_id_entry);
     id_box.append(&generate_button);
 
-    let relay_primary_label = Label::new(Some(&format!(
-        "{DEFAULT_RELAY_HTTP_PRIMARY} -> ws://192.168.1.200:8082 - not connected"
-    )));
+    let relay_primary_label = Label::new(Some("Primary relay status: idle"));
     relay_primary_label.set_xalign(0.0);
     relay_primary_label.set_wrap(true);
 
-    let relay_secondary_label = Label::new(Some(&format!(
-        "{DEFAULT_RELAY_HTTP_SECONDARY} -> ws://192.168.1.200:9082 - not connected"
-    )));
+    let relay_secondary_label = Label::new(Some("Secondary relay status: idle"));
     relay_secondary_label.set_xalign(0.0);
     relay_secondary_label.set_wrap(true);
 
     let connect_button = Button::with_label("Connect to Relays");
+    connect_button.add_css_class("action");
 
-    root.append(&title);
+    glass_panel.append(&relay_config_title);
+    glass_panel.append(&relay_http_primary_entry);
+    glass_panel.append(&relay_http_secondary_entry);
+    glass_panel.append(&id_box);
+    glass_panel.append(&connect_button);
+    glass_panel.append(&relay_primary_label);
+    glass_panel.append(&relay_secondary_label);
+
+    root.append(&header);
     root.append(&subtitle);
-    root.append(&relay_config_title);
-    root.append(&relay_http_primary_entry);
-    root.append(&relay_http_secondary_entry);
-    root.append(&id_box);
-    root.append(&connect_button);
-    root.append(&relay_primary_label);
-    root.append(&relay_secondary_label);
-
+    root.append(&glass_panel);
     window.set_child(Some(&root));
 
     let (tx, rx) = channel::<RelayStatus>();
@@ -105,14 +114,20 @@ fn build_ui(app: &Application) {
 
     {
         let tx = tx.clone();
+        let wayfair_id_entry = wayfair_id_entry.clone();
         connect_button.connect_clicked(move |button| {
             button.set_sensitive(false);
 
+            if wayfair_id_entry.text().is_empty() {
+                wayfair_id_entry.set_text(&Uuid::new_v4().to_string());
+            }
+
+            let wayfair_id = wayfair_id_entry.text().to_string();
             let relay_http_primary = normalize_http_endpoint(&relay_http_primary_entry.text());
             let relay_http_secondary = normalize_http_endpoint(&relay_http_secondary_entry.text());
 
-            spawn_relay_check(0, &relay_http_primary, tx.clone());
-            spawn_relay_check(1, &relay_http_secondary, tx.clone());
+            spawn_relay_check(0, &relay_http_primary, &wayfair_id, tx.clone());
+            spawn_relay_check(1, &relay_http_secondary, &wayfair_id, tx.clone());
         });
     }
 
@@ -126,6 +141,26 @@ fn build_ui(app: &Application) {
     window.present();
 }
 
+fn spawn_relay_check(
+    relay_slot: usize,
+    relay_http: &str,
+    wayfair_id: &str,
+    tx: Sender<RelayStatus>,
+) {
+    let relay_http = relay_http.to_string();
+    let wayfair_id = wayfair_id.to_string();
+    thread::spawn(move || {
+        let relay_ws = to_ws_endpoint(&relay_http);
+        let state = connect_to_relay(&relay_ws, &wayfair_id);
+        let _ = tx.send(RelayStatus {
+            relay_slot,
+            relay_http,
+            relay_ws,
+            state,
+        });
+    });
+}
+
 fn attach_status_poller(
     rx: Receiver<RelayStatus>,
     connect_button: Button,
@@ -134,18 +169,18 @@ fn attach_status_poller(
 ) {
     let mut completed = 0;
 
-    glib::timeout_add_local(Duration::from_millis(200), move || {
+    glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
         while let Ok(status) = rx.try_recv() {
             completed += 1;
             let text = format!(
-                "{} -> {} - {}",
+                "{} -> {} · {}",
                 status.relay_http, status.relay_ws, status.state
             );
 
             if status.relay_slot == 0 {
-                relay_primary_label.set_text(&text);
+                relay_primary_label.set_text(&format!("Primary relay status: {text}"));
             } else {
-                relay_secondary_label.set_text(&text);
+                relay_secondary_label.set_text(&format!("Secondary relay status: {text}"));
             }
         }
 
@@ -158,113 +193,61 @@ fn attach_status_poller(
     });
 }
 
-fn spawn_relay_check(relay_slot: usize, relay_http: &str, tx: Sender<RelayStatus>) {
-    let relay_http = relay_http.to_string();
-    thread::spawn(move || {
-        let relay_ws = to_ws_endpoint(&relay_http);
-        let state = connect_to_relay(&relay_ws);
-        let _ = tx.send(RelayStatus {
-            relay_slot,
-            relay_http,
-            relay_ws,
-            state,
-        });
-    });
-}
-
-fn normalize_http_endpoint(endpoint: &str) -> String {
-    let trimmed = endpoint.trim();
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        return trimmed.to_string();
-    }
-
-    format!("http://{trimmed}")
-}
-
-fn to_ws_endpoint(http_like: &str) -> String {
-    if let Some(stripped) = http_like.strip_prefix("http://") {
-        return format!("ws://{stripped}");
-    }
-    if let Some(stripped) = http_like.strip_prefix("https://") {
-        return format!("wss://{stripped}");
-    }
-
-    http_like.to_string()
-}
-
-fn connect_to_relay(relay_ws: &str) -> String {
-    let Ok(url) = Url::parse(relay_ws) else {
-        return "invalid relay URL".to_string();
-    };
-
-    let Some(host) = url.host_str() else {
-        return "relay URL missing host".to_string();
-    };
-
-    let port = url.port_or_known_default().unwrap_or(80);
-
-    let socket_addr = format!("{host}:{port}");
-    let timeout = Duration::from_secs(RELAY_CONNECT_TIMEOUT_SECS);
-
-    let Ok(stream) = TcpStream::connect_timeout(
-        &match socket_addr.parse() {
-            Ok(addr) => addr,
-            Err(err) => return format!("invalid socket address: {err}"),
-        },
-        timeout,
-    ) else {
-        return format!("tcp connection timeout/failure to {socket_addr}");
-    };
-
-    let _ = stream.set_read_timeout(Some(timeout));
-    let _ = stream.set_write_timeout(Some(timeout));
-
-    match client(url.as_str(), stream) {
-        Ok((mut socket, _response)) => {
-            let hello_payload =
-                r#"{"type":"hello","platform":"linux","client":"aethos-linux-mvp0"}"#;
-            match socket.send(Message::Text(hello_payload.into())) {
-                Ok(_) => "connected + hello sent".to_string(),
-                Err(err) => format!("connected; hello send failed: {err}"),
-            }
+fn apply_styles() {
+    let provider = CssProvider::new();
+    provider.load_from_data(
+        "
+        window {
+            background: radial-gradient(circle at top left, #263f76, #1a2147 45%, #111632 75%, #0d1022 100%);
+            color: #e4efff;
         }
-        Err(err) => format!("websocket handshake failed: {err}"),
-    }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::{normalize_http_endpoint, to_ws_endpoint};
+        .root {
+            background: transparent;
+        }
 
-    #[test]
-    fn normalizes_without_scheme() {
-        assert_eq!(
-            normalize_http_endpoint("192.168.1.200:8082"),
-            "http://192.168.1.200:8082"
-        );
-    }
+        .header {
+            font-size: 30px;
+            font-weight: 800;
+            color: #e8f1ff;
+        }
 
-    #[test]
-    fn preserves_scheme_when_present() {
-        assert_eq!(
-            normalize_http_endpoint("https://relay.example"),
-            "https://relay.example"
-        );
-    }
+        .subtitle {
+            font-size: 15px;
+            color: rgba(221, 233, 255, 0.85);
+        }
 
-    #[test]
-    fn converts_http_to_ws() {
-        assert_eq!(
-            to_ws_endpoint("http://192.168.1.200:8082"),
-            "ws://192.168.1.200:8082"
-        );
-    }
+        .glass-panel {
+            border-radius: 18px;
+            padding: 18px;
+            border: 1px solid rgba(214, 230, 255, 0.35);
+            background: linear-gradient(135deg, rgba(139, 176, 255, 0.18), rgba(126, 95, 255, 0.12));
+            box-shadow: 0 8px 18px rgba(15, 19, 40, 0.35);
+        }
 
-    #[test]
-    fn converts_https_to_wss() {
-        assert_eq!(
-            to_ws_endpoint("https://relay.example"),
-            "wss://relay.example"
+        entry {
+            border-radius: 10px;
+            border: 1px solid rgba(204, 221, 255, 0.4);
+            background: rgba(11, 18, 39, 0.5);
+            color: #eff6ff;
+        }
+
+        button.action {
+            border-radius: 10px;
+            border: 1px solid rgba(194, 218, 255, 0.45);
+            background: linear-gradient(90deg, rgba(120, 159, 255, 0.35), rgba(146, 120, 255, 0.25));
+            color: #ecf5ff;
+            font-weight: 700;
+            padding: 8px 12px;
+        }
+        ",
+    );
+
+    if let Some(display) = Display::default() {
+        gtk4::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
     }
 }

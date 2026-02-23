@@ -31,6 +31,14 @@ starting with Ubuntu/Debian and extending to broader targets later.
 
 ## Roadmap
 
+### Milestone 1a: MVP1 module split (in progress)
+
+- [x] Create `aethos_core::protocol` for hello envelope schema + serialization.
+- [x] Create `relay::client` for endpoint normalization and relay probe transport logic.
+- [x] Wire GUI to use module APIs instead of inline transport/protocol code.
+- [x] Add initial cockpit/glass visual direction pass for Linux desktop UI.
+
+
 ### Milestone 1: Core protocol crate
 
 - Create `aethos-core` for message models and serialization.

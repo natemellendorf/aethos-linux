@@ -10,15 +10,27 @@ Native Linux GUI client scaffold for Aethos.
 - Communicate with Aethos Relays listening at:
   - `http://192.168.1.200:8082`
   - `http://192.168.1.200:9082`
-- Connect over WebSocket to those endpoints (`ws://...` derived from `http://...`).
+- Connect over WebSocket to those endpoints using `/ws` (`ws://.../ws` derived from `http://...`).
 
-## Current implementation
+## MVP 1 progress
 
-- GTK4 desktop UI (Rust).
-- Button to generate a Wayfair ID (UUID v4 placeholder for MVP0).
-- Editable relay endpoint fields so IP/host values are configurable at runtime.
-- Relay status panel showing per-endpoint connection state.
-- Relay probe sends a minimal hello envelope after WebSocket connection.
+- Introduced `aethos_core` module for protocol message scaffolding.
+- Introduced `relay` module for endpoint normalization, `/ws` WS derivation, and relay transport probing.
+- Hello envelope now includes a Wayfair ID and serializes as JSON before send.
+- Applied first-pass cockpit/glass visual theme (blue/purple gradients + glass panel styling).
+
+## Project layout
+
+```text
+src/
+  aethos_core/
+    mod.rs
+    protocol.rs
+  relay/
+    mod.rs
+    client.rs
+  main.rs
+```
 
 ## Prerequisites (Ubuntu/Debian)
 
@@ -58,25 +70,21 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 ## Local relay testing
 
-The default `192.168.1.200` endpoints are only placeholders. In this environment, point the GUI
-relay fields at locally reachable relay instances (for example localhost).
-
-Typical local loop:
-
-```bash
-# Terminal 1: run relay (see aethos-relay README for exact setup)
-# e.g. a local relay listening on 8082/9082
-
-# Terminal 2: run Linux client
-cargo run
-```
-
-Then in the GUI, set relay endpoints to your local relay listeners, for example:
+The default `192.168.1.200` endpoints are placeholders. In local/dev environments,
+point the GUI relay fields to reachable listeners, for example:
 
 - `http://127.0.0.1:8082`
 - `http://127.0.0.1:9082`
 
+Relay terminals and startup details should follow the `aethos-relay` README setup.
+
+## Design reference
+
+Art direction notes are tracked in:
+
+- `docs/design/art-style-reference.md`
+
 ## Next
 
 Protocol-compliant message framing, relay contract implementation, identity/key material,
-and peer transport logic are planned in `docs/project-charter.md`.
+and peer transport logic are tracked in `docs/project-charter.md`.
