@@ -47,11 +47,11 @@ starting with Ubuntu/Debian and extending to broader targets later.
 
 ### Milestone 2: Relay client
 
-- Build resilient relay session manager:
-  - Reconnect with backoff.
-  - Relay failover and health scoring.
-  - Auth/session token support when contract requires it.
-- Implement request/response dispatcher and correlation IDs.
+- [x] Build resilient relay session manager:
+  - [x] Reconnect with backoff.
+  - [x] Relay failover and health scoring.
+  - [x] Auth/session token support when contract requires it.
+- [x] Implement request/response dispatcher and correlation IDs.
 
 ### Milestone 3: Local identity and storage
 
