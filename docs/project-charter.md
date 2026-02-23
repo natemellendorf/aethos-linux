@@ -47,24 +47,24 @@ starting with Ubuntu/Debian and extending to broader targets later.
 
 ### Milestone 2: Relay client
 
-- Build resilient relay session manager:
-  - Reconnect with backoff.
-  - Relay failover and health scoring.
-  - Auth/session token support when contract requires it.
-- Implement request/response dispatcher and correlation IDs.
+- [x] Build resilient relay session manager:
+  - [x] Reconnect with backoff.
+  - [x] Relay failover and health scoring.
+  - [x] Auth/session token support when contract requires it.
+- [x] Implement request/response dispatcher and correlation IDs.
 
 ### Milestone 3: Local identity and storage
 
 - Promote Wayfair ID to durable identity lifecycle:
-  - Key generation + secure storage.
-  - Device profile and peer metadata.
-- Add encrypted local store for session and peer cache.
+  - [x] Key generation + secure storage.
+  - [~] Device profile and peer metadata (device profile landed; peer metadata pending).
+- [~] Add encrypted local store for session and peer cache (session cache landed; peer cache pending).
 
 ### Milestone 4: GUI experience
 
-- Add onboarding flow and identity provisioning UX.
-- Add relay status dashboard and diagnostics.
-- Add conversation/session views for Aethos message exchange.
+- [~] Add onboarding flow and identity provisioning UX (initial onboarding steps + identity rotation UX landed).
+- [~] Add relay status dashboard and diagnostics (tabbed dashboard + diagnostics timeline landed).
+- [~] Add conversation/session views for Aethos message exchange (session list scaffold landed; message exchange pending).
 
 ### Milestone 5: Local radio transports
 

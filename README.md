@@ -21,6 +21,27 @@ Native Linux GUI client scaffold for Aethos.
 - UI includes explicit delete action and warning about key backup/data loss implications.
 - Applied first-pass cockpit/glass visual theme (blue/purple gradients + glass panel styling).
 
+## Milestone 2 progress
+
+- Added relay session manager primitives with reconnect backoff, failover scheduling, and relay health scoring.
+- Added per-relay auth/session token plumbing for WS handshake authorization headers.
+- Added request/response dispatcher primitives with correlation IDs and pending request tracking.
+- Wired the GUI relay check path through session manager selection + dispatcher correlation logging so Milestone 2 primitives are exercised at runtime.
+
+
+## Milestone 3 progress
+
+- Promoted identity persistence to include a generated Ed25519 signing key stored alongside Wayfair ID metadata with secure file permissions on Linux (0600).
+- Added device profile persistence (device name + platform) as part of local identity lifecycle records.
+- Added encrypted local relay session cache storage using ChaCha20-Poly1305 at rest, keyed from local identity material.
+
+## Milestone 4 progress
+
+- Added a tabbed GUI flow with dedicated Onboarding, Relay Dashboard, and Sessions views.
+- Added onboarding progression UX that surfaces identity provisioning state and allows explicit transition into diagnostics.
+- Added relay diagnostics timeline view to keep a running log of per-relay probe outcomes and dispatcher metadata.
+- Added conversation/session list scaffold to start Milestone 4 session-view groundwork for later message-exchange integration.
+
 ## Identity persistence
 
 Wayfair IDs are stored on disk so they survive app restarts:
