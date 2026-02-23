@@ -37,8 +37,9 @@ Native Linux GUI client scaffold for Aethos.
 
 ## Milestone 4 progress
 
-- Added a tabbed GUI flow with dedicated Onboarding, Relay Dashboard, and Sessions views.
+- Upgraded GUI shell toward iOS parity with five primary tabs: Home, Peers, Inbox, Compose, and Console.
 - Added onboarding progression UX that surfaces identity provisioning state and allows explicit transition into diagnostics.
+- Console now consolidates identity provisioning + relay diagnostics, while Home surfaces high-level runtime summary status.
 - Added relay diagnostics timeline view to keep a running log of per-relay probe outcomes and dispatcher metadata.
 - Added conversation/session list scaffold to start Milestone 4 session-view groundwork for later message-exchange integration.
 

@@ -46,9 +46,9 @@ fn build_ui(app: &Application) {
 
     let window = ApplicationWindow::builder()
         .application(app)
-        .title("Aethos Waypoint · Linux MVP4 Preview")
-        .default_width(980)
-        .default_height(680)
+        .title("Aethos Waypoint · Linux Wayfarer Shell")
+        .default_width(1100)
+        .default_height(760)
         .build();
 
     let root = GtkBox::new(Orientation::Vertical, 12);
@@ -58,12 +58,12 @@ fn build_ui(app: &Application) {
     root.set_margin_start(20);
     root.set_margin_end(20);
 
-    let header = Label::new(Some("Aethos Waypoint · Linux MVP4 Preview"));
+    let header = Label::new(Some("Aethos Waypoint · Linux Wayfarer Shell"));
     header.add_css_class("header");
     header.set_xalign(0.0);
 
     let subtitle = Label::new(Some(
-        "Onboarding + relay diagnostics dashboard + conversation preview (Milestone 4 incremental pass).",
+        "Paralleling iOS app flow: Home · Peers · Inbox · Compose · Console.",
     ));
     subtitle.add_css_class("subtitle");
     subtitle.set_xalign(0.0);
@@ -77,15 +77,147 @@ fn build_ui(app: &Application) {
     views.set_vexpand(true);
     tab_switcher.set_stack(Some(&views));
 
-    let onboarding_panel = GtkBox::new(Orientation::Vertical, 10);
-    onboarding_panel.add_css_class("glass-panel");
+    let home_panel = GtkBox::new(Orientation::Vertical, 10);
+    home_panel.add_css_class("glass-panel");
 
-    let onboarding_title = Label::new(Some("Onboarding"));
-    onboarding_title.add_css_class("section-title");
-    onboarding_title.set_xalign(0.0);
+    let home_title = Label::new(Some("Home"));
+    home_title.add_css_class("section-title");
+    home_title.set_xalign(0.0);
+
+    let home_hint = Label::new(Some(
+        "Cockpit summary view mirroring iOS: identity, relay state, peers, and transfer queues.",
+    ));
+    home_hint.set_xalign(0.0);
+    home_hint.set_wrap(true);
+
+    let home_identity = Label::new(Some("Local Wayfarer ID: not provisioned"));
+    home_identity.set_xalign(0.0);
+
+    let home_connectivity = Label::new(Some("Relay connectivity: idle"));
+    home_connectivity.set_xalign(0.0);
+
+    let home_peer_count = Label::new(Some("Peers: 3 known · 1 recently active"));
+    home_peer_count.set_xalign(0.0);
+
+    let home_transfer_count = Label::new(Some("Transfers: outbound 0 · inbound 0"));
+    home_transfer_count.set_xalign(0.0);
+
+    home_panel.append(&home_title);
+    home_panel.append(&home_hint);
+    home_panel.append(&home_identity);
+    home_panel.append(&home_connectivity);
+    home_panel.append(&home_peer_count);
+    home_panel.append(&home_transfer_count);
+
+    let peers_panel = GtkBox::new(Orientation::Vertical, 10);
+    peers_panel.add_css_class("glass-panel");
+
+    let peers_title = Label::new(Some("Peers"));
+    peers_title.add_css_class("section-title");
+    peers_title.set_xalign(0.0);
+
+    let peers_hint = Label::new(Some(
+        "Grouped peer roster preview (freshness buckets + identity entrypoint).",
+    ));
+    peers_hint.set_xalign(0.0);
+
+    let peers_list = ListBox::new();
+    peers_list.add_css_class("session-list");
+    for peer_row in [
+        "fresh · field-node-17 · wayfair_id=wf-17 · seen=30s ago",
+        "active · ops-bridge · wayfair_id=wf-ops · seen=12m ago",
+        "stale · archive-proxy · wayfair_id=wf-arch · seen=2d ago",
+    ] {
+        let row = ListBoxRow::new();
+        row.set_selectable(false);
+        let label = Label::new(Some(peer_row));
+        label.set_xalign(0.0);
+        label.set_margin_top(6);
+        label.set_margin_bottom(6);
+        row.set_child(Some(&label));
+        peers_list.append(&row);
+    }
+
+    peers_panel.append(&peers_title);
+    peers_panel.append(&peers_hint);
+    peers_panel.append(&peers_list);
+
+    let inbox_panel = GtkBox::new(Orientation::Vertical, 10);
+    inbox_panel.add_css_class("glass-panel");
+
+    let inbox_title = Label::new(Some("Inbox"));
+    inbox_title.add_css_class("section-title");
+    inbox_title.set_xalign(0.0);
+
+    let inbox_hint = Label::new(Some(
+        "Transfer history grouped by lifecycle state (queued/sending/receiving/delivered).",
+    ));
+    inbox_hint.set_xalign(0.0);
+    inbox_hint.set_wrap(true);
+
+    let inbox_list = ListBox::new();
+    inbox_list.add_css_class("session-list");
+    for transfer_row in [
+        "delivered · tx#2026-001 · from field-node-17 · 4.2 MB",
+        "receiving · tx#2026-004 · from ops-bridge · 18.1 MB",
+        "queued outbound · tx#2026-005 · to wf-ops · 1 attachment",
+    ] {
+        let row = ListBoxRow::new();
+        row.set_selectable(false);
+        let label = Label::new(Some(transfer_row));
+        label.set_xalign(0.0);
+        label.set_margin_top(6);
+        label.set_margin_bottom(6);
+        row.set_child(Some(&label));
+        inbox_list.append(&row);
+    }
+
+    inbox_panel.append(&inbox_title);
+    inbox_panel.append(&inbox_hint);
+    inbox_panel.append(&inbox_list);
+
+    let compose_panel = GtkBox::new(Orientation::Vertical, 10);
+    compose_panel.add_css_class("glass-panel");
+
+    let compose_title = Label::new(Some("Compose"));
+    compose_title.add_css_class("section-title");
+    compose_title.set_xalign(0.0);
+
+    let compose_hint = Label::new(Some(
+        "File-send flow preview: destination + payload note + queued status signal.",
+    ));
+    compose_hint.set_xalign(0.0);
+    compose_hint.set_wrap(true);
+
+    let destination_entry = Entry::builder().hexpand(true).build();
+    destination_entry.set_placeholder_text(Some("Destination Wayfarer ID"));
+
+    let payload_entry = Entry::builder().hexpand(true).build();
+    payload_entry.set_placeholder_text(Some("Payload/file note"));
+
+    let compose_send = Button::with_label("Queue Transfer");
+    compose_send.add_css_class("action");
+
+    let compose_status = Label::new(Some("Compose status: waiting"));
+    compose_status.set_xalign(0.0);
+    compose_status.set_wrap(true);
+
+    compose_panel.append(&compose_title);
+    compose_panel.append(&compose_hint);
+    compose_panel.append(&destination_entry);
+    compose_panel.append(&payload_entry);
+    compose_panel.append(&compose_send);
+    compose_panel.append(&compose_status);
+
+    let console_panel = GtkBox::new(Orientation::Vertical, 10);
+    console_panel.add_css_class("glass-panel");
+
+    let console_title = Label::new(Some("Console"));
+    console_title.add_css_class("section-title");
+    console_title.set_xalign(0.0);
 
     let onboarding_status = Label::new(Some(
-        "Step 1/2 · Provision identity (or regenerate if rotating devices).",
+        "Identity provisioning: Step 1/2 · Generate identity (or rotate if needed).",
     ));
     onboarding_status.set_xalign(0.0);
     onboarding_status.set_wrap(true);
@@ -93,10 +225,6 @@ fn build_ui(app: &Application) {
     let id_box = GtkBox::new(Orientation::Horizontal, 8);
     let wayfair_id_entry = Entry::builder().hexpand(true).editable(false).build();
     wayfair_id_entry.set_placeholder_text(Some("No Wayfair ID generated yet"));
-
-    let identity_meta_label = Label::new(Some("Identity metadata: unavailable"));
-    identity_meta_label.set_xalign(0.0);
-    identity_meta_label.set_wrap(true);
 
     let generate_button = Button::with_label("Generate / Rotate Identity");
     generate_button.add_css_class("action");
@@ -107,29 +235,9 @@ fn build_ui(app: &Application) {
     id_box.append(&generate_button);
     id_box.append(&delete_button);
 
-    let identity_notice = Label::new(Some(
-        "Deleting your Wayfair ID is like changing your email address. If you do not back up your keypair, you may lose access to data sent to this identity.",
-    ));
-    identity_notice.add_css_class("warning");
-    identity_notice.set_xalign(0.0);
-    identity_notice.set_wrap(true);
-
-    let proceed_button = Button::with_label("Proceed to Relay Diagnostics");
-    proceed_button.add_css_class("action");
-
-    onboarding_panel.append(&onboarding_title);
-    onboarding_panel.append(&onboarding_status);
-    onboarding_panel.append(&id_box);
-    onboarding_panel.append(&identity_meta_label);
-    onboarding_panel.append(&identity_notice);
-    onboarding_panel.append(&proceed_button);
-
-    let diagnostics_panel = GtkBox::new(Orientation::Vertical, 10);
-    diagnostics_panel.add_css_class("glass-panel");
-
-    let relay_config_title = Label::new(Some("Relay diagnostics"));
-    relay_config_title.add_css_class("section-title");
-    relay_config_title.set_xalign(0.0);
+    let identity_meta_label = Label::new(Some("Identity metadata: unavailable"));
+    identity_meta_label.set_xalign(0.0);
+    identity_meta_label.set_wrap(true);
 
     let relay_http_primary_entry = Entry::builder().hexpand(true).build();
     relay_http_primary_entry.set_text(DEFAULT_RELAY_HTTP_PRIMARY);
@@ -152,55 +260,27 @@ fn build_ui(app: &Application) {
     diagnostics_text.set_wrap_mode(gtk4::WrapMode::WordChar);
     diagnostics_text
         .buffer()
-        .set_text("Diagnostics timeline:\n- waiting for first relay run");
+        .set_text("Console timeline:\n- waiting for first relay run");
 
-    let diagnostics_scroll = ScrolledWindow::builder().min_content_height(160).build();
+    let diagnostics_scroll = ScrolledWindow::builder().min_content_height(180).build();
     diagnostics_scroll.set_child(Some(&diagnostics_text));
 
-    diagnostics_panel.append(&relay_config_title);
-    diagnostics_panel.append(&relay_http_primary_entry);
-    diagnostics_panel.append(&relay_http_secondary_entry);
-    diagnostics_panel.append(&connect_button);
-    diagnostics_panel.append(&relay_primary_label);
-    diagnostics_panel.append(&relay_secondary_label);
-    diagnostics_panel.append(&diagnostics_scroll);
+    console_panel.append(&console_title);
+    console_panel.append(&onboarding_status);
+    console_panel.append(&id_box);
+    console_panel.append(&identity_meta_label);
+    console_panel.append(&relay_http_primary_entry);
+    console_panel.append(&relay_http_secondary_entry);
+    console_panel.append(&connect_button);
+    console_panel.append(&relay_primary_label);
+    console_panel.append(&relay_secondary_label);
+    console_panel.append(&diagnostics_scroll);
 
-    let conversations_panel = GtkBox::new(Orientation::Vertical, 10);
-    conversations_panel.add_css_class("glass-panel");
-
-    let conversations_title = Label::new(Some("Conversation sessions (preview)"));
-    conversations_title.add_css_class("section-title");
-    conversations_title.set_xalign(0.0);
-
-    let conversations_hint = Label::new(Some(
-        "Milestone 4 scaffold: session list and last relay diagnostics context.",
-    ));
-    conversations_hint.set_xalign(0.0);
-
-    let sessions = ListBox::new();
-    sessions.add_css_class("session-list");
-    for session_text in [
-        "#general · status=placeholder · participants=2",
-        "ops-bridge · status=placeholder · participants=3",
-        "field-node-17 · status=placeholder · participants=1",
-    ] {
-        let row = ListBoxRow::new();
-        row.set_selectable(false);
-        let label = Label::new(Some(session_text));
-        label.set_xalign(0.0);
-        label.set_margin_top(6);
-        label.set_margin_bottom(6);
-        row.set_child(Some(&label));
-        sessions.append(&row);
-    }
-
-    conversations_panel.append(&conversations_title);
-    conversations_panel.append(&conversations_hint);
-    conversations_panel.append(&sessions);
-
-    views.add_titled(&onboarding_panel, Some("onboarding"), "Onboarding");
-    views.add_titled(&diagnostics_panel, Some("diagnostics"), "Relay Dashboard");
-    views.add_titled(&conversations_panel, Some("sessions"), "Sessions");
+    views.add_titled(&home_panel, Some("home"), "Home");
+    views.add_titled(&peers_panel, Some("peers"), "Peers");
+    views.add_titled(&inbox_panel, Some("inbox"), "Inbox");
+    views.add_titled(&compose_panel, Some("compose"), "Compose");
+    views.add_titled(&console_panel, Some("console"), "Console");
 
     root.append(&header);
     root.append(&subtitle);
@@ -210,13 +290,13 @@ fn build_ui(app: &Application) {
 
     if let Ok(identity) = ensure_local_identity() {
         wayfair_id_entry.set_text(&identity.wayfair_id);
+        home_identity.set_text(&format!("Local Wayfarer ID: {}", identity.wayfair_id));
         let key_preview: String = identity.verifying_key_b64.chars().take(16).collect();
         identity_meta_label.set_text(&format!(
             "Identity metadata: device={} · verify_key={}…",
             identity.device_name, key_preview
         ));
-        onboarding_status
-            .set_text("Step 2/2 · Identity provisioned. Proceed to relay diagnostics.");
+        onboarding_status.set_text("Identity provisioning: Step 2/2 · Identity provisioned.");
     }
 
     if let Ok(Some(cache)) = load_relay_session_cache() {
@@ -233,16 +313,17 @@ fn build_ui(app: &Application) {
         let wayfair_id_entry = wayfair_id_entry.clone();
         let identity_meta_label = identity_meta_label.clone();
         let onboarding_status = onboarding_status.clone();
+        let home_identity = home_identity.clone();
         generate_button.connect_clicked(move |_| match regenerate_local_identity() {
             Ok(identity) => {
                 let key_preview: String = identity.verifying_key_b64.chars().take(16).collect();
                 wayfair_id_entry.set_text(&identity.wayfair_id);
+                home_identity.set_text(&format!("Local Wayfarer ID: {}", identity.wayfair_id));
                 identity_meta_label.set_text(&format!(
                     "Identity metadata: device={} · verify_key={}…",
                     identity.device_name, key_preview
                 ));
-                onboarding_status
-                    .set_text("Step 2/2 · Identity rotated. You can run relay diagnostics now.");
+                onboarding_status.set_text("Identity provisioning: Step 2/2 · Identity rotated.");
             }
             Err(err) => eprintln!("{err}"),
         });
@@ -252,21 +333,15 @@ fn build_ui(app: &Application) {
         let wayfair_id_entry = wayfair_id_entry.clone();
         let identity_meta_label = identity_meta_label.clone();
         let onboarding_status = onboarding_status.clone();
+        let home_identity = home_identity.clone();
         delete_button.connect_clicked(move |_| {
             if let Err(err) = delete_wayfair_id() {
                 eprintln!("{err}");
             }
             wayfair_id_entry.set_text("");
+            home_identity.set_text("Local Wayfarer ID: not provisioned");
             identity_meta_label.set_text("Identity metadata: unavailable");
-            onboarding_status
-                .set_text("Step 1/2 · Identity deleted. Generate identity to continue.");
-        });
-    }
-
-    {
-        let views = views.clone();
-        proceed_button.connect_clicked(move |_| {
-            views.set_visible_child_name("diagnostics");
+            onboarding_status.set_text("Identity provisioning: Step 1/2 · Identity deleted.");
         });
     }
 
@@ -275,6 +350,7 @@ fn build_ui(app: &Application) {
         let wayfair_id_entry = wayfair_id_entry.clone();
         let identity_meta_label = identity_meta_label.clone();
         let onboarding_status = onboarding_status.clone();
+        let home_identity = home_identity.clone();
         connect_button.connect_clicked(move |button| {
             button.set_sensitive(false);
 
@@ -284,13 +360,14 @@ fn build_ui(app: &Application) {
                         let key_preview: String =
                             identity.verifying_key_b64.chars().take(16).collect();
                         wayfair_id_entry.set_text(&identity.wayfair_id);
+                        home_identity
+                            .set_text(&format!("Local Wayfarer ID: {}", identity.wayfair_id));
                         identity_meta_label.set_text(&format!(
                             "Identity metadata: device={} · verify_key={}…",
                             identity.device_name, key_preview
                         ));
-                        onboarding_status.set_text(
-                            "Step 2/2 · Identity provisioned automatically before diagnostics.",
-                        );
+                        onboarding_status
+                            .set_text("Identity provisioning: Step 2/2 · Auto-provisioned.");
                     }
                     Err(err) => eprintln!("{err}"),
                 }
@@ -308,12 +385,34 @@ fn build_ui(app: &Application) {
         });
     }
 
+    {
+        let compose_status = compose_status.clone();
+        let destination_entry = destination_entry.clone();
+        let payload_entry = payload_entry.clone();
+        compose_send.connect_clicked(move |_| {
+            let destination = destination_entry.text().to_string();
+            let payload = payload_entry.text().to_string();
+
+            if destination.trim().is_empty() || payload.trim().is_empty() {
+                compose_status
+                    .set_text("Compose status: destination and payload note are required");
+                return;
+            }
+
+            compose_status.set_text(&format!(
+                "Compose status: queued outbound transfer to {} ({})",
+                destination, payload
+            ));
+        });
+    }
+
     attach_status_poller(
         rx,
         connect_button,
         relay_primary_label,
         relay_secondary_label,
         diagnostics_text,
+        home_connectivity,
     );
 
     window.present();
@@ -404,6 +503,7 @@ fn attach_status_poller(
     relay_primary_label: Label,
     relay_secondary_label: Label,
     diagnostics_text: TextView,
+    home_connectivity: Label,
 ) {
     let mut completed = 0;
 
@@ -427,6 +527,12 @@ fn attach_status_poller(
                 .to_string();
             let next = format!("{previous}\n- {text}");
             buffer.set_text(&next);
+
+            if text.contains("connected + hello sent") {
+                home_connectivity.set_text("Relay connectivity: online");
+            } else {
+                home_connectivity.set_text("Relay connectivity: degraded/offline");
+            }
         }
 
         if completed >= 2 {
@@ -513,11 +619,6 @@ fn apply_styles() {
             color: #ffe7ef;
             font-weight: 700;
             padding: 8px 12px;
-        }
-
-        .warning {
-            color: rgba(255, 217, 217, 0.95);
-            font-size: 13px;
         }
         ",
     );
