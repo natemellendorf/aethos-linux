@@ -17,7 +17,18 @@ Native Linux GUI client scaffold for Aethos.
 - Introduced `aethos_core` module for protocol message scaffolding.
 - Introduced `relay` module for endpoint normalization, `/ws` WS derivation, and relay transport probing.
 - Hello envelope now includes a Wayfair ID and serializes as JSON before send.
+- Wayfair ID now persists to native Linux user data storage (`$XDG_DATA_HOME` or `~/.local/share`).
+- UI includes explicit delete action and warning about key backup/data loss implications.
 - Applied first-pass cockpit/glass visual theme (blue/purple gradients + glass panel styling).
+
+## Identity persistence
+
+Wayfair IDs are stored on disk so they survive app restarts:
+
+- Preferred path: `$XDG_DATA_HOME/aethos-linux/identity.json`
+- Fallback path: `~/.local/share/aethos-linux/identity.json`
+
+Deleting the Wayfair ID removes this local identity file. This is effectively like changing your email address; if users do not back up their keypair, they can lose access to data addressed to the old identity.
 
 ## Project layout
 

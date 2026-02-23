@@ -11,6 +11,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 use uuid::Uuid;
 
+use crate::aethos_core::identity_store::{delete_wayfair_id, load_wayfair_id, save_wayfair_id};
 use crate::relay::client::{connect_to_relay, normalize_http_endpoint, to_ws_endpoint};
 
 const APP_ID: &str = "org.aethos.linux";
@@ -37,8 +38,8 @@ fn build_ui(app: &Application) {
     let window = ApplicationWindow::builder()
         .application(app)
         .title("Aethos Linux MVP1")
-        .default_width(900)
-        .default_height(560)
+        .default_width(920)
+        .default_height(620)
         .build();
 
     let root = GtkBox::new(Orientation::Vertical, 12);
@@ -73,11 +74,26 @@ fn build_ui(app: &Application) {
     let id_box = GtkBox::new(Orientation::Horizontal, 8);
     let wayfair_id_entry = Entry::builder().hexpand(true).editable(false).build();
     wayfair_id_entry.set_placeholder_text(Some("No Wayfair ID generated yet"));
+
+    if let Ok(Some(existing_id)) = load_wayfair_id() {
+        wayfair_id_entry.set_text(&existing_id);
+    }
+
     let generate_button = Button::with_label("Generate Wayfair ID");
     generate_button.add_css_class("action");
+    let delete_button = Button::with_label("Delete Wayfair ID");
+    delete_button.add_css_class("danger");
 
     id_box.append(&wayfair_id_entry);
     id_box.append(&generate_button);
+    id_box.append(&delete_button);
+
+    let identity_notice = Label::new(Some(
+        "Deleting your Wayfair ID is like changing your email address. If you do not back up your keypair, you may lose access to data sent to this identity.",
+    ));
+    identity_notice.add_css_class("warning");
+    identity_notice.set_xalign(0.0);
+    identity_notice.set_wrap(true);
 
     let relay_primary_label = Label::new(Some("Primary relay status: idle"));
     relay_primary_label.set_xalign(0.0);
@@ -94,6 +110,7 @@ fn build_ui(app: &Application) {
     glass_panel.append(&relay_http_primary_entry);
     glass_panel.append(&relay_http_secondary_entry);
     glass_panel.append(&id_box);
+    glass_panel.append(&identity_notice);
     glass_panel.append(&connect_button);
     glass_panel.append(&relay_primary_label);
     glass_panel.append(&relay_secondary_label);
@@ -108,7 +125,21 @@ fn build_ui(app: &Application) {
     {
         let wayfair_id_entry = wayfair_id_entry.clone();
         generate_button.connect_clicked(move |_| {
-            wayfair_id_entry.set_text(&Uuid::new_v4().to_string());
+            let wayfair_id = Uuid::new_v4().to_string();
+            if let Err(err) = save_wayfair_id(&wayfair_id) {
+                eprintln!("{err}");
+            }
+            wayfair_id_entry.set_text(&wayfair_id);
+        });
+    }
+
+    {
+        let wayfair_id_entry = wayfair_id_entry.clone();
+        delete_button.connect_clicked(move |_| {
+            if let Err(err) = delete_wayfair_id() {
+                eprintln!("{err}");
+            }
+            wayfair_id_entry.set_text("");
         });
     }
 
@@ -119,7 +150,11 @@ fn build_ui(app: &Application) {
             button.set_sensitive(false);
 
             if wayfair_id_entry.text().is_empty() {
-                wayfair_id_entry.set_text(&Uuid::new_v4().to_string());
+                let wayfair_id = Uuid::new_v4().to_string();
+                if let Err(err) = save_wayfair_id(&wayfair_id) {
+                    eprintln!("{err}");
+                }
+                wayfair_id_entry.set_text(&wayfair_id);
             }
 
             let wayfair_id = wayfair_id_entry.text().to_string();
@@ -239,6 +274,20 @@ fn apply_styles() {
             color: #ecf5ff;
             font-weight: 700;
             padding: 8px 12px;
+        }
+
+        button.danger {
+            border-radius: 10px;
+            border: 1px solid rgba(255, 187, 187, 0.45);
+            background: linear-gradient(90deg, rgba(160, 74, 115, 0.35), rgba(138, 64, 96, 0.25));
+            color: #ffe7ef;
+            font-weight: 700;
+            padding: 8px 12px;
+        }
+
+        .warning {
+            color: rgba(255, 217, 217, 0.95);
+            font-size: 13px;
         }
         ",
     );
