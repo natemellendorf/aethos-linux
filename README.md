@@ -21,6 +21,13 @@ Native Linux GUI client scaffold for Aethos.
 - UI includes explicit delete action and warning about key backup/data loss implications.
 - Applied first-pass cockpit/glass visual theme (blue/purple gradients + glass panel styling).
 
+## Milestone 2 progress
+
+- Added relay session manager primitives with reconnect backoff, failover scheduling, and relay health scoring.
+- Added per-relay auth/session token plumbing for WS handshake authorization headers.
+- Added request/response dispatcher primitives with correlation IDs and pending request tracking.
+- Wired the GUI relay check path through session manager selection + dispatcher correlation logging so Milestone 2 primitives are exercised at runtime.
+
 ## Identity persistence
 
 Wayfair IDs are stored on disk so they survive app restarts:
