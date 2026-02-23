@@ -63,33 +63,6 @@ pub fn regenerate_local_identity() -> Result<LocalIdentitySummary, String> {
     summary_from_identity(&identity)
 }
 
-pub fn load_wayfair_id() -> Result<Option<String>, String> {
-    let identity = load_identity()?;
-    Ok(identity.map(|stored| stored.wayfair_id))
-}
-
-pub fn save_wayfair_id(wayfair_id: &str) -> Result<(), String> {
-    let identity = match load_identity()? {
-        Some(mut identity) => {
-            identity.wayfair_id = wayfair_id.to_string();
-            identity
-        }
-        None => {
-            let mut csprng = OsRng;
-            let signing_key = SigningKey::generate(&mut csprng);
-            StoredIdentity {
-                wayfair_id: wayfair_id.to_string(),
-                signing_key_b64: base64::engine::general_purpose::STANDARD
-                    .encode(signing_key.to_bytes()),
-                device_name: infer_device_name(),
-                platform: "linux".to_string(),
-            }
-        }
-    };
-
-    persist_identity(&identity)
-}
-
 pub fn delete_wayfair_id() -> Result<(), String> {
     let identity_path = identity_file_path();
     if identity_path.exists() {

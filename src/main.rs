@@ -83,8 +83,17 @@ fn build_ui(app: &Application) {
     let wayfair_id_entry = Entry::builder().hexpand(true).editable(false).build();
     wayfair_id_entry.set_placeholder_text(Some("No Wayfair ID generated yet"));
 
+    let identity_meta_label = Label::new(Some("Identity metadata: unavailable"));
+    identity_meta_label.set_xalign(0.0);
+    identity_meta_label.set_wrap(true);
+
     if let Ok(identity) = ensure_local_identity() {
         wayfair_id_entry.set_text(&identity.wayfair_id);
+        let key_preview: String = identity.verifying_key_b64.chars().take(16).collect();
+        identity_meta_label.set_text(&format!(
+            "Identity metadata: device={} · verify_key={}…",
+            identity.device_name, key_preview
+        ));
     }
 
     let generate_button = Button::with_label("Generate Wayfair ID");
@@ -126,6 +135,7 @@ fn build_ui(app: &Application) {
     glass_panel.append(&relay_http_primary_entry);
     glass_panel.append(&relay_http_secondary_entry);
     glass_panel.append(&id_box);
+    glass_panel.append(&identity_meta_label);
     glass_panel.append(&identity_notice);
     glass_panel.append(&connect_button);
     glass_panel.append(&relay_primary_label);
@@ -140,31 +150,50 @@ fn build_ui(app: &Application) {
 
     {
         let wayfair_id_entry = wayfair_id_entry.clone();
+        let identity_meta_label = identity_meta_label.clone();
         generate_button.connect_clicked(move |_| match regenerate_local_identity() {
-            Ok(identity) => wayfair_id_entry.set_text(&identity.wayfair_id),
+            Ok(identity) => {
+                let key_preview: String = identity.verifying_key_b64.chars().take(16).collect();
+                wayfair_id_entry.set_text(&identity.wayfair_id);
+                identity_meta_label.set_text(&format!(
+                    "Identity metadata: device={} · verify_key={}…",
+                    identity.device_name, key_preview
+                ));
+            }
             Err(err) => eprintln!("{err}"),
         });
     }
 
     {
         let wayfair_id_entry = wayfair_id_entry.clone();
+        let identity_meta_label = identity_meta_label.clone();
         delete_button.connect_clicked(move |_| {
             if let Err(err) = delete_wayfair_id() {
                 eprintln!("{err}");
             }
             wayfair_id_entry.set_text("");
+            identity_meta_label.set_text("Identity metadata: unavailable");
         });
     }
 
     {
         let tx = tx.clone();
         let wayfair_id_entry = wayfair_id_entry.clone();
+        let identity_meta_label = identity_meta_label.clone();
         connect_button.connect_clicked(move |button| {
             button.set_sensitive(false);
 
             if wayfair_id_entry.text().is_empty() {
                 match ensure_local_identity() {
-                    Ok(identity) => wayfair_id_entry.set_text(&identity.wayfair_id),
+                    Ok(identity) => {
+                        let key_preview: String =
+                            identity.verifying_key_b64.chars().take(16).collect();
+                        wayfair_id_entry.set_text(&identity.wayfair_id);
+                        identity_meta_label.set_text(&format!(
+                            "Identity metadata: device={} · verify_key={}…",
+                            identity.device_name, key_preview
+                        ));
+                    }
                     Err(err) => eprintln!("{err}"),
                 }
             }
