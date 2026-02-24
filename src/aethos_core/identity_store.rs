@@ -40,19 +40,11 @@ pub struct LocalIdentitySummary {
     pub device_name: String,
 }
 
-pub fn ensure_local_identity() -> Result<LocalIdentitySummary, String> {
-    ensure_local_identity_for_profile(DEFAULT_PROFILE)
-}
-
 pub fn ensure_local_identity_for_profile(profile: &str) -> Result<LocalIdentitySummary, String> {
     match load_identity(profile)? {
         Some(identity) => summary_from_identity(&identity),
         None => regenerate_local_identity_for_profile(profile),
     }
-}
-
-pub fn regenerate_local_identity() -> Result<LocalIdentitySummary, String> {
-    regenerate_local_identity_for_profile(DEFAULT_PROFILE)
 }
 
 pub fn regenerate_local_identity_for_profile(
@@ -72,10 +64,6 @@ pub fn regenerate_local_identity_for_profile(
 
     persist_identity(profile, &identity)?;
     summary_from_identity(&identity)
-}
-
-pub fn delete_wayfair_id() -> Result<(), String> {
-    delete_wayfair_id_for_profile(DEFAULT_PROFILE)
 }
 
 pub fn delete_wayfair_id_for_profile(profile: &str) -> Result<(), String> {
@@ -100,10 +88,6 @@ pub fn delete_wayfair_id_for_profile(profile: &str) -> Result<(), String> {
     }
 
     Ok(())
-}
-
-pub fn save_relay_session_cache(cache: &RelaySessionCache) -> Result<(), String> {
-    save_relay_session_cache_for_profile(DEFAULT_PROFILE, cache)
 }
 
 pub fn save_relay_session_cache_for_profile(
@@ -143,10 +127,6 @@ pub fn save_relay_session_cache_for_profile(
     }
 
     write_secure_file(&path, serialized_envelope.as_bytes())
-}
-
-pub fn load_relay_session_cache() -> Result<Option<RelaySessionCache>, String> {
-    load_relay_session_cache_for_profile(DEFAULT_PROFILE)
 }
 
 pub fn load_relay_session_cache_for_profile(
