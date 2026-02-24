@@ -37,19 +37,26 @@ Native Linux GUI client scaffold for Aethos.
 
 ## Milestone 4 progress
 
-- Added a tabbed GUI flow with dedicated Onboarding, Relay Dashboard, and Sessions views.
+- Upgraded GUI shell toward iOS parity with five primary tabs: Home, Peers, Inbox, Compose, and Console, aligned with iOS Wayfarer shell semantics.
 - Added onboarding progression UX that surfaces identity provisioning state and allows explicit transition into diagnostics.
+- Console now consolidates identity provisioning + relay diagnostics, while Home surfaces high-level runtime summary status.
+- Enabled multi-instance desktop launches and per-profile identity selection so two app windows can run concurrently on one machine with different Wayfarer IDs.
 - Added relay diagnostics timeline view to keep a running log of per-relay probe outcomes and dispatcher metadata.
 - Added conversation/session list scaffold to start Milestone 4 session-view groundwork for later message-exchange integration.
 
+## Milestone 5 kickoff
+
+- Added charter-aligned Milestone 5 review and implementation sequence in `docs/milestone-5-kickoff-review.md`.
+- Captured direct-first transport orchestration recommendations before beginning local radio adapter implementation.
+
 ## Identity persistence
 
-Wayfair IDs are stored on disk so they survive app restarts:
+Wayfair IDs are stored on disk so they survive app restarts. Identity data is now profile-scoped:
 
-- Preferred path: `$XDG_DATA_HOME/aethos-linux/identity.json`
-- Fallback path: `~/.local/share/aethos-linux/identity.json`
+- Preferred path pattern: `$XDG_DATA_HOME/aethos-linux/identity-<profile>.json`
+- Fallback path pattern: `~/.local/share/aethos-linux/identity-<profile>.json`
 
-Deleting the Wayfair ID removes this local identity file. This is effectively like changing your email address; if users do not back up their keypair, they can lose access to data addressed to the old identity.
+Each running instance can select a different profile in Console (or via `AETHOS_PROFILE`) so multiple app windows can operate with separate local identities on the same machine. Deleting the Wayfair ID removes only the selected profile identity file.
 
 ## Project layout
 

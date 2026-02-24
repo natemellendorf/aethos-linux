@@ -68,9 +68,10 @@ starting with Ubuntu/Debian and extending to broader targets later.
 
 ### Milestone 5: Local radio transports
 
-- Abstract transport interfaces for Wi-Fi/Bluetooth/Cellular pathways.
-- Integrate Linux-compatible transport plugins.
-- Route peer communication direct-first, relay fallback second.
+- [~] Milestone 5 kickoff review and implementation sequence documented (`docs/milestone-5-kickoff-review.md`).
+- [ ] Abstract transport interfaces for Wi-Fi/Bluetooth/Cellular pathways.
+- [ ] Integrate Linux-compatible transport plugins.
+- [ ] Route peer communication direct-first, relay fallback second.
 
 ### Milestone 6: Packaging and distribution
 

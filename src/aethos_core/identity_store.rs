@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const APP_DIR_NAME: &str = "aethos-linux";
-const IDENTITY_FILE_NAME: &str = "identity.json";
-const SESSION_CACHE_FILE_NAME: &str = "session-cache.enc.json";
+const DEFAULT_PROFILE: &str = "default";
+const IDENTITY_FILE_PREFIX: &str = "identity";
+const SESSION_CACHE_FILE_PREFIX: &str = "session-cache";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredIdentity {
@@ -39,14 +40,16 @@ pub struct LocalIdentitySummary {
     pub device_name: String,
 }
 
-pub fn ensure_local_identity() -> Result<LocalIdentitySummary, String> {
-    match load_identity()? {
-        Some(identity) => Ok(summary_from_identity(&identity)?),
-        None => regenerate_local_identity(),
+pub fn ensure_local_identity_for_profile(profile: &str) -> Result<LocalIdentitySummary, String> {
+    match load_identity(profile)? {
+        Some(identity) => summary_from_identity(&identity),
+        None => regenerate_local_identity_for_profile(profile),
     }
 }
 
-pub fn regenerate_local_identity() -> Result<LocalIdentitySummary, String> {
+pub fn regenerate_local_identity_for_profile(
+    profile: &str,
+) -> Result<LocalIdentitySummary, String> {
     let mut csprng = OsRng;
     let signing_key = SigningKey::generate(&mut csprng);
     let signing_key_b64 = base64::engine::general_purpose::STANDARD.encode(signing_key.to_bytes());
@@ -59,12 +62,12 @@ pub fn regenerate_local_identity() -> Result<LocalIdentitySummary, String> {
         platform: "linux".to_string(),
     };
 
-    persist_identity(&identity)?;
+    persist_identity(profile, &identity)?;
     summary_from_identity(&identity)
 }
 
-pub fn delete_wayfair_id() -> Result<(), String> {
-    let identity_path = identity_file_path();
+pub fn delete_wayfair_id_for_profile(profile: &str) -> Result<(), String> {
+    let identity_path = identity_file_path(profile);
     if identity_path.exists() {
         fs::remove_file(&identity_path).map_err(|err| {
             format!(
@@ -74,7 +77,7 @@ pub fn delete_wayfair_id() -> Result<(), String> {
         })?;
     }
 
-    let cache_path = session_cache_file_path();
+    let cache_path = session_cache_file_path(profile);
     if cache_path.exists() {
         fs::remove_file(&cache_path).map_err(|err| {
             format!(
@@ -87,8 +90,11 @@ pub fn delete_wayfair_id() -> Result<(), String> {
     Ok(())
 }
 
-pub fn save_relay_session_cache(cache: &RelaySessionCache) -> Result<(), String> {
-    let identity = ensure_stored_identity()?;
+pub fn save_relay_session_cache_for_profile(
+    profile: &str,
+    cache: &RelaySessionCache,
+) -> Result<(), String> {
+    let identity = ensure_stored_identity(profile)?;
     let cipher = cipher_from_identity(&identity)?;
     let serialized = serde_json::to_vec(cache)
         .map_err(|err| format!("failed to serialize session cache payload: {err}"))?;
@@ -110,7 +116,7 @@ pub fn save_relay_session_cache(cache: &RelaySessionCache) -> Result<(), String>
     let serialized_envelope = serde_json::to_string_pretty(&envelope)
         .map_err(|err| format!("failed to serialize encrypted cache envelope: {err}"))?;
 
-    let path = session_cache_file_path();
+    let path = session_cache_file_path(profile);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| {
             format!(
@@ -123,13 +129,15 @@ pub fn save_relay_session_cache(cache: &RelaySessionCache) -> Result<(), String>
     write_secure_file(&path, serialized_envelope.as_bytes())
 }
 
-pub fn load_relay_session_cache() -> Result<Option<RelaySessionCache>, String> {
-    let path = session_cache_file_path();
+pub fn load_relay_session_cache_for_profile(
+    profile: &str,
+) -> Result<Option<RelaySessionCache>, String> {
+    let path = session_cache_file_path(profile);
     if !path.exists() {
         return Ok(None);
     }
 
-    let identity = ensure_stored_identity()?;
+    let identity = ensure_stored_identity(profile)?;
     let cipher = cipher_from_identity(&identity)?;
 
     let content = fs::read_to_string(&path).map_err(|err| {
@@ -168,8 +176,8 @@ pub fn load_relay_session_cache() -> Result<Option<RelaySessionCache>, String> {
     Ok(Some(cache))
 }
 
-fn persist_identity(identity: &StoredIdentity) -> Result<(), String> {
-    let path = identity_file_path();
+fn persist_identity(profile: &str, identity: &StoredIdentity) -> Result<(), String> {
+    let path = identity_file_path(profile);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| {
             format!(
@@ -185,8 +193,8 @@ fn persist_identity(identity: &StoredIdentity) -> Result<(), String> {
     write_secure_file(&path, serialized.as_bytes())
 }
 
-fn load_identity() -> Result<Option<StoredIdentity>, String> {
-    let path = identity_file_path();
+fn load_identity(profile: &str) -> Result<Option<StoredIdentity>, String> {
+    let path = identity_file_path(profile);
     if !path.exists() {
         return Ok(None);
     }
@@ -200,12 +208,12 @@ fn load_identity() -> Result<Option<StoredIdentity>, String> {
     Ok(Some(identity))
 }
 
-fn ensure_stored_identity() -> Result<StoredIdentity, String> {
-    match load_identity()? {
+fn ensure_stored_identity(profile: &str) -> Result<StoredIdentity, String> {
+    match load_identity(profile)? {
         Some(identity) => Ok(identity),
         None => {
-            regenerate_local_identity()?;
-            load_identity()?.ok_or_else(|| "failed to load regenerated identity".to_string())
+            regenerate_local_identity_for_profile(profile)?;
+            load_identity(profile)?.ok_or_else(|| "failed to load regenerated identity".to_string())
         }
     }
 }
@@ -267,12 +275,12 @@ fn write_secure_file(path: &Path, content: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn identity_file_path() -> PathBuf {
-    identity_file_path_for(base_data_dir())
+fn identity_file_path(profile: &str) -> PathBuf {
+    identity_file_path_for(base_data_dir(), profile)
 }
 
-fn session_cache_file_path() -> PathBuf {
-    session_cache_file_path_for(base_data_dir())
+fn session_cache_file_path(profile: &str) -> PathBuf {
+    session_cache_file_path_for(base_data_dir(), profile)
 }
 
 fn base_data_dir() -> PathBuf {
@@ -289,36 +297,65 @@ fn base_data_dir() -> PathBuf {
     std::env::temp_dir()
 }
 
-fn identity_file_path_for(base_dir: PathBuf) -> PathBuf {
-    base_dir.join(APP_DIR_NAME).join(IDENTITY_FILE_NAME)
+fn identity_file_path_for(base_dir: PathBuf, profile: &str) -> PathBuf {
+    let safe = sanitize_profile(profile);
+    base_dir
+        .join(APP_DIR_NAME)
+        .join(format!("{IDENTITY_FILE_PREFIX}-{safe}.json"))
 }
 
-fn session_cache_file_path_for(base_dir: PathBuf) -> PathBuf {
-    base_dir.join(APP_DIR_NAME).join(SESSION_CACHE_FILE_NAME)
+fn session_cache_file_path_for(base_dir: PathBuf, profile: &str) -> PathBuf {
+    let safe = sanitize_profile(profile);
+    base_dir
+        .join(APP_DIR_NAME)
+        .join(format!("{SESSION_CACHE_FILE_PREFIX}-{safe}.enc.json"))
+}
+
+fn sanitize_profile(profile: &str) -> String {
+    let trimmed = profile.trim();
+    if trimmed.is_empty() {
+        return DEFAULT_PROFILE.to_string();
+    }
+
+    trimmed
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{identity_file_path_for, session_cache_file_path_for};
+    use super::{identity_file_path_for, sanitize_profile, session_cache_file_path_for};
     use std::path::PathBuf;
 
     #[test]
-    fn identity_file_path_uses_app_subdir() {
+    fn identity_file_path_uses_profile_suffix() {
         let base = PathBuf::from("/tmp/test-data");
-        let path = identity_file_path_for(base);
+        let path = identity_file_path_for(base, "alpha");
         assert_eq!(
             path,
-            PathBuf::from("/tmp/test-data/aethos-linux/identity.json")
+            PathBuf::from("/tmp/test-data/aethos-linux/identity-alpha.json")
         );
     }
 
     #[test]
-    fn session_cache_path_uses_app_subdir() {
+    fn session_cache_path_uses_profile_suffix() {
         let base = PathBuf::from("/tmp/test-data");
-        let path = session_cache_file_path_for(base);
+        let path = session_cache_file_path_for(base, "default");
         assert_eq!(
             path,
-            PathBuf::from("/tmp/test-data/aethos-linux/session-cache.enc.json")
+            PathBuf::from("/tmp/test-data/aethos-linux/session-cache-default.enc.json")
         );
+    }
+
+    #[test]
+    fn sanitize_profile_normalizes_invalid_chars() {
+        assert_eq!(sanitize_profile("team blue"), "team_blue");
     }
 }
