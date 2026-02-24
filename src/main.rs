@@ -4,18 +4,21 @@ mod relay;
 use gtk4::gdk::Display;
 use gtk4::prelude::*;
 use gtk4::{
-    glib, Application, ApplicationWindow, Box as GtkBox, Button, CssProvider, Entry, Label,
+    gio, glib, Application, ApplicationWindow, Box as GtkBox, Button, CssProvider, Entry, Label,
     ListBox, ListBoxRow, Orientation, ScrolledWindow, Stack, StackSwitcher, TextView,
     STYLE_PROVIDER_PRIORITY_APPLICATION,
 };
 use serde_json::json;
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::aethos_core::identity_store::{
-    delete_wayfair_id, ensure_local_identity, load_relay_session_cache, regenerate_local_identity,
-    save_relay_session_cache, RelaySessionCache,
+    delete_wayfair_id_for_profile, ensure_local_identity_for_profile,
+    load_relay_session_cache_for_profile, regenerate_local_identity_for_profile,
+    save_relay_session_cache_for_profile, RelaySessionCache,
 };
 use crate::relay::client::{
     connect_to_relay, connect_to_relay_with_auth, normalize_http_endpoint, RelayFrame,
@@ -28,6 +31,7 @@ const DEFAULT_RELAY_HTTP_SECONDARY: &str = "http://192.168.1.200:9082";
 
 #[derive(Clone, Debug)]
 struct RelayStatus {
+    profile: String,
     relay_slot: usize,
     relay_http: String,
     relay_ws: String,
@@ -36,7 +40,10 @@ struct RelayStatus {
 }
 
 fn main() -> glib::ExitCode {
-    let app = Application::builder().application_id(APP_ID).build();
+    let app = Application::builder()
+        .application_id(APP_ID)
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
     app.connect_activate(build_ui);
     app.run()
 }
@@ -216,6 +223,28 @@ fn build_ui(app: &Application) {
     console_title.add_css_class("section-title");
     console_title.set_xalign(0.0);
 
+    let initial_profile = std::env::var("AETHOS_PROFILE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "default".to_string());
+    let selected_profile = Rc::new(RefCell::new(initial_profile.clone()));
+
+    let profile_row = GtkBox::new(Orientation::Horizontal, 8);
+    let profile_entry = Entry::builder().hexpand(true).build();
+    profile_entry.set_text(&initial_profile);
+    profile_entry.set_placeholder_text(Some("Profile name (e.g. alice, bob, field-node-17)"));
+    let profile_load_button = Button::with_label("Load Profile");
+    profile_load_button.add_css_class("action");
+    profile_row.append(&profile_entry);
+    profile_row.append(&profile_load_button);
+
+    let profile_status = Label::new(Some(&format!(
+        "Active profile: {} (launch multiple windows with different profiles)",
+        initial_profile
+    )));
+    profile_status.set_xalign(0.0);
+    profile_status.set_wrap(true);
+
     let onboarding_status = Label::new(Some(
         "Identity provisioning: Step 1/2 · Generate identity (or rotate if needed).",
     ));
@@ -266,6 +295,8 @@ fn build_ui(app: &Application) {
     diagnostics_scroll.set_child(Some(&diagnostics_text));
 
     console_panel.append(&console_title);
+    console_panel.append(&profile_row);
+    console_panel.append(&profile_status);
     console_panel.append(&onboarding_status);
     console_panel.append(&id_box);
     console_panel.append(&identity_meta_label);
@@ -288,7 +319,7 @@ fn build_ui(app: &Application) {
     root.append(&views);
     window.set_child(Some(&root));
 
-    if let Ok(identity) = ensure_local_identity() {
+    if let Ok(identity) = ensure_local_identity_for_profile(&selected_profile.borrow()) {
         wayfair_id_entry.set_text(&identity.wayfair_id);
         home_identity.set_text(&format!("Local Wayfarer ID: {}", identity.wayfair_id));
         let key_preview: String = identity.verifying_key_b64.chars().take(16).collect();
@@ -299,7 +330,7 @@ fn build_ui(app: &Application) {
         onboarding_status.set_text("Identity provisioning: Step 2/2 · Identity provisioned.");
     }
 
-    if let Ok(Some(cache)) = load_relay_session_cache() {
+    if let Ok(Some(cache)) = load_relay_session_cache_for_profile(&selected_profile.borrow()) {
         relay_primary_label.set_text(&format!("Primary relay status: {}", cache.primary_status));
         relay_secondary_label.set_text(&format!(
             "Secondary relay status: {}",
@@ -310,32 +341,37 @@ fn build_ui(app: &Application) {
     let (tx, rx) = channel::<RelayStatus>();
 
     {
+        let selected_profile = selected_profile.clone();
         let wayfair_id_entry = wayfair_id_entry.clone();
         let identity_meta_label = identity_meta_label.clone();
         let onboarding_status = onboarding_status.clone();
         let home_identity = home_identity.clone();
-        generate_button.connect_clicked(move |_| match regenerate_local_identity() {
-            Ok(identity) => {
-                let key_preview: String = identity.verifying_key_b64.chars().take(16).collect();
-                wayfair_id_entry.set_text(&identity.wayfair_id);
-                home_identity.set_text(&format!("Local Wayfarer ID: {}", identity.wayfair_id));
-                identity_meta_label.set_text(&format!(
-                    "Identity metadata: device={} · verify_key={}…",
-                    identity.device_name, key_preview
-                ));
-                onboarding_status.set_text("Identity provisioning: Step 2/2 · Identity rotated.");
+        generate_button.connect_clicked(move |_| {
+            match regenerate_local_identity_for_profile(&selected_profile.borrow()) {
+                Ok(identity) => {
+                    let key_preview: String = identity.verifying_key_b64.chars().take(16).collect();
+                    wayfair_id_entry.set_text(&identity.wayfair_id);
+                    home_identity.set_text(&format!("Local Wayfarer ID: {}", identity.wayfair_id));
+                    identity_meta_label.set_text(&format!(
+                        "Identity metadata: device={} · verify_key={}…",
+                        identity.device_name, key_preview
+                    ));
+                    onboarding_status
+                        .set_text("Identity provisioning: Step 2/2 · Identity rotated.");
+                }
+                Err(err) => eprintln!("{err}"),
             }
-            Err(err) => eprintln!("{err}"),
         });
     }
 
     {
+        let selected_profile = selected_profile.clone();
         let wayfair_id_entry = wayfair_id_entry.clone();
         let identity_meta_label = identity_meta_label.clone();
         let onboarding_status = onboarding_status.clone();
         let home_identity = home_identity.clone();
         delete_button.connect_clicked(move |_| {
-            if let Err(err) = delete_wayfair_id() {
+            if let Err(err) = delete_wayfair_id_for_profile(&selected_profile.borrow()) {
                 eprintln!("{err}");
             }
             wayfair_id_entry.set_text("");
@@ -346,6 +382,7 @@ fn build_ui(app: &Application) {
     }
 
     {
+        let selected_profile = selected_profile.clone();
         let tx = tx.clone();
         let wayfair_id_entry = wayfair_id_entry.clone();
         let identity_meta_label = identity_meta_label.clone();
@@ -355,7 +392,7 @@ fn build_ui(app: &Application) {
             button.set_sensitive(false);
 
             if wayfair_id_entry.text().is_empty() {
-                match ensure_local_identity() {
+                match ensure_local_identity_for_profile(&selected_profile.borrow()) {
                     Ok(identity) => {
                         let key_preview: String =
                             identity.verifying_key_b64.chars().take(16).collect();
@@ -377,11 +414,63 @@ fn build_ui(app: &Application) {
             let relay_http_primary = normalize_http_endpoint(&relay_http_primary_entry.text());
             let relay_http_secondary = normalize_http_endpoint(&relay_http_secondary_entry.text());
 
+            let profile = selected_profile.borrow().clone();
             spawn_relay_checks(
                 vec![relay_http_primary, relay_http_secondary],
                 &wayfair_id,
+                &profile,
                 tx.clone(),
             );
+        });
+    }
+
+    {
+        let selected_profile = selected_profile.clone();
+        let profile_entry = profile_entry.clone();
+        let profile_status = profile_status.clone();
+        let wayfair_id_entry = wayfair_id_entry.clone();
+        let identity_meta_label = identity_meta_label.clone();
+        let onboarding_status = onboarding_status.clone();
+        let home_identity = home_identity.clone();
+        let relay_primary_label = relay_primary_label.clone();
+        let relay_secondary_label = relay_secondary_label.clone();
+        profile_load_button.connect_clicked(move |_| {
+            let requested = profile_entry.text().trim().to_string();
+            let next_profile = if requested.is_empty() {
+                "default".to_string()
+            } else {
+                requested
+            };
+
+            *selected_profile.borrow_mut() = next_profile.clone();
+            profile_status.set_text(&format!(
+                "Active profile: {} (launch multiple windows with different profiles)",
+                next_profile
+            ));
+
+            match ensure_local_identity_for_profile(&next_profile) {
+                Ok(identity) => {
+                    wayfair_id_entry.set_text(&identity.wayfair_id);
+                    home_identity.set_text(&format!("Local Wayfarer ID: {}", identity.wayfair_id));
+                    let key_preview: String = identity.verifying_key_b64.chars().take(16).collect();
+                    identity_meta_label.set_text(&format!(
+                        "Identity metadata: device={} · verify_key={}…",
+                        identity.device_name, key_preview
+                    ));
+                    onboarding_status
+                        .set_text("Identity provisioning: Step 2/2 · Identity loaded for profile.");
+                }
+                Err(err) => eprintln!("{err}"),
+            }
+
+            if let Ok(Some(cache)) = load_relay_session_cache_for_profile(&next_profile) {
+                relay_primary_label
+                    .set_text(&format!("Primary relay status: {}", cache.primary_status));
+                relay_secondary_label.set_text(&format!(
+                    "Secondary relay status: {}",
+                    cache.secondary_status
+                ));
+            }
         });
     }
 
@@ -421,9 +510,11 @@ fn build_ui(app: &Application) {
 fn spawn_relay_checks(
     relay_http_endpoints: Vec<String>,
     wayfair_id: &str,
+    profile: &str,
     tx: Sender<RelayStatus>,
 ) {
     let wayfair_id = wayfair_id.to_string();
+    let profile = profile.to_string();
 
     thread::spawn(move || {
         let mut session_manager =
@@ -486,6 +577,7 @@ fn spawn_relay_checks(
             };
 
             let _ = tx.send(RelayStatus {
+                profile: profile.clone(),
                 relay_slot: selection.relay_slot,
                 relay_http: selection.relay_http,
                 relay_ws: selection.relay_ws,
@@ -506,13 +598,15 @@ fn attach_status_poller(
     home_connectivity: Label,
 ) {
     let mut completed = 0;
+    let mut last_profile = "default".to_string();
 
     glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
         while let Ok(status) = rx.try_recv() {
             completed += 1;
+            last_profile = status.profile.clone();
             let text = format!(
-                "{} -> {} · {} · {}",
-                status.relay_http, status.relay_ws, status.state, status.dispatch
+                "[profile={}] {} -> {} · {} · {}",
+                status.profile, status.relay_http, status.relay_ws, status.state, status.dispatch
             );
 
             if status.relay_slot == 0 {
@@ -538,10 +632,13 @@ fn attach_status_poller(
         if completed >= 2 {
             let primary = relay_primary_label.text().to_string();
             let secondary = relay_secondary_label.text().to_string();
-            if let Err(err) = save_relay_session_cache(&RelaySessionCache {
-                primary_status: primary,
-                secondary_status: secondary,
-            }) {
+            if let Err(err) = save_relay_session_cache_for_profile(
+                &last_profile,
+                &RelaySessionCache {
+                    primary_status: primary,
+                    secondary_status: secondary,
+                },
+            ) {
                 eprintln!("{err}");
             }
 
