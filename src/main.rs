@@ -78,7 +78,7 @@ fn build_ui(app: &Application) {
     let logo = Picture::for_filename("src/img/logo.png");
     logo.add_css_class("aethos-logo");
     logo.set_can_shrink(true);
-    logo.set_content_fit(gtk4::ContentFit::Contain);
+    logo.set_keep_aspect_ratio(true);
     logo.set_size_request(72, 72);
     logo.set_halign(gtk4::Align::End);
 
