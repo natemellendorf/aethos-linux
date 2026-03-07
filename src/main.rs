@@ -5,7 +5,7 @@ use gtk4::gdk::Display;
 use gtk4::prelude::*;
 use gtk4::{
     glib, Application, ApplicationWindow, Box as GtkBox, Button, CssProvider, Entry, Label,
-    ListBox, ListBoxRow, Orientation, ScrolledWindow, Stack, StackSwitcher, TextView,
+    ListBox, ListBoxRow, Orientation, Picture, ScrolledWindow, Stack, StackSwitcher, TextView,
     STYLE_PROVIDER_PRIORITY_APPLICATION,
 };
 use serde_json::json;
@@ -58,6 +58,9 @@ fn build_ui(app: &Application) {
     root.set_margin_start(20);
     root.set_margin_end(20);
 
+    let title_area = GtkBox::new(Orientation::Vertical, 4);
+    title_area.set_hexpand(true);
+
     let header = Label::new(Some("Aethos Waypoint · Linux MVP4 Preview"));
     header.add_css_class("header");
     header.set_xalign(0.0);
@@ -68,6 +71,21 @@ fn build_ui(app: &Application) {
     subtitle.add_css_class("subtitle");
     subtitle.set_xalign(0.0);
     subtitle.set_wrap(true);
+
+    title_area.append(&header);
+    title_area.append(&subtitle);
+
+    let logo = Picture::for_filename("src/img/logo.png");
+    logo.add_css_class("aethos-logo");
+    logo.set_can_shrink(true);
+    logo.set_content_fit(gtk4::ContentFit::Contain);
+    logo.set_size_request(72, 72);
+    logo.set_halign(gtk4::Align::End);
+
+    let header_row = GtkBox::new(Orientation::Horizontal, 12);
+    header_row.set_hexpand(true);
+    header_row.append(&title_area);
+    header_row.append(&logo);
 
     let tab_switcher = StackSwitcher::new();
     tab_switcher.set_halign(gtk4::Align::Start);
@@ -202,8 +220,7 @@ fn build_ui(app: &Application) {
     views.add_titled(&diagnostics_panel, Some("diagnostics"), "Relay Dashboard");
     views.add_titled(&conversations_panel, Some("sessions"), "Sessions");
 
-    root.append(&header);
-    root.append(&subtitle);
+    root.append(&header_row);
     root.append(&tab_switcher);
     root.append(&views);
     window.set_child(Some(&root));
@@ -469,6 +486,13 @@ fn apply_styles() {
         .subtitle {
             font-size: 15px;
             color: rgba(221, 233, 255, 0.85);
+        }
+
+        .aethos-logo {
+            border-radius: 14px;
+            padding: 6px;
+            background: rgba(16, 23, 48, 0.45);
+            border: 1px solid rgba(207, 222, 255, 0.35);
         }
 
         .section-title {
