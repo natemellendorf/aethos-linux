@@ -195,7 +195,7 @@ Hook behavior:
 
 - `pre-commit`: runs full lint gate (`cargo fmt --all -- --check` and `cargo clippy --all-targets --all-features -- -D warnings`)
 - `pre-merge-commit`: when merge includes local `main` tip, runs `cargo test`
-- `pre-push`: when pushing `origin/main`, creates a GitHub prerelease first
+- `pre-push`: when pushing `origin/main`, creates a GitHub prerelease only when explicitly requested
 
 Prerelease + release scripts:
 
@@ -203,12 +203,23 @@ Prerelease + release scripts:
 # Create prerelease manually (also used by pre-push hook)
 scripts/release/create-prerelease.sh
 
+# Request prerelease during push (opt-in)
+AETHOS_CREATE_PRERELEASE=1 git push origin main
+# or
+git push -o prerelease origin main
+
 # Dry-run next official version inference
 scripts/release/create-release.sh --dry-run
 
 # Cut official release (updates Cargo.toml version, tests, commit, tag, GitHub release)
 scripts/release/create-release.sh
+
+# Promote an existing prerelease to official release tag
+# (example: v1.2.3-pre.2026... -> v1.2.3)
+scripts/release/create-release.sh --from-prerelease <tag>
 ```
+
+The app footer displays the build identifier as `v<version> (build <git-sha>)` for troubleshooting.
 
 Versioning strategy:
 

@@ -7,6 +7,28 @@ if [[ "${remote_name}" != "origin" ]]; then
   exit 0
 fi
 
+should_create_prerelease="0"
+
+# Explicit opt-in via environment variable:
+#   AETHOS_CREATE_PRERELEASE=1 git push origin main
+if [[ "${AETHOS_CREATE_PRERELEASE:-0}" == "1" ]]; then
+  should_create_prerelease="1"
+fi
+
+# Explicit opt-in via push option:
+#   git push -o prerelease origin main
+push_option_count="${GIT_PUSH_OPTION_COUNT:-0}"
+if [[ "${push_option_count}" =~ ^[0-9]+$ ]] && [[ "${push_option_count}" -gt 0 ]]; then
+  for ((i = 0; i < push_option_count; i++)); do
+    option_var="GIT_PUSH_OPTION_${i}"
+    option_value="${!option_var:-}"
+    if [[ "${option_value}" == "prerelease" ]]; then
+      should_create_prerelease="1"
+      break
+    fi
+  done
+fi
+
 ROOT_DIR="$(git rev-parse --show-toplevel)"
 release_script="${ROOT_DIR}/scripts/release/create-prerelease.sh"
 
@@ -15,8 +37,12 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     if [[ "${local_sha}" == "0000000000000000000000000000000000000000" ]]; then
       continue
     fi
-    printf '[git-hook:pre-push] push to origin/main detected, creating prerelease\n'
-    bash "${release_script}"
+    if [[ "${should_create_prerelease}" == "1" ]]; then
+      printf '[git-hook:pre-push] push to origin/main detected with prerelease request\n'
+      bash "${release_script}"
+    else
+      printf '[git-hook:pre-push] push to origin/main detected (prerelease skipped; opt-in required)\n'
+    fi
     break
   fi
 done

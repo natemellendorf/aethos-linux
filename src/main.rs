@@ -57,6 +57,7 @@ const APP_LOG_FILE_NAME: &str = "aethos-linux.log";
 const CHAT_HISTORY_FILE_NAME: &str = "chat-history.json";
 const SHARE_QR_FILE_NAME: &str = "share-wayfarer-qr.png";
 const APP_SETTINGS_FILE_NAME: &str = "settings.json";
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Clone, Debug)]
 struct RelayStatus {
@@ -163,6 +164,48 @@ impl Default for AppSettings {
             ],
         }
     }
+}
+
+#[derive(Clone)]
+struct RelayStatusUi {
+    connect_button: Button,
+    relay_primary_label: Label,
+    relay_secondary_label: Label,
+    diagnostics_text: TextView,
+    relay_dot: Label,
+    relay_chip_text: Label,
+    relay_chip: GtkBox,
+}
+
+#[derive(Clone)]
+struct SessionPollerUi {
+    send_button: Button,
+    body_entry: Entry,
+    chat_status_label: Label,
+    chat_state: Rc<RefCell<ChatState>>,
+    contacts_list: ListBox,
+    contact_order: Rc<RefCell<Vec<String>>>,
+    selected_contact_id_value: Label,
+    contact_alias_entry: Entry,
+    messages_list: ListBox,
+    messages_scroll: ScrolledWindow,
+    thread_title: Label,
+    thread_contact_id_label: Label,
+    compact_contact_picker: ComboBoxText,
+    picker_syncing: Rc<Cell<bool>>,
+    wave_pending: Rc<Cell<bool>>,
+    wave_mode_label: Label,
+    auto_scroll_locked: Rc<Cell<bool>>,
+}
+
+struct MessageRenderUi<'a> {
+    messages_list: &'a ListBox,
+    messages_scroll: &'a ScrolledWindow,
+    thread_title: &'a Label,
+    thread_contact_id_label: &'a Label,
+    send_button: &'a Button,
+    body_entry: &'a Entry,
+    auto_scroll_locked: &'a Rc<Cell<bool>>,
 }
 
 fn main() -> glib::ExitCode {
@@ -646,7 +689,7 @@ fn build_ui(app: &Application) {
     footer.set_valign(gtk4::Align::End);
     footer.set_size_request(-1, 28);
 
-    let footer_note = Label::new(Some("Aethos Linux app"));
+    let footer_note = Label::new(Some(&build_version_text()));
     footer_note.add_css_class("footer-note");
     footer_note.set_xalign(0.0);
     footer_note.set_hexpand(true);
@@ -790,13 +833,15 @@ fn build_ui(app: &Application) {
     );
     render_messages(
         &chat_state.borrow(),
-        &messages_list,
-        &messages_scroll,
-        &thread_title,
-        &thread_contact_id_label,
-        &send_button,
-        &body_entry,
-        &auto_scroll_locked,
+        MessageRenderUi {
+            messages_list: &messages_list,
+            messages_scroll: &messages_scroll,
+            thread_title: &thread_title,
+            thread_contact_id_label: &thread_contact_id_label,
+            send_button: &send_button,
+            body_entry: &body_entry,
+            auto_scroll_locked: &auto_scroll_locked,
+        },
     );
 
     {
@@ -860,13 +905,15 @@ fn build_ui(app: &Application) {
                 );
                 render_messages(
                     &chat_state.borrow(),
-                    &messages_list,
-                    &messages_scroll,
-                    &thread_title,
-                    &thread_contact_id_label,
-                    &send_button,
-                    &body_entry,
-                    &auto_scroll_locked,
+                    MessageRenderUi {
+                        messages_list: &messages_list,
+                        messages_scroll: &messages_scroll,
+                        thread_title: &thread_title,
+                        thread_contact_id_label: &thread_contact_id_label,
+                        send_button: &send_button,
+                        body_entry: &body_entry,
+                        auto_scroll_locked: &auto_scroll_locked,
+                    },
                 );
             }
         });
@@ -927,13 +974,15 @@ fn build_ui(app: &Application) {
             );
             render_messages(
                 &chat_state.borrow(),
-                &messages_list,
-                &messages_scroll,
-                &thread_title,
-                &thread_contact_id_label,
-                &send_button,
-                &body_entry,
-                &auto_scroll_locked,
+                MessageRenderUi {
+                    messages_list: &messages_list,
+                    messages_scroll: &messages_scroll,
+                    thread_title: &thread_title,
+                    thread_contact_id_label: &thread_contact_id_label,
+                    send_button: &send_button,
+                    body_entry: &body_entry,
+                    auto_scroll_locked: &auto_scroll_locked,
+                },
             );
         });
     }
@@ -1236,13 +1285,15 @@ fn build_ui(app: &Application) {
                 );
                 render_messages(
                     &chat_state.borrow(),
-                    &messages_list,
-                    &messages_scroll,
-                    &thread_title,
-                    &thread_contact_id_label,
-                    &send_button,
-                    &body_entry,
-                    &auto_scroll_locked,
+                    MessageRenderUi {
+                        messages_list: &messages_list,
+                        messages_scroll: &messages_scroll,
+                        thread_title: &thread_title,
+                        thread_contact_id_label: &thread_contact_id_label,
+                        send_button: &send_button,
+                        body_entry: &body_entry,
+                        auto_scroll_locked: &auto_scroll_locked,
+                    },
                 );
             }
         });
@@ -1270,13 +1321,15 @@ fn build_ui(app: &Application) {
             }
             render_messages(
                 &chat_state.borrow(),
-                &messages_list,
-                &messages_scroll,
-                &thread_title,
-                &thread_contact_id_label,
-                &send_button,
-                &body_entry,
-                &auto_scroll_locked,
+                MessageRenderUi {
+                    messages_list: &messages_list,
+                    messages_scroll: &messages_scroll,
+                    thread_title: &thread_title,
+                    thread_contact_id_label: &thread_contact_id_label,
+                    send_button: &send_button,
+                    body_entry: &body_entry,
+                    auto_scroll_locked: &auto_scroll_locked,
+                },
             );
         });
     }
@@ -1928,8 +1981,7 @@ fn build_ui(app: &Application) {
                 let manifest_for_status = outgoing_manifest_id.clone();
                 let result = send_to_relay_v1_with_auth(
                     &relay_ws,
-                    &identity.wayfarer_id,
-                    &identity.device_id,
+                    (&identity.wayfarer_id, &identity.device_id),
                     &to,
                     &payload_b64,
                     None,
@@ -1978,34 +2030,38 @@ fn build_ui(app: &Application) {
 
     attach_status_poller(
         rx,
-        connect_button,
-        relay_primary_label,
-        relay_secondary_label,
-        diagnostics_text,
-        relay_dot,
-        relay_chip_text,
-        relay_chip,
+        RelayStatusUi {
+            connect_button,
+            relay_primary_label,
+            relay_secondary_label,
+            diagnostics_text,
+            relay_dot,
+            relay_chip_text,
+            relay_chip,
+        },
     );
 
     attach_session_poller(
         session_rx,
-        send_button,
-        body_entry,
-        chat_status_label,
-        Rc::clone(&chat_state),
-        contacts_list,
-        Rc::clone(&contact_order),
-        selected_contact_id_value.clone(),
-        contact_alias_entry.clone(),
-        messages_list,
-        messages_scroll.clone(),
-        thread_title,
-        thread_contact_id_label,
-        compact_contact_picker.clone(),
-        Rc::clone(&picker_syncing),
-        Rc::clone(&wave_pending),
-        wave_mode_label,
-        Rc::clone(&auto_scroll_locked),
+        SessionPollerUi {
+            send_button,
+            body_entry,
+            chat_status_label,
+            chat_state: Rc::clone(&chat_state),
+            contacts_list,
+            contact_order: Rc::clone(&contact_order),
+            selected_contact_id_value: selected_contact_id_value.clone(),
+            contact_alias_entry: contact_alias_entry.clone(),
+            messages_list,
+            messages_scroll: messages_scroll.clone(),
+            thread_title,
+            thread_contact_id_label,
+            compact_contact_picker: compact_contact_picker.clone(),
+            picker_syncing: Rc::clone(&picker_syncing),
+            wave_pending: Rc::clone(&wave_pending),
+            wave_mode_label,
+            auto_scroll_locked: Rc::clone(&auto_scroll_locked),
+        },
     );
 
     attach_compact_adaptive_mode(
@@ -2120,17 +2176,16 @@ fn spawn_relay_checks(
     });
 }
 
-#[allow(clippy::too_many_arguments)]
-fn attach_status_poller(
-    rx: Receiver<RelayStatus>,
-    connect_button: Button,
-    relay_primary_label: Label,
-    relay_secondary_label: Label,
-    diagnostics_text: TextView,
-    relay_dot: Label,
-    relay_chip_text: Label,
-    relay_chip: GtkBox,
-) {
+fn attach_status_poller(rx: Receiver<RelayStatus>, ui: RelayStatusUi) {
+    let RelayStatusUi {
+        connect_button,
+        relay_primary_label,
+        relay_secondary_label,
+        diagnostics_text,
+        relay_dot,
+        relay_chip_text,
+        relay_chip,
+    } = ui;
     let mut completed = 0;
     let mut expected_total = 2;
 
@@ -2270,27 +2325,26 @@ fn set_gossip_chip_disabled(gossip_dot: &Label, gossip_chip_text: &Label, gossip
     gossip_chip.set_tooltip_text(Some("LAN gossip is disabled in Settings"));
 }
 
-#[allow(clippy::too_many_arguments)]
-fn attach_session_poller(
-    rx: Receiver<SessionStatus>,
-    send_button: Button,
-    body_entry: Entry,
-    chat_status_label: Label,
-    chat_state: Rc<RefCell<ChatState>>,
-    contacts_list: ListBox,
-    contact_order: Rc<RefCell<Vec<String>>>,
-    selected_contact_id_value: Label,
-    contact_alias_entry: Entry,
-    messages_list: ListBox,
-    messages_scroll: ScrolledWindow,
-    thread_title: Label,
-    thread_contact_id_label: Label,
-    compact_contact_picker: ComboBoxText,
-    picker_syncing: Rc<Cell<bool>>,
-    wave_pending: Rc<Cell<bool>>,
-    wave_mode_label: Label,
-    auto_scroll_locked: Rc<Cell<bool>>,
-) {
+fn attach_session_poller(rx: Receiver<SessionStatus>, ui: SessionPollerUi) {
+    let SessionPollerUi {
+        send_button,
+        body_entry,
+        chat_status_label,
+        chat_state,
+        contacts_list,
+        contact_order,
+        selected_contact_id_value,
+        contact_alias_entry,
+        messages_list,
+        messages_scroll,
+        thread_title,
+        thread_contact_id_label,
+        compact_contact_picker,
+        picker_syncing,
+        wave_pending,
+        wave_mode_label,
+        auto_scroll_locked,
+    } = ui;
     glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
         while let Ok(status) = rx.try_recv() {
             match status.op {
@@ -2440,13 +2494,15 @@ fn attach_session_poller(
             );
             render_messages(
                 &chat_state.borrow(),
-                &messages_list,
-                &messages_scroll,
-                &thread_title,
-                &thread_contact_id_label,
-                &send_button,
-                &body_entry,
-                &auto_scroll_locked,
+                MessageRenderUi {
+                    messages_list: &messages_list,
+                    messages_scroll: &messages_scroll,
+                    thread_title: &thread_title,
+                    thread_contact_id_label: &thread_contact_id_label,
+                    send_button: &send_button,
+                    body_entry: &body_entry,
+                    auto_scroll_locked: &auto_scroll_locked,
+                },
             );
 
             if status.outgoing_contact.is_some() {
@@ -3177,17 +3233,16 @@ fn attach_compact_adaptive_mode(
     });
 }
 
-#[allow(clippy::too_many_arguments)]
-fn render_messages(
-    state: &ChatState,
-    messages_list: &ListBox,
-    messages_scroll: &ScrolledWindow,
-    thread_title: &Label,
-    thread_contact_id_label: &Label,
-    send_button: &Button,
-    body_entry: &Entry,
-    auto_scroll_locked: &Rc<Cell<bool>>,
-) {
+fn render_messages(state: &ChatState, ui: MessageRenderUi<'_>) {
+    let MessageRenderUi {
+        messages_list,
+        messages_scroll,
+        thread_title,
+        thread_contact_id_label,
+        send_button,
+        body_entry,
+        auto_scroll_locked,
+    } = ui;
     clear_listbox(messages_list);
 
     let Some(selected_contact) = state.selected_contact.as_ref() else {
@@ -3687,6 +3742,11 @@ fn shell_escape(value: &str) -> String {
         return value.to_string();
     }
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn build_version_text() -> String {
+    let git_sha = option_env!("AETHOS_GIT_SHA").unwrap_or("dev");
+    format!("Aethos Linux v{APP_VERSION} (build {git_sha})")
 }
 
 fn append_local_log(message: &str) {

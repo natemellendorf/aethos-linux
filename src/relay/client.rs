@@ -80,8 +80,7 @@ pub fn send_to_relay_v1(
 ) -> Result<(String, Option<i64>, Option<i64>), String> {
     send_to_relay_v1_with_auth(
         relay_ws,
-        wayfarer_id,
-        device_id,
+        (wayfarer_id, device_id),
         to,
         payload_b64,
         client_msg_id,
@@ -91,17 +90,16 @@ pub fn send_to_relay_v1(
 }
 
 #[allow(dead_code)]
-#[allow(clippy::too_many_arguments)]
 pub fn send_to_relay_v1_with_auth(
     relay_ws: &str,
-    wayfarer_id: &str,
-    device_id: &str,
+    identity: (&str, &str),
     to: &str,
     payload_b64: &str,
     client_msg_id: Option<&str>,
     ttl_seconds: Option<i64>,
     auth_token: Option<&str>,
 ) -> Result<(String, Option<i64>, Option<i64>), String> {
+    let (wayfarer_id, device_id) = identity;
     let frame = SendFrame::new(
         to,
         payload_b64,

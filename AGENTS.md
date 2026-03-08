@@ -16,8 +16,8 @@
 - Hooks are repository-managed via `scripts/setup-git-hooks.sh` and should be installed in local dev environments.
 - Commit gate (`pre-commit`): run full project lint checks before commit is accepted.
 - Merge gate (`pre-merge-commit`): when merging local `main` tip, run full test suite before merge commit completes.
-- Push gate (`pre-push`): when pushing `origin/main`, create a GitHub prerelease before allowing the push to continue.
-- Official releases should be cut only through `scripts/release/create-release.sh` to keep versioning/changelog/tag flow consistent.
+- Push gate (`pre-push`): when pushing `origin/main`, create a GitHub prerelease only on explicit request (`AETHOS_CREATE_PRERELEASE=1` or `git push -o prerelease`).
+- Official releases should be cut only through `scripts/release/create-release.sh` (or promoted from prerelease via `--from-prerelease`, which creates the clean `vX.Y.Z` official tag) to keep versioning/changelog/tag flow consistent.
 
 ## Release policy
 
