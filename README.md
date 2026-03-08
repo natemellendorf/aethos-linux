@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/natemellendorf/aethos/refs/heads/main/docs/img/banner.jpg" alt="Aethos banner" width="960">
+</p>
+
 # aethos-linux
 
 Native Linux GUI client scaffold for Aethos.
@@ -125,15 +129,25 @@ This installer will:
 - build `aethos-linux` in release mode
 - install the binary to `~/.local/bin/aethos-linux`
 
+By default, if `--ref` is not provided, it resolves and installs the latest GitHub release tag.
+
 Optional flags/environment:
 
 ```bash
-# Install from a tag
 curl -fsSL https://raw.githubusercontent.com/natemellendorf/aethos-linux/main/scripts/install.sh | bash -s -- --ref v0.1.0
+```
 
-# Skip dependency bootstrap if already provisioned
+```bash
+# Install from a specific tag
+curl -fsSL https://raw.githubusercontent.com/natemellendorf/aethos-linux/main/scripts/install.sh | bash -s -- --ref v0.2.0
+```
+
+```bash
+# Skip dependency bootstrap
 curl -fsSL https://raw.githubusercontent.com/natemellendorf/aethos-linux/main/scripts/install.sh | bash -s -- --skip-deps
+```
 
+```bash
 # Custom binary directory
 curl -fsSL https://raw.githubusercontent.com/natemellendorf/aethos-linux/main/scripts/install.sh | bash -s -- --bin-dir "$HOME/bin"
 ```

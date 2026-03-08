@@ -2,10 +2,9 @@
 set -euo pipefail
 
 DEFAULT_REPO="natemellendorf/aethos-linux"
-DEFAULT_REF="main"
 
 REPO="${AETHOS_REPO:-$DEFAULT_REPO}"
-REF="${AETHOS_REF:-$DEFAULT_REF}"
+REF="${AETHOS_REF:-}"
 PREFIX="${AETHOS_PREFIX:-$HOME/.local}"
 BIN_DIR="${AETHOS_BIN_DIR:-$PREFIX/bin}"
 SKIP_DEPS="${AETHOS_SKIP_DEPS:-0}"
@@ -19,7 +18,7 @@ Usage:
 
 Options:
   --repo <owner/name>  GitHub repository (default: natemellendorf/aethos-linux)
-  --ref <git-ref>      Branch, tag, or commit to install (default: main)
+  --ref <git-ref>      Branch, tag, or commit to install (default: latest release tag)
   --prefix <dir>       Install prefix (default: ~/.local)
   --bin-dir <dir>      Binary install dir (default: <prefix>/bin)
   --skip-deps          Skip OS/Rust dependency bootstrap
@@ -30,7 +29,7 @@ Environment overrides:
 
 Examples:
   curl -fsSL https://raw.githubusercontent.com/natemellendorf/aethos-linux/main/scripts/install.sh | bash
-  curl -fsSL https://raw.githubusercontent.com/natemellendorf/aethos-linux/main/scripts/install.sh | bash -s -- --ref v0.1.0
+  curl -fsSL https://raw.githubusercontent.com/natemellendorf/aethos-linux/main/scripts/install.sh | bash -s -- --ref v0.2.0
 EOF
 }
 
@@ -100,6 +99,26 @@ ensure_rust() {
   fi
 
   has_cmd cargo || fail "cargo is still unavailable after rustup install."
+}
+
+resolve_ref() {
+  if [[ -n "${REF}" ]]; then
+    log "Using explicit ref: ${REF}"
+    return
+  fi
+
+  local api_url="https://api.github.com/repos/${REPO}/releases/latest"
+  local json tag
+
+  json="$(curl -fsSL -H 'Accept: application/vnd.github+json' "${api_url}" || true)"
+  tag="$(printf '%s' "${json}" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+
+  if [[ -z "${tag}" ]]; then
+    fail "Unable to resolve latest release tag for ${REPO}. Pass --ref <branch|tag|commit> explicitly."
+  fi
+
+  REF="${tag}"
+  log "Resolved latest release tag: ${REF}"
 }
 
 download_source() {
@@ -183,6 +202,7 @@ main() {
   need_linux
   ensure_apt_deps
   ensure_rust
+  resolve_ref
 
   local tmp_dir
   tmp_dir="$(mktemp -d)"
