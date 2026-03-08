@@ -147,10 +147,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-gnu
-
       - name: Setup MSYS2 with GTK4
         uses: msys2/setup-msys2@v2
         with:
@@ -160,7 +156,15 @@ jobs:
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-pkgconf
             mingw-w64-x86_64-gtk4
+            mingw-w64-x86_64-rust
             zip
+
+      - name: Verify windows toolchain
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          rustc --version
+          cargo --version
 
       - name: Build windows binary
         shell: msys2 {0}
