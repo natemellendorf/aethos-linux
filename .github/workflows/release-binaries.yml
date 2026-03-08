@@ -1,0 +1,216 @@
+name: Release Binaries
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build assets for (example: v0.2.1 or v0.2.1-pre...)"
+        required: true
+        type: string
+      build_prerelease:
+        description: Allow prerelease tag builds
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.out.outputs.tag }}
+      should_build: ${{ steps.out.outputs.should_build }}
+    steps:
+      - id: out
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            tag="${{ github.event.release.tag_name }}"
+            prerelease="${{ github.event.release.prerelease }}"
+            if [[ "${prerelease}" == "true" ]]; then
+              should_build="false"
+              echo "Skipping prerelease '${tag}' (explicit opt-in required via workflow_dispatch)."
+            else
+              should_build="true"
+            fi
+          else
+            tag="${{ inputs.tag }}"
+            allow_pre="${{ inputs.build_prerelease }}"
+            if [[ "${tag}" == *-pre.* && "${allow_pre}" != "true" ]]; then
+              echo "Requested tag '${tag}' looks like a prerelease. Re-run with build_prerelease=true." >&2
+              exit 1
+            fi
+            should_build="true"
+          fi
+
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "should_build=${should_build}" >> "$GITHUB_OUTPUT"
+
+  build-linux:
+    needs: prepare
+    if: needs.prepare.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+      TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libgtk-4-dev libglib2.0-dev
+
+      - name: Build linux binary
+        run: cargo build --release --locked --target "$TARGET" --bin aethos
+
+      - name: Package linux artifact
+        run: |
+          mkdir -p dist
+          cp "target/$TARGET/release/aethos" dist/aethos
+          tar -C dist -czf "dist/aethos-${TAG}-${TARGET}.tar.gz" aethos
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ env.TARGET }}
+          path: dist/aethos-${{ env.TAG }}-${{ env.TARGET }}.tar.gz
+
+  build-macos:
+    needs: prepare
+    if: needs.prepare.outputs.should_build == 'true'
+    runs-on: macos-latest
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Determine macOS target
+        shell: bash
+        run: |
+          set -euo pipefail
+          arch="$(uname -m)"
+          case "$arch" in
+            arm64|aarch64)
+              target="aarch64-apple-darwin"
+              ;;
+            x86_64)
+              target="x86_64-apple-darwin"
+              ;;
+            *)
+              echo "Unsupported macOS arch: $arch" >&2
+              exit 1
+              ;;
+          esac
+          echo "TARGET=$target" >> "$GITHUB_ENV"
+
+      - name: Install macOS build dependencies
+        run: |
+          brew update
+          brew install gtk4 pkg-config
+
+      - name: Build macOS binary
+        run: |
+          rustup target add "$TARGET"
+          cargo build --release --locked --target "$TARGET" --bin aethos
+
+      - name: Package macOS artifact
+        run: |
+          mkdir -p dist
+          cp "target/$TARGET/release/aethos" dist/aethos
+          tar -C dist -czf "dist/aethos-${TAG}-${TARGET}.tar.gz" aethos
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ env.TARGET }}
+          path: dist/aethos-${{ env.TAG }}-${{ env.TARGET }}.tar.gz
+
+  build-windows:
+    needs: prepare
+    if: needs.prepare.outputs.should_build == 'true'
+    runs-on: windows-latest
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+      TARGET: x86_64-pc-windows-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Setup MSYS2 with GTK4
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-gtk4
+            zip
+
+      - name: Build windows binary
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target "$TARGET" --bin aethos
+
+      - name: Package windows artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target\${env:TARGET}\release\aethos.exe" "dist\aethos.exe"
+          Compress-Archive -Path "dist\aethos.exe" -DestinationPath "dist\aethos-${env:TAG}-${env:TARGET}.zip" -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ env.TARGET }}
+          path: dist/aethos-${{ env.TAG }}-${{ env.TARGET }}.zip
+
+  upload-release-assets:
+    needs: [prepare, build-linux, build-macos, build-windows]
+    if: needs.prepare.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Flatten artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mkdir -p out
+          for file in dist/*/*; do
+            mv "$file" out/
+          done
+
+      - name: Generate SHA256 sums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd out
+          sha256sum * > aethos-${TAG}-sha256sums.txt
+
+      - name: Upload assets to release
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" out/* --clobber

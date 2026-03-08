@@ -6,12 +6,18 @@
 
 Native Linux GUI client scaffold for Aethos.
 
-## One-line install (curl | bash)
+## Install
 
-For a quick workstation install from GitHub:
+### Linux/macOS (shell)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/natemellendorf/aethos-linux/main/scripts/install.sh | bash
+```
+
+### Windows (PowerShell)
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
 ```
 
 This installer will:
@@ -22,7 +28,7 @@ This installer will:
 - build `aethos` in release mode
 - install the binary to `~/.local/bin/aethos` (with compatibility alias `aethos-linux`)
 
-By default, if `--ref` is not provided, it resolves and installs the latest GitHub release tag.
+By default, if `--ref` is not provided, installers resolve the latest official GitHub release tag and download a prebuilt binary artifact for the local OS/arch.
 
 Optional flags/environment:
 
@@ -32,13 +38,13 @@ curl -fsSL https://raw.githubusercontent.com/natemellendorf/aethos-linux/main/sc
 ```
 
 ```bash
-# Skip dependency bootstrap
-curl -fsSL https://raw.githubusercontent.com/natemellendorf/aethos-linux/main/scripts/install.sh | bash -s -- --skip-deps
-```
-
-```bash
 # Custom binary directory
 curl -fsSL https://raw.githubusercontent.com/natemellendorf/aethos-linux/main/scripts/install.sh | bash -s -- --bin-dir "$HOME/bin"
+```
+
+```powershell
+# Windows specific tag install
+powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Ref v0.2.0
 ```
 
 ## MVP 0 goals
@@ -216,6 +222,9 @@ Prerelease + release scripts:
 # Create prerelease manually (also used by pre-push hook)
 scripts/release/create-prerelease.sh
 
+# Create prerelease and explicitly queue prerelease binary artifacts
+AETHOS_BUILD_PRERELEASE_BINARIES=1 scripts/release/create-prerelease.sh
+
 # Request prerelease during push (opt-in)
 AETHOS_CREATE_PRERELEASE=1 git push origin main
 # or
@@ -231,6 +240,17 @@ scripts/release/create-release.sh
 # (example: v1.2.3-pre.2026... -> v1.2.3)
 scripts/release/create-release.sh --from-prerelease <tag>
 ```
+
+Binary artifact workflow (`.github/workflows/release-binaries.yml`):
+
+- Official release (`release.published` with `prerelease=false`): builds and uploads Linux/macOS/Windows artifacts automatically.
+- Prerelease: skipped by default.
+- Explicit prerelease binary build: run workflow manually with `workflow_dispatch` and `build_prerelease=true`, or set `AETHOS_BUILD_PRERELEASE_BINARIES=1` when running `create-prerelease.sh`.
+- Output assets are attached to the release as:
+  - `aethos-<tag>-x86_64-unknown-linux-gnu.tar.gz`
+  - `aethos-<tag>-<macos-target>.tar.gz`
+  - `aethos-<tag>-x86_64-pc-windows-gnu.zip`
+  - `aethos-<tag>-sha256sums.txt`
 
 The app footer displays the build identifier as `v<version> (build <git-sha>)` for troubleshooting.
 

@@ -40,3 +40,11 @@ gh release create "${tag}" \
   --notes "${notes}"
 
 log "created prerelease ${tag}"
+
+if [[ "${AETHOS_BUILD_PRERELEASE_BINARIES:-0}" == "1" ]]; then
+  log "dispatching prerelease binary build workflow"
+  gh workflow run release-binaries.yml \
+    -f tag="${tag}" \
+    -f build_prerelease=true
+  log "queued workflow: release-binaries.yml (tag=${tag})"
+fi

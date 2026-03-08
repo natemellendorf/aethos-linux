@@ -25,3 +25,4 @@
 - Breaking changes (`!` or `BREAKING CHANGE:`) trigger major bumps.
 - `feat:` changes trigger minor bumps.
 - Other changes trigger patch bumps.
+- CI binary artifact builds run automatically only for official releases; prerelease binary builds require explicit opt-in.
