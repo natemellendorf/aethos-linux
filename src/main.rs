@@ -6,9 +6,9 @@ use gtk4::gdk::Display;
 use gtk4::pango::EllipsizeMode;
 use gtk4::prelude::*;
 use gtk4::{
-    glib, Application, ApplicationWindow, Box as GtkBox, Button, ComboBoxText, CssProvider, Dialog,
-    DrawingArea, Entry, Image, Label, ListBox, ListBoxRow, Orientation, Paned, Popover,
-    PositionType, ResponseType, Revealer, RevealerTransitionType, ScrolledWindow, Stack,
+    glib, Application, ApplicationWindow, Box as GtkBox, Button, CheckButton, ComboBoxText,
+    CssProvider, Dialog, DrawingArea, Entry, Image, Label, ListBox, ListBoxRow, Orientation, Paned,
+    Popover, PositionType, ResponseType, Revealer, RevealerTransitionType, ScrolledWindow, Stack,
     StackSwitcher, TextView, STYLE_PROVIDER_PRIORITY_APPLICATION,
 };
 use image::{ImageBuffer, Luma, Rgba, RgbaImage};
@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
@@ -28,6 +29,13 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::aethos_core::gossip_sync::{
+    has_item as gossip_has_item, import_transfer_items,
+    inventory_entries as gossip_inventory_entries, parse_frame as parse_gossip_frame,
+    record_local_payload as gossip_record_local_payload, serialize_frame as serialize_gossip_frame,
+    transfer_items_for_request as gossip_transfer_items, GossipSyncFrame, GOSSIP_LAN_PORT,
+    GOSSIP_SYNC_VERSION,
+};
 use crate::aethos_core::identity_store::{
     delete_wayfarer_id, ensure_local_identity, load_contact_aliases, load_relay_session_cache,
     regenerate_local_identity, save_contact_aliases, save_relay_session_cache, RelaySessionCache,
@@ -48,10 +56,12 @@ const DEFAULT_RELAY_HTTP_SECONDARY: &str = "http://192.168.1.200:9082";
 const APP_LOG_FILE_NAME: &str = "aethos-linux.log";
 const CHAT_HISTORY_FILE_NAME: &str = "chat-history.json";
 const SHARE_QR_FILE_NAME: &str = "share-wayfarer-qr.png";
+const APP_SETTINGS_FILE_NAME: &str = "settings.json";
 
 #[derive(Clone, Debug)]
 struct RelayStatus {
     relay_slot: usize,
+    batch_total: usize,
     relay_http: String,
     relay_ws: String,
     state: String,
@@ -72,6 +82,8 @@ struct SessionStatus {
     outgoing_contact: Option<String>,
     outgoing_text: Option<String>,
     outgoing_manifest_id: Option<String>,
+    outgoing_local_id: Option<String>,
+    outgoing_error: Option<String>,
     pulled_messages: Vec<PulledMessagePreview>,
 }
 
@@ -81,14 +93,22 @@ struct PulledMessagePreview {
     msg_id: String,
     text: String,
     received_at: i64,
+    manifest_id_hex: Option<String>,
     receipt_manifest_id: Option<String>,
     receipt_received_at_unix_ms: Option<u64>,
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum ChatDirection {
     Incoming,
     Outgoing,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+enum OutboundState {
+    Sending,
+    Sent,
+    Failed { error: String },
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -96,6 +116,8 @@ struct ChatMessage {
     msg_id: String,
     text: String,
     timestamp: String,
+    #[serde(default)]
+    created_at_unix: i64,
     direction: ChatDirection,
     #[serde(default)]
     seen: bool,
@@ -103,6 +125,8 @@ struct ChatMessage {
     manifest_id_hex: Option<String>,
     #[serde(default)]
     delivered_at: Option<String>,
+    #[serde(default)]
+    outbound_state: Option<OutboundState>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -118,6 +142,27 @@ struct ChatState {
     show_full_contact_id: bool,
     contact_aliases: BTreeMap<String, String>,
     new_contacts: BTreeSet<String>,
+    contact_filter: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct AppSettings {
+    relay_sync_enabled: bool,
+    gossip_sync_enabled: bool,
+    relay_endpoints: Vec<String>,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            relay_sync_enabled: true,
+            gossip_sync_enabled: true,
+            relay_endpoints: vec![
+                DEFAULT_RELAY_HTTP_PRIMARY.to_string(),
+                DEFAULT_RELAY_HTTP_SECONDARY.to_string(),
+            ],
+        }
+    }
 }
 
 fn main() -> glib::ExitCode {
@@ -132,6 +177,11 @@ fn main() -> glib::ExitCode {
 
 fn build_ui(app: &Application) {
     apply_styles();
+
+    let initial_settings = load_app_settings().unwrap_or_default();
+    let app_settings = Rc::new(RefCell::new(initial_settings.clone()));
+    let relay_sync_enabled = Arc::new(AtomicBool::new(initial_settings.relay_sync_enabled));
+    let gossip_sync_enabled = Arc::new(AtomicBool::new(initial_settings.gossip_sync_enabled));
 
     let window = ApplicationWindow::builder()
         .application(app)
@@ -247,10 +297,29 @@ fn build_ui(app: &Application) {
     relay_config_title.add_css_class("section-title");
     relay_config_title.set_xalign(0.0);
 
-    let relay_http_primary_entry = Entry::builder().hexpand(true).build();
-    relay_http_primary_entry.set_text(DEFAULT_RELAY_HTTP_PRIMARY);
-    let relay_http_secondary_entry = Entry::builder().hexpand(true).build();
-    relay_http_secondary_entry.set_text(DEFAULT_RELAY_HTTP_SECONDARY);
+    let relay_toggle = CheckButton::with_label("Enable Relay Sync");
+    relay_toggle.set_active(initial_settings.relay_sync_enabled);
+    let gossip_toggle = CheckButton::with_label("Enable LAN Gossip Sync");
+    gossip_toggle.set_active(initial_settings.gossip_sync_enabled);
+
+    let relay_list = ListBox::new();
+    relay_list.add_css_class("contact-list");
+    let relay_list_order = Rc::new(RefCell::new(Vec::<String>::new()));
+    let relay_list_scroll = ScrolledWindow::builder().min_content_height(120).build();
+    relay_list_scroll.set_vexpand(true);
+    relay_list_scroll.set_child(Some(&relay_list));
+
+    let relay_entry = Entry::builder().hexpand(true).build();
+    relay_entry.set_placeholder_text(Some("Relay endpoint (http://host:port)"));
+
+    let relay_actions = GtkBox::new(Orientation::Horizontal, 8);
+    let add_relay_button = Button::with_label("Add Relay");
+    add_relay_button.add_css_class("compact");
+    let remove_relay_button = Button::with_label("Remove Selected");
+    remove_relay_button.add_css_class("danger");
+    remove_relay_button.set_sensitive(false);
+    relay_actions.append(&add_relay_button);
+    relay_actions.append(&remove_relay_button);
 
     let connect_button = Button::with_label("Run Relay Diagnostics");
     connect_button.add_css_class("action");
@@ -277,8 +346,11 @@ fn build_ui(app: &Application) {
     diagnostics_scroll.set_child(Some(&diagnostics_text));
 
     diagnostics_panel.append(&relay_config_title);
-    diagnostics_panel.append(&relay_http_primary_entry);
-    diagnostics_panel.append(&relay_http_secondary_entry);
+    diagnostics_panel.append(&relay_toggle);
+    diagnostics_panel.append(&gossip_toggle);
+    diagnostics_panel.append(&relay_list_scroll);
+    diagnostics_panel.append(&relay_entry);
+    diagnostics_panel.append(&relay_actions);
     diagnostics_panel.append(&connect_button);
     diagnostics_panel.append(&open_logs_button);
     diagnostics_panel.append(&relay_primary_label);
@@ -366,6 +438,18 @@ fn build_ui(app: &Application) {
     messages_scroll.set_vexpand(true);
     messages_scroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
     messages_scroll.set_child(Some(&messages_list));
+
+    let auto_scroll_locked = Rc::new(Cell::new(false));
+    {
+        let auto_scroll_locked = Rc::clone(&auto_scroll_locked);
+        let adj = messages_scroll.vadjustment();
+        adj.connect_value_changed(move |adj| {
+            let bottom = (adj.upper() - adj.page_size()).max(adj.lower());
+            let distance = bottom - adj.value();
+            let user_has_scrolled = adj.value() > adj.lower() + 1.0;
+            auto_scroll_locked.set(user_has_scrolled && distance > 12.0);
+        });
+    }
     thread_column.append(&thread_header);
     thread_column.append(&messages_scroll);
 
@@ -421,13 +505,21 @@ fn build_ui(app: &Application) {
     contacts_manage_scroll.set_child(Some(&contacts_manage_list));
     contacts_manage_scroll.set_vexpand(true);
 
-    let contact_id_entry = Entry::builder().hexpand(true).build();
-    contact_id_entry.set_placeholder_text(Some("Wayfarer ID (64 lowercase hex)"));
-    let contact_id_label = Label::new(Some("Wayfarer ID"));
+    let contact_filter_entry = Entry::builder().hexpand(true).build();
+    contact_filter_entry.set_placeholder_text(Some("Filter contacts by name or ID"));
+    contact_filter_entry.add_css_class("message-entry");
+
+    let selected_contact_id_value = Label::new(Some("No contact selected"));
+    selected_contact_id_value.add_css_class("contact-id-value");
+    selected_contact_id_value.set_xalign(0.0);
+
+    let new_contact_id_entry = Entry::builder().hexpand(true).build();
+    new_contact_id_entry.set_placeholder_text(Some("New contact Wayfarer ID (64 lowercase hex)"));
+    let contact_id_label = Label::new(Some("Selected Contact Wayfarer ID"));
     contact_id_label.add_css_class("field-label");
     contact_id_label.set_xalign(0.0);
     let contact_id_hint = Label::new(Some(
-        "Paste the contact's global Wayfarer address (64 lowercase hex characters).",
+        "Current selected contact address. To add a new contact, paste their ID in the field below.",
     ));
     contact_id_hint.add_css_class("field-hint");
     contact_id_hint.set_xalign(0.0);
@@ -455,10 +547,12 @@ fn build_ui(app: &Application) {
 
     contacts_panel.append(&contacts_manage_title);
     contacts_panel.append(&contacts_manage_hint);
+    contacts_panel.append(&contact_filter_entry);
     contacts_panel.append(&contacts_manage_scroll);
     contacts_panel.append(&contact_id_label);
     contacts_panel.append(&contact_id_hint);
-    contacts_panel.append(&contact_id_entry);
+    contacts_panel.append(&selected_contact_id_value);
+    contacts_panel.append(&new_contact_id_entry);
     contacts_panel.append(&contact_alias_label);
     contacts_panel.append(&contact_alias_hint);
     contacts_panel.append(&contact_alias_entry);
@@ -577,11 +671,14 @@ fn build_ui(app: &Application) {
 
     {
         let share_wayfarer_entry = share_wayfarer_entry.clone();
+        let copy_wayfarer_button = copy_wayfarer_button.clone();
+        let copy_wayfarer_popover_anchor = copy_wayfarer_button.clone();
         copy_wayfarer_button.connect_clicked(move |_| {
             if let Some(display) = Display::default() {
                 display
                     .clipboard()
                     .set_text(&share_wayfarer_entry.text().to_string());
+                show_copied_popover(&copy_wayfarer_popover_anchor);
             }
         });
     }
@@ -602,6 +699,12 @@ fn build_ui(app: &Application) {
     } else {
         update_relay_chip("idle", "idle", &relay_dot, &relay_chip_text, &relay_chip);
     }
+
+    render_relay_list(
+        &app_settings.borrow().relay_endpoints,
+        &relay_list,
+        &relay_list_order,
+    );
 
     let chat_state = Rc::new(RefCell::new(ChatState::default()));
     let contact_order = Rc::new(RefCell::new(Vec::<String>::new()));
@@ -648,8 +751,14 @@ fn build_ui(app: &Application) {
     picker_syncing.set(false);
     sync_contact_form(
         &chat_state.borrow(),
-        &contact_id_entry,
+        &selected_contact_id_value,
         &contact_alias_entry,
+    );
+    update_contact_action_buttons(
+        &chat_state.borrow(),
+        &new_contact_id_entry,
+        &add_update_contact_button,
+        &remove_contact_button,
     );
     render_messages(
         &chat_state.borrow(),
@@ -657,6 +766,9 @@ fn build_ui(app: &Application) {
         &messages_scroll,
         &thread_title,
         &thread_contact_id_label,
+        &send_button,
+        &body_entry,
+        &auto_scroll_locked,
     );
 
     {
@@ -668,8 +780,14 @@ fn build_ui(app: &Application) {
         let thread_contact_id_label = thread_contact_id_label.clone();
         let recipient_entry = recipient_entry.clone();
         let compact_contact_picker = compact_contact_picker.clone();
-        let contact_id_entry = contact_id_entry.clone();
+        let selected_contact_id_value = selected_contact_id_value.clone();
         let contact_alias_entry = contact_alias_entry.clone();
+        let new_contact_id_entry = new_contact_id_entry.clone();
+        let add_update_contact_button = add_update_contact_button.clone();
+        let remove_contact_button = remove_contact_button.clone();
+        let send_button = send_button.clone();
+        let body_entry = body_entry.clone();
+        let auto_scroll_locked = Rc::clone(&auto_scroll_locked);
         let picker_syncing = Rc::clone(&picker_syncing);
         contacts_list.connect_row_selected(move |_list, row| {
             let Some(row) = row else {
@@ -689,6 +807,7 @@ fn build_ui(app: &Application) {
                     state.new_contacts.remove(&contact_id);
                     mark_contact_seen(&mut state, &contact_id);
                 }
+                auto_scroll_locked.set(false);
                 let _ = save_persisted_chat_state(&chat_state.borrow());
                 if let Some(selected_contact) = chat_state.borrow().selected_contact.as_ref() {
                     recipient_entry.set_text(selected_contact);
@@ -702,8 +821,14 @@ fn build_ui(app: &Application) {
                 picker_syncing.set(false);
                 sync_contact_form(
                     &chat_state.borrow(),
-                    &contact_id_entry,
+                    &selected_contact_id_value,
                     &contact_alias_entry,
+                );
+                update_contact_action_buttons(
+                    &chat_state.borrow(),
+                    &new_contact_id_entry,
+                    &add_update_contact_button,
+                    &remove_contact_button,
                 );
                 render_messages(
                     &chat_state.borrow(),
@@ -711,6 +836,9 @@ fn build_ui(app: &Application) {
                     &messages_scroll,
                     &thread_title,
                     &thread_contact_id_label,
+                    &send_button,
+                    &body_entry,
+                    &auto_scroll_locked,
                 );
             }
         });
@@ -724,8 +852,14 @@ fn build_ui(app: &Application) {
         let thread_title = thread_title.clone();
         let thread_contact_id_label = thread_contact_id_label.clone();
         let recipient_entry = recipient_entry.clone();
-        let contact_id_entry = contact_id_entry.clone();
+        let selected_contact_id_value = selected_contact_id_value.clone();
         let contact_alias_entry = contact_alias_entry.clone();
+        let new_contact_id_entry = new_contact_id_entry.clone();
+        let add_update_contact_button = add_update_contact_button.clone();
+        let remove_contact_button = remove_contact_button.clone();
+        let send_button = send_button.clone();
+        let body_entry = body_entry.clone();
+        let auto_scroll_locked = Rc::clone(&auto_scroll_locked);
         let picker_syncing = Rc::clone(&picker_syncing);
         compact_contact_picker.connect_changed(move |picker| {
             if picker_syncing.get() {
@@ -749,12 +883,19 @@ fn build_ui(app: &Application) {
                 state.new_contacts.remove(&active_id);
                 mark_contact_seen(&mut state, &active_id);
             }
+            auto_scroll_locked.set(false);
             let _ = save_persisted_chat_state(&chat_state.borrow());
             recipient_entry.set_text(&active_id);
             sync_contact_form(
                 &chat_state.borrow(),
-                &contact_id_entry,
+                &selected_contact_id_value,
                 &contact_alias_entry,
+            );
+            update_contact_action_buttons(
+                &chat_state.borrow(),
+                &new_contact_id_entry,
+                &add_update_contact_button,
+                &remove_contact_button,
             );
             render_messages(
                 &chat_state.borrow(),
@@ -762,6 +903,9 @@ fn build_ui(app: &Application) {
                 &messages_scroll,
                 &thread_title,
                 &thread_contact_id_label,
+                &send_button,
+                &body_entry,
+                &auto_scroll_locked,
             );
         });
     }
@@ -773,13 +917,29 @@ fn build_ui(app: &Application) {
         let contacts_list = contacts_list.clone();
         let contacts_manage_list = contacts_manage_list.clone();
         let compact_contact_picker = compact_contact_picker.clone();
-        let contact_id_entry = contact_id_entry.clone();
+        let selected_contact_id_value = selected_contact_id_value.clone();
+        let new_contact_id_entry = new_contact_id_entry.clone();
         let contact_alias_entry = contact_alias_entry.clone();
         let chat_status_label = chat_status_label.clone();
         let picker_syncing = Rc::clone(&picker_syncing);
         let recipient_entry = recipient_entry.clone();
-        add_update_contact_button.connect_clicked(move |_| {
-            let contact_id = contact_id_entry.text().trim().to_string();
+        let add_update_contact_button_for_click = add_update_contact_button.clone();
+        let add_update_contact_button_state = add_update_contact_button_for_click.clone();
+        let remove_contact_button_state = remove_contact_button.clone();
+        add_update_contact_button_for_click.connect_clicked(move |_| {
+            let typed_contact_id = new_contact_id_entry.text().trim().to_string();
+            let contact_id = if typed_contact_id.is_empty() {
+                match chat_state.borrow().selected_contact.clone() {
+                    Some(selected) => selected,
+                    None => {
+                        chat_status_label
+                            .set_text("Enter a contact ID to add, or select a contact to update");
+                        return;
+                    }
+                }
+            } else {
+                typed_contact_id
+            };
             if !is_valid_wayfarer_id(&contact_id) {
                 chat_status_label
                     .set_text("invalid contact id: expected 64 lowercase hex characters");
@@ -824,8 +984,15 @@ fn build_ui(app: &Application) {
             picker_syncing.set(false);
             sync_contact_form(
                 &chat_state.borrow(),
-                &contact_id_entry,
+                &selected_contact_id_value,
                 &contact_alias_entry,
+            );
+            new_contact_id_entry.set_text("");
+            update_contact_action_buttons(
+                &chat_state.borrow(),
+                &new_contact_id_entry,
+                &add_update_contact_button_state,
+                &remove_contact_button_state,
             );
             if let Some(selected) = chat_state.borrow().selected_contact.as_ref() {
                 recipient_entry.set_text(selected);
@@ -838,72 +1005,134 @@ fn build_ui(app: &Application) {
         let chat_state = Rc::clone(&chat_state);
         let contact_order = Rc::clone(&contact_order);
         let contacts_manage_order = Rc::clone(&contacts_manage_order);
+        let window = window.clone();
         let contacts_list = contacts_list.clone();
         let contacts_manage_list = contacts_manage_list.clone();
         let compact_contact_picker = compact_contact_picker.clone();
-        let contact_id_entry = contact_id_entry.clone();
+        let selected_contact_id_value = selected_contact_id_value.clone();
         let contact_alias_entry = contact_alias_entry.clone();
         let chat_status_label = chat_status_label.clone();
         let picker_syncing = Rc::clone(&picker_syncing);
         let recipient_entry = recipient_entry.clone();
-        remove_contact_button.connect_clicked(move |_| {
-            let contact_id = contact_id_entry.text().trim().to_string();
-            if contact_id.is_empty() {
-                chat_status_label.set_text("Select a contact to remove");
-                return;
-            }
-
-            {
-                let mut state = chat_state.borrow_mut();
-                state.contact_aliases.remove(&contact_id);
-                state.threads.remove(&contact_id);
-                state.new_contacts.remove(&contact_id);
-                if state.selected_contact.as_deref() == Some(contact_id.as_str()) {
-                    state.selected_contact = state.contact_aliases.keys().next().cloned();
-                    if let Some(next_contact) = state.selected_contact.clone() {
-                        mark_contact_seen(&mut state, &next_contact);
-                    }
-                }
-                if let Err(err) = save_contact_aliases(&state.contact_aliases) {
-                    chat_status_label.set_text(&format!("failed to remove contact: {err}"));
+        let new_contact_id_entry = new_contact_id_entry.clone();
+        let remove_contact_button_for_click = remove_contact_button.clone();
+        let add_update_contact_button_state = add_update_contact_button.clone();
+        let remove_contact_button_state = remove_contact_button_for_click.clone();
+        remove_contact_button_for_click.connect_clicked(move |_| {
+            let contact_id = match chat_state.borrow().selected_contact.clone() {
+                Some(selected) => selected,
+                None => {
+                    chat_status_label.set_text("Select a contact to remove");
                     return;
                 }
-            }
-            if let Err(err) = save_persisted_chat_state(&chat_state.borrow()) {
-                chat_status_label.set_text(&format!("failed to persist chat state: {err}"));
-                return;
-            }
+            };
 
-            render_contacts(&chat_state.borrow(), &contacts_list, &contact_order);
-            render_contacts_manager(
-                &chat_state.borrow(),
-                &contacts_manage_list,
-                &contacts_manage_order,
-            );
-            picker_syncing.set(true);
-            sync_contact_picker(
-                &chat_state.borrow(),
-                &compact_contact_picker,
-                &contact_order,
-            );
-            picker_syncing.set(false);
-            sync_contact_form(
-                &chat_state.borrow(),
-                &contact_id_entry,
-                &contact_alias_entry,
-            );
-            if let Some(selected) = chat_state.borrow().selected_contact.as_ref() {
-                recipient_entry.set_text(selected);
-            } else {
-                recipient_entry.set_text("");
-            }
-            chat_status_label.set_text("Contact removed locally");
+            let display_name = {
+                let state = chat_state.borrow();
+                contact_display_name(&state, &contact_id)
+            };
+
+            let dialog = Dialog::builder()
+                .transient_for(&window)
+                .modal(true)
+                .title("Remove Contact?")
+                .build();
+            dialog.add_button("Cancel", ResponseType::Cancel);
+            dialog.add_button("Remove Contact", ResponseType::Accept);
+
+            let content = dialog.content_area();
+            let warning = Label::new(Some(&format!(
+                "Remove {display_name} ({}) and local thread history? This cannot be undone.",
+                tiny_wayfarer(&contact_id)
+            )));
+            warning.set_wrap(true);
+            warning.set_xalign(0.0);
+            warning.add_css_class("warning");
+            content.append(&warning);
+
+            let chat_state = Rc::clone(&chat_state);
+            let contact_order = Rc::clone(&contact_order);
+            let contacts_manage_order = Rc::clone(&contacts_manage_order);
+            let contacts_list = contacts_list.clone();
+            let contacts_manage_list = contacts_manage_list.clone();
+            let compact_contact_picker = compact_contact_picker.clone();
+            let selected_contact_id_value = selected_contact_id_value.clone();
+            let contact_alias_entry = contact_alias_entry.clone();
+            let chat_status_label = chat_status_label.clone();
+            let picker_syncing = Rc::clone(&picker_syncing);
+            let recipient_entry = recipient_entry.clone();
+            let new_contact_id_entry_for_dialog = new_contact_id_entry.clone();
+            let add_update_contact_button_for_dialog = add_update_contact_button_state.clone();
+            let remove_contact_button_for_dialog = remove_contact_button_state.clone();
+            dialog.connect_response(move |dialog, response| {
+                if response != ResponseType::Accept {
+                    dialog.close();
+                    return;
+                }
+
+                let contact_id = contact_id.clone();
+                {
+                    let mut state = chat_state.borrow_mut();
+                    state.contact_aliases.remove(&contact_id);
+                    state.threads.remove(&contact_id);
+                    state.new_contacts.remove(&contact_id);
+                    if state.selected_contact.as_deref() == Some(contact_id.as_str()) {
+                        state.selected_contact = state.contact_aliases.keys().next().cloned();
+                        if let Some(next_contact) = state.selected_contact.clone() {
+                            mark_contact_seen(&mut state, &next_contact);
+                        }
+                    }
+                    if let Err(err) = save_contact_aliases(&state.contact_aliases) {
+                        chat_status_label.set_text(&format!("failed to remove contact: {err}"));
+                        dialog.close();
+                        return;
+                    }
+                }
+                if let Err(err) = save_persisted_chat_state(&chat_state.borrow()) {
+                    chat_status_label.set_text(&format!("failed to persist chat state: {err}"));
+                    dialog.close();
+                    return;
+                }
+
+                render_contacts(&chat_state.borrow(), &contacts_list, &contact_order);
+                render_contacts_manager(
+                    &chat_state.borrow(),
+                    &contacts_manage_list,
+                    &contacts_manage_order,
+                );
+                picker_syncing.set(true);
+                sync_contact_picker(
+                    &chat_state.borrow(),
+                    &compact_contact_picker,
+                    &contact_order,
+                );
+                picker_syncing.set(false);
+                sync_contact_form(
+                    &chat_state.borrow(),
+                    &selected_contact_id_value,
+                    &contact_alias_entry,
+                );
+                update_contact_action_buttons(
+                    &chat_state.borrow(),
+                    &new_contact_id_entry_for_dialog,
+                    &add_update_contact_button_for_dialog,
+                    &remove_contact_button_for_dialog,
+                );
+                if let Some(selected) = chat_state.borrow().selected_contact.as_ref() {
+                    recipient_entry.set_text(selected);
+                } else {
+                    recipient_entry.set_text("");
+                }
+                chat_status_label.set_text("Contact removed locally");
+                dialog.close();
+            });
+            dialog.present();
         });
     }
 
     {
         let add_update_contact_button = add_update_contact_button.clone();
-        contact_id_entry.connect_activate(move |_| {
+        new_contact_id_entry.connect_activate(move |_| {
             add_update_contact_button.emit_clicked();
         });
     }
@@ -920,8 +1149,11 @@ fn build_ui(app: &Application) {
         let contacts_manage_order = Rc::clone(&contacts_manage_order);
         let contact_order = Rc::clone(&contact_order);
         let contacts_list = contacts_list.clone();
-        let contact_id_entry = contact_id_entry.clone();
+        let selected_contact_id_value = selected_contact_id_value.clone();
         let contact_alias_entry = contact_alias_entry.clone();
+        let new_contact_id_entry = new_contact_id_entry.clone();
+        let add_update_contact_button = add_update_contact_button.clone();
+        let remove_contact_button = remove_contact_button.clone();
         let recipient_entry = recipient_entry.clone();
         let compact_contact_picker = compact_contact_picker.clone();
         let picker_syncing = Rc::clone(&picker_syncing);
@@ -929,6 +1161,9 @@ fn build_ui(app: &Application) {
         let messages_scroll = messages_scroll.clone();
         let thread_title = thread_title.clone();
         let thread_contact_id_label = thread_contact_id_label.clone();
+        let send_button = send_button.clone();
+        let body_entry = body_entry.clone();
+        let auto_scroll_locked = Rc::clone(&auto_scroll_locked);
         let contacts_manage_list = contacts_manage_list.clone();
         contacts_manage_list.connect_row_selected(move |_list, row| {
             let Some(row) = row else {
@@ -947,6 +1182,7 @@ fn build_ui(app: &Application) {
                     state.new_contacts.remove(&contact_id);
                     mark_contact_seen(&mut state, &contact_id);
                 }
+                auto_scroll_locked.set(false);
                 let _ = save_persisted_chat_state(&chat_state.borrow());
                 if let Some(selected) = chat_state.borrow().selected_contact.as_ref() {
                     recipient_entry.set_text(selected);
@@ -961,8 +1197,14 @@ fn build_ui(app: &Application) {
                 picker_syncing.set(false);
                 sync_contact_form(
                     &chat_state.borrow(),
-                    &contact_id_entry,
+                    &selected_contact_id_value,
                     &contact_alias_entry,
+                );
+                update_contact_action_buttons(
+                    &chat_state.borrow(),
+                    &new_contact_id_entry,
+                    &add_update_contact_button,
+                    &remove_contact_button,
                 );
                 render_messages(
                     &chat_state.borrow(),
@@ -970,6 +1212,9 @@ fn build_ui(app: &Application) {
                     &messages_scroll,
                     &thread_title,
                     &thread_contact_id_label,
+                    &send_button,
+                    &body_entry,
+                    &auto_scroll_locked,
                 );
             }
         });
@@ -982,6 +1227,9 @@ fn build_ui(app: &Application) {
         let thread_title = thread_title.clone();
         let thread_contact_id_label = thread_contact_id_label.clone();
         let id_toggle_button = id_toggle_button.clone();
+        let send_button = send_button.clone();
+        let body_entry = body_entry.clone();
+        let auto_scroll_locked = Rc::clone(&auto_scroll_locked);
         id_toggle_button.connect_clicked(move |button| {
             {
                 let mut state = chat_state.borrow_mut();
@@ -998,6 +1246,9 @@ fn build_ui(app: &Application) {
                 &messages_scroll,
                 &thread_title,
                 &thread_contact_id_label,
+                &send_button,
+                &body_entry,
+                &auto_scroll_locked,
             );
         });
     }
@@ -1150,14 +1401,96 @@ fn build_ui(app: &Application) {
     }
 
     {
-        let contact_id_entry = contact_id_entry.clone();
+        let chat_state = Rc::clone(&chat_state);
+        let new_contact_id_entry = new_contact_id_entry.clone();
+        let add_update_contact_button = add_update_contact_button.clone();
+        let remove_contact_button = remove_contact_button.clone();
+        let new_contact_id_entry_state = new_contact_id_entry.clone();
+        new_contact_id_entry.connect_changed(move |_| {
+            update_contact_action_buttons(
+                &chat_state.borrow(),
+                &new_contact_id_entry_state,
+                &add_update_contact_button,
+                &remove_contact_button,
+            );
+        });
+    }
+
+    {
+        let chat_state = Rc::clone(&chat_state);
+        let contacts_manage_list = contacts_manage_list.clone();
+        let contacts_manage_order = Rc::clone(&contacts_manage_order);
+        let contact_filter_entry = contact_filter_entry.clone();
+        let contact_filter_entry_state = contact_filter_entry.clone();
+        contact_filter_entry.connect_changed(move |_| {
+            chat_state.borrow_mut().contact_filter = contact_filter_entry_state.text().to_string();
+            render_contacts_manager(
+                &chat_state.borrow(),
+                &contacts_manage_list,
+                &contacts_manage_order,
+            );
+
+            let selected_contact = chat_state.borrow().selected_contact.clone();
+            if let Some(selected_contact) = selected_contact {
+                let selected_index = contacts_manage_order
+                    .borrow()
+                    .iter()
+                    .position(|contact| contact == &selected_contact);
+                if let Some(index) = selected_index {
+                    if let Some(row) = contacts_manage_list.row_at_index(index as i32) {
+                        contacts_manage_list.select_row(Some(&row));
+                    }
+                } else {
+                    contacts_manage_list.select_row(Option::<&ListBoxRow>::None);
+                }
+            } else {
+                contacts_manage_list.select_row(Option::<&ListBoxRow>::None);
+            }
+        });
+    }
+
+    {
+        let chat_state = Rc::clone(&chat_state);
+        let contacts_manage_order = Rc::clone(&contacts_manage_order);
+        let new_contact_id_entry = new_contact_id_entry.clone();
+        let selected_contact_id_value = selected_contact_id_value.clone();
         let contact_alias_entry = contact_alias_entry.clone();
         let contacts_manage_list = contacts_manage_list.clone();
+        let contact_filter_entry = contact_filter_entry.clone();
+        let add_update_contact_button = add_update_contact_button.clone();
+        let remove_contact_button = remove_contact_button.clone();
         views.connect_visible_child_name_notify(move |stack| {
             if stack.visible_child_name().as_deref() == Some("contacts") {
-                contact_id_entry.set_text("");
-                contact_alias_entry.set_text("");
-                contacts_manage_list.select_row(Option::<&ListBoxRow>::None);
+                new_contact_id_entry.set_text("");
+                contact_filter_entry.set_text(&chat_state.borrow().contact_filter);
+                sync_contact_form(
+                    &chat_state.borrow(),
+                    &selected_contact_id_value,
+                    &contact_alias_entry,
+                );
+
+                let selected_contact = chat_state.borrow().selected_contact.clone();
+                if let Some(selected_contact) = selected_contact {
+                    let selected_index = contacts_manage_order
+                        .borrow()
+                        .iter()
+                        .position(|contact| contact == &selected_contact);
+                    if let Some(index) = selected_index {
+                        if let Some(row) = contacts_manage_list.row_at_index(index as i32) {
+                            contacts_manage_list.select_row(Some(&row));
+                        }
+                    } else {
+                        contacts_manage_list.select_row(Option::<&ListBoxRow>::None);
+                    }
+                } else {
+                    contacts_manage_list.select_row(Option::<&ListBoxRow>::None);
+                }
+                update_contact_action_buttons(
+                    &chat_state.borrow(),
+                    &new_contact_id_entry,
+                    &add_update_contact_button,
+                    &remove_contact_button,
+                );
             }
         });
     }
@@ -1189,6 +1522,116 @@ fn build_ui(app: &Application) {
     }
 
     {
+        let app_settings = Rc::clone(&app_settings);
+        let relay_sync_enabled = Arc::clone(&relay_sync_enabled);
+        relay_toggle.connect_toggled(move |toggle| {
+            let mut settings = app_settings.borrow_mut();
+            settings.relay_sync_enabled = toggle.is_active();
+            relay_sync_enabled.store(settings.relay_sync_enabled, Ordering::SeqCst);
+            if let Err(err) = save_app_settings(&settings) {
+                append_local_log(&format!("save_settings_failed: {err}"));
+            }
+        });
+    }
+
+    {
+        let app_settings = Rc::clone(&app_settings);
+        let gossip_sync_enabled = Arc::clone(&gossip_sync_enabled);
+        gossip_toggle.connect_toggled(move |toggle| {
+            let mut settings = app_settings.borrow_mut();
+            settings.gossip_sync_enabled = toggle.is_active();
+            gossip_sync_enabled.store(settings.gossip_sync_enabled, Ordering::SeqCst);
+            if let Err(err) = save_app_settings(&settings) {
+                append_local_log(&format!("save_settings_failed: {err}"));
+            }
+        });
+    }
+
+    {
+        let relay_list_order = Rc::clone(&relay_list_order);
+        let relay_entry = relay_entry.clone();
+        let remove_relay_button = remove_relay_button.clone();
+        relay_list.connect_row_selected(move |_list, row| {
+            let Some(row) = row else {
+                remove_relay_button.set_sensitive(false);
+                return;
+            };
+            let idx = row.index();
+            if idx >= 0 {
+                if let Some(endpoint) = relay_list_order.borrow().get(idx as usize) {
+                    relay_entry.set_text(endpoint);
+                    remove_relay_button.set_sensitive(true);
+                }
+            }
+        });
+    }
+
+    {
+        let app_settings = Rc::clone(&app_settings);
+        let relay_list = relay_list.clone();
+        let relay_list_order = Rc::clone(&relay_list_order);
+        let relay_entry = relay_entry.clone();
+        let remove_relay_button = remove_relay_button.clone();
+        add_relay_button.connect_clicked(move |_| {
+            let candidate = normalize_http_endpoint(&relay_entry.text());
+            if candidate.trim().is_empty() {
+                return;
+            }
+            let mut settings = app_settings.borrow_mut();
+            if !settings
+                .relay_endpoints
+                .iter()
+                .any(|item| item == &candidate)
+            {
+                settings.relay_endpoints.push(candidate.clone());
+            }
+            settings.relay_endpoints.sort();
+            settings.relay_endpoints.dedup();
+            if let Err(err) = save_app_settings(&settings) {
+                append_local_log(&format!("save_settings_failed: {err}"));
+            }
+            render_relay_list(&settings.relay_endpoints, &relay_list, &relay_list_order);
+            select_relay_row_by_value(&relay_list, &relay_list_order, &candidate);
+            remove_relay_button.set_sensitive(true);
+        });
+    }
+
+    {
+        let app_settings = Rc::clone(&app_settings);
+        let relay_list = relay_list.clone();
+        let relay_list_order = Rc::clone(&relay_list_order);
+        let relay_entry = relay_entry.clone();
+        let remove_relay_button_for_click = remove_relay_button.clone();
+        let remove_relay_button_state = remove_relay_button_for_click.clone();
+        remove_relay_button_for_click.connect_clicked(move |_| {
+            let idx = relay_list
+                .selected_row()
+                .map(|row| row.index())
+                .unwrap_or(-1);
+            if idx < 0 {
+                return;
+            }
+            let mut settings = app_settings.borrow_mut();
+            if (idx as usize) < settings.relay_endpoints.len() {
+                settings.relay_endpoints.remove(idx as usize);
+            }
+            if let Err(err) = save_app_settings(&settings) {
+                append_local_log(&format!("save_settings_failed: {err}"));
+            }
+            render_relay_list(&settings.relay_endpoints, &relay_list, &relay_list_order);
+            relay_entry.set_text("");
+            remove_relay_button_state.set_sensitive(false);
+        });
+    }
+
+    {
+        let add_relay_button = add_relay_button.clone();
+        relay_entry.connect_activate(move |_| {
+            add_relay_button.emit_clicked();
+        });
+    }
+
+    {
         let tx = tx.clone();
         let wayfarer_id_entry = wayfarer_id_entry.clone();
         let identity_meta_label = identity_meta_label.clone();
@@ -1196,10 +1639,18 @@ fn build_ui(app: &Application) {
         let share_wayfarer_entry = share_wayfarer_entry.clone();
         let share_qr_image = share_qr_image.clone();
         let share_status_label = share_status_label.clone();
-        let relay_http_primary_entry = relay_http_primary_entry.clone();
-        let relay_http_secondary_entry = relay_http_secondary_entry.clone();
+        let app_settings = Rc::clone(&app_settings);
+        let relay_sync_enabled = Arc::clone(&relay_sync_enabled);
+        let relay_secondary_label = relay_secondary_label.clone();
         connect_button.connect_clicked(move |button| {
             button.set_sensitive(false);
+
+            if !relay_sync_enabled.load(Ordering::SeqCst) {
+                relay_secondary_label
+                    .set_text("Secondary relay status: relay sync disabled in settings");
+                button.set_sensitive(true);
+                return;
+            }
 
             let identity = match ensure_local_identity() {
                 Ok(identity) => identity,
@@ -1222,11 +1673,15 @@ fn build_ui(app: &Application) {
             onboarding_status
                 .set_text("Step 2/2 · Identity provisioned automatically before diagnostics.");
 
-            let relay_http_primary = normalize_http_endpoint(&relay_http_primary_entry.text());
-            let relay_http_secondary = normalize_http_endpoint(&relay_http_secondary_entry.text());
+            let relay_endpoints = app_settings.borrow().relay_endpoints.clone();
+            if relay_endpoints.is_empty() {
+                relay_secondary_label.set_text("Secondary relay status: no relay configured");
+                button.set_sensitive(true);
+                return;
+            }
 
             spawn_relay_checks(
-                vec![relay_http_primary, relay_http_secondary],
+                relay_endpoints,
                 &identity.wayfarer_id,
                 &identity.device_id,
                 tx.clone(),
@@ -1238,12 +1693,28 @@ fn build_ui(app: &Application) {
 
     {
         let session_tx = session_tx.clone();
-        let relay_http_primary_entry = relay_http_primary_entry.clone();
+        let app_settings = Rc::clone(&app_settings);
+        let relay_sync_enabled = Arc::clone(&relay_sync_enabled);
         let recipient_entry = recipient_entry.clone();
         let body_entry = body_entry.clone();
         let chat_state = Rc::clone(&chat_state);
         send_button.connect_clicked(move |button| {
             button.set_sensitive(false);
+
+            if !relay_sync_enabled.load(Ordering::SeqCst) {
+                let _ = session_tx.send(SessionStatus {
+                    op: SessionOp::Send,
+                    text: "send failed: relay sync disabled in settings".to_string(),
+                    ack_msg_id: None,
+                    outgoing_contact: None,
+                    outgoing_text: None,
+                    outgoing_manifest_id: None,
+                    outgoing_local_id: None,
+                    outgoing_error: None,
+                    pulled_messages: Vec::new(),
+                });
+                return;
+            }
 
             let identity = match ensure_local_identity() {
                 Ok(identity) => identity,
@@ -1255,14 +1726,32 @@ fn build_ui(app: &Application) {
                         outgoing_contact: None,
                         outgoing_text: None,
                         outgoing_manifest_id: None,
+                        outgoing_local_id: None,
+                        outgoing_error: None,
                         pulled_messages: Vec::new(),
                     });
                     return;
                 }
             };
 
-            let relay_ws =
-                to_ws_endpoint(&normalize_http_endpoint(&relay_http_primary_entry.text()));
+            let relay_http = match app_settings.borrow().relay_endpoints.first().cloned() {
+                Some(endpoint) => endpoint,
+                None => {
+                    let _ = session_tx.send(SessionStatus {
+                        op: SessionOp::Send,
+                        text: "send failed: no relay configured".to_string(),
+                        ack_msg_id: None,
+                        outgoing_contact: None,
+                        outgoing_text: None,
+                        outgoing_manifest_id: None,
+                        outgoing_local_id: None,
+                        outgoing_error: None,
+                        pulled_messages: Vec::new(),
+                    });
+                    return;
+                }
+            };
+            let relay_ws = to_ws_endpoint(&normalize_http_endpoint(&relay_http));
             let to = match chat_state.borrow().selected_contact.clone() {
                 Some(contact) => contact,
                 None => {
@@ -1273,6 +1762,8 @@ fn build_ui(app: &Application) {
                         outgoing_contact: None,
                         outgoing_text: None,
                         outgoing_manifest_id: None,
+                        outgoing_local_id: None,
+                        outgoing_error: None,
                         pulled_messages: Vec::new(),
                     });
                     return;
@@ -1286,12 +1777,28 @@ fn build_ui(app: &Application) {
                     outgoing_contact: None,
                     outgoing_text: None,
                     outgoing_manifest_id: None,
+                    outgoing_local_id: None,
+                    outgoing_error: None,
                     pulled_messages: Vec::new(),
                 });
                 return;
             }
             recipient_entry.set_text(&to);
             let outgoing_text = body_entry.text().to_string();
+            if outgoing_text.trim().is_empty() {
+                let _ = session_tx.send(SessionStatus {
+                    op: SessionOp::Send,
+                    text: "send failed: message is empty".to_string(),
+                    ack_msg_id: None,
+                    outgoing_contact: None,
+                    outgoing_text: None,
+                    outgoing_manifest_id: None,
+                    outgoing_local_id: None,
+                    outgoing_error: None,
+                    pulled_messages: Vec::new(),
+                });
+                return;
+            }
             let payload_b64 = match build_envelope_payload_b64_from_utf8(&to, &outgoing_text) {
                 Ok(payload) => payload,
                 Err(err) => {
@@ -1302,19 +1809,41 @@ fn build_ui(app: &Application) {
                         outgoing_contact: None,
                         outgoing_text: None,
                         outgoing_manifest_id: None,
+                        outgoing_local_id: None,
+                        outgoing_error: None,
                         pulled_messages: Vec::new(),
                     });
                     return;
                 }
             };
+            let expires_at_unix_ms = (now_unix_secs().max(0) as u64)
+                .saturating_mul(1000)
+                .saturating_add(3600 * 1000);
+            let _ = gossip_record_local_payload(&payload_b64, expires_at_unix_ms);
             body_entry.set_text("");
             let outgoing_manifest_id = decode_envelope_payload_b64(&payload_b64)
                 .ok()
                 .map(|decoded| decoded.manifest_id_hex);
+            let local_outgoing_id = next_local_outgoing_id();
+
+            let _ = session_tx.send(SessionStatus {
+                op: SessionOp::Send,
+                text: "sending message...".to_string(),
+                ack_msg_id: None,
+                outgoing_contact: Some(to.clone()),
+                outgoing_text: Some(outgoing_text.clone()),
+                outgoing_manifest_id: outgoing_manifest_id.clone(),
+                outgoing_local_id: Some(local_outgoing_id.clone()),
+                outgoing_error: None,
+                pulled_messages: Vec::new(),
+            });
 
             let auth = std::env::var("AETHOS_RELAY_AUTH_TOKEN").ok();
             let session_tx = session_tx.clone();
             thread::spawn(move || {
+                let to_for_status = to.clone();
+                let text_for_status = outgoing_text.clone();
+                let manifest_for_status = outgoing_manifest_id.clone();
                 let result = send_to_relay_v1_with_auth(
                     &relay_ws,
                     &identity.wayfarer_id,
@@ -1337,15 +1866,19 @@ fn build_ui(app: &Application) {
                         outgoing_contact: Some(to),
                         outgoing_text: Some(outgoing_text),
                         outgoing_manifest_id,
+                        outgoing_local_id: Some(local_outgoing_id),
+                        outgoing_error: None,
                         pulled_messages: Vec::new(),
                     },
                     Err(err) => SessionStatus {
                         op: SessionOp::Send,
                         text: format!("send failed: {err}"),
                         ack_msg_id: None,
-                        outgoing_contact: None,
-                        outgoing_text: None,
-                        outgoing_manifest_id: None,
+                        outgoing_contact: Some(to_for_status),
+                        outgoing_text: Some(text_for_status),
+                        outgoing_manifest_id: manifest_for_status,
+                        outgoing_local_id: Some(local_outgoing_id),
+                        outgoing_error: Some(err.clone()),
                         pulled_messages: Vec::new(),
                     },
                 };
@@ -1375,20 +1908,22 @@ fn build_ui(app: &Application) {
     attach_session_poller(
         session_rx,
         send_button,
+        body_entry,
         chat_status_label,
         Rc::clone(&chat_state),
         contacts_list,
         Rc::clone(&contact_order),
-        contact_id_entry.clone(),
+        selected_contact_id_value.clone(),
         contact_alias_entry.clone(),
         messages_list,
-        messages_scroll,
+        messages_scroll.clone(),
         thread_title,
         thread_contact_id_label,
         compact_contact_picker.clone(),
         Rc::clone(&picker_syncing),
         Rc::clone(&wave_pending),
         wave_mode_label,
+        Rc::clone(&auto_scroll_locked),
     );
 
     attach_compact_adaptive_mode(
@@ -1398,9 +1933,15 @@ fn build_ui(app: &Application) {
         compact_picker_revealer,
     );
 
-    start_background_inbox_sync(relay_http_primary_entry, session_tx);
+    start_background_inbox_sync(
+        Rc::clone(&app_settings),
+        Arc::clone(&relay_sync_enabled),
+        session_tx.clone(),
+    );
+    start_background_gossip_sync(session_tx.clone(), Arc::clone(&gossip_sync_enabled));
 
     window.present();
+    force_initial_thread_bottom(messages_scroll, Rc::clone(&auto_scroll_locked));
 }
 
 fn spawn_relay_checks(
@@ -1481,6 +2022,7 @@ fn spawn_relay_checks(
 
             let _ = tx.send(RelayStatus {
                 relay_slot: selection.relay_slot,
+                batch_total: relay_count,
                 relay_http: selection.relay_http,
                 relay_ws: selection.relay_ws,
                 state,
@@ -1502,9 +2044,11 @@ fn attach_status_poller(
     relay_chip: GtkBox,
 ) {
     let mut completed = 0;
+    let mut expected_total = 2;
 
     glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
         while let Ok(status) = rx.try_recv() {
+            expected_total = status.batch_total.max(1);
             completed += 1;
             let text = format!(
                 "{} -> {} · {} · {}",
@@ -1526,7 +2070,7 @@ fn attach_status_poller(
             buffer.set_text(&next);
         }
 
-        if completed >= 2 {
+        if completed >= expected_total {
             let primary = relay_primary_label.text().to_string();
             let secondary = relay_secondary_label.text().to_string();
             update_relay_chip(
@@ -1596,11 +2140,12 @@ fn update_relay_chip(
 fn attach_session_poller(
     rx: Receiver<SessionStatus>,
     send_button: Button,
+    body_entry: Entry,
     chat_status_label: Label,
     chat_state: Rc<RefCell<ChatState>>,
     contacts_list: ListBox,
     contact_order: Rc<RefCell<Vec<String>>>,
-    contact_id_entry: Entry,
+    selected_contact_id_value: Label,
     contact_alias_entry: Entry,
     messages_list: ListBox,
     messages_scroll: ScrolledWindow,
@@ -1610,6 +2155,7 @@ fn attach_session_poller(
     picker_syncing: Rc<Cell<bool>>,
     wave_pending: Rc<Cell<bool>>,
     wave_mode_label: Label,
+    auto_scroll_locked: Rc<Cell<bool>>,
 ) {
     glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
         while let Ok(status) = rx.try_recv() {
@@ -1629,23 +2175,38 @@ fn attach_session_poller(
                     status.outgoing_contact.as_ref(),
                     status.outgoing_text.as_ref(),
                 ) {
-                    let outbound_msg_id = status
-                        .ack_msg_id
+                    let local_id = status
+                        .outgoing_local_id
                         .clone()
-                        .unwrap_or_else(|| "outbound".to_string());
-                    state
-                        .threads
-                        .entry(contact.clone())
-                        .or_default()
-                        .push(ChatMessage {
-                            msg_id: outbound_msg_id,
+                        .unwrap_or_else(next_local_outgoing_id);
+                    let now = now_unix_secs();
+                    let thread = state.threads.entry(contact.clone()).or_default();
+
+                    if !thread.iter().any(|item| item.msg_id == local_id) {
+                        thread.push(ChatMessage {
+                            msg_id: local_id.clone(),
                             text: text.clone(),
-                            timestamp: format_timestamp_from_unix(now_unix_secs()),
+                            timestamp: format_timestamp_from_unix(now),
+                            created_at_unix: now,
                             direction: ChatDirection::Outgoing,
                             seen: true,
                             manifest_id_hex: status.outgoing_manifest_id.clone(),
                             delivered_at: None,
+                            outbound_state: Some(OutboundState::Sending),
                         });
+                    }
+
+                    if let Some(item) = thread.iter_mut().find(|item| item.msg_id == local_id) {
+                        if let Some(error) = status.outgoing_error.as_ref() {
+                            item.outbound_state = Some(OutboundState::Failed {
+                                error: error.clone(),
+                            });
+                        } else if let Some(server_msg_id) = status.ack_msg_id.as_ref() {
+                            item.msg_id = server_msg_id.clone();
+                            item.outbound_state = Some(OutboundState::Sent);
+                        }
+                    }
+
                     state.selected_contact = Some(contact.clone());
                     mark_contact_seen(&mut state, contact);
                 }
@@ -1663,19 +2224,32 @@ fn attach_session_poller(
                     let is_seen_on_insert =
                         state.selected_contact.as_deref() == Some(pulled.from_wayfarer_id.as_str());
 
-                    state
+                    let thread = state
                         .threads
                         .entry(pulled.from_wayfarer_id.clone())
-                        .or_default()
-                        .push(ChatMessage {
-                            msg_id: pulled.msg_id.clone(),
-                            text: pulled.text.clone(),
-                            timestamp: format_timestamp_from_unix(pulled.received_at),
-                            direction: ChatDirection::Incoming,
-                            seen: is_seen_on_insert,
-                            manifest_id_hex: None,
-                            delivered_at: None,
-                        });
+                        .or_default();
+
+                    let already_present = thread.iter().any(|existing| {
+                        existing.msg_id == pulled.msg_id
+                            || (pulled.manifest_id_hex.is_some()
+                                && existing.manifest_id_hex == pulled.manifest_id_hex)
+                    });
+
+                    if already_present {
+                        continue;
+                    }
+
+                    thread.push(ChatMessage {
+                        msg_id: pulled.msg_id.clone(),
+                        text: pulled.text.clone(),
+                        timestamp: format_timestamp_from_unix(pulled.received_at),
+                        created_at_unix: pulled.received_at,
+                        direction: ChatDirection::Incoming,
+                        seen: is_seen_on_insert,
+                        manifest_id_hex: pulled.manifest_id_hex.clone(),
+                        delivered_at: None,
+                        outbound_state: None,
+                    });
 
                     if let Some(manifest) = pulled.receipt_manifest_id.as_ref() {
                         let delivered_time = pulled
@@ -1688,6 +2262,7 @@ fn attach_session_poller(
                                     && item.manifest_id_hex.as_deref() == Some(manifest.as_str())
                                 {
                                     item.delivered_at = Some(delivered_time.clone());
+                                    item.outbound_state = Some(OutboundState::Sent);
                                     break;
                                 }
                             }
@@ -1726,7 +2301,7 @@ fn attach_session_poller(
             picker_syncing.set(false);
             sync_contact_form(
                 &chat_state.borrow(),
-                &contact_id_entry,
+                &selected_contact_id_value,
                 &contact_alias_entry,
             );
             render_messages(
@@ -1735,6 +2310,9 @@ fn attach_session_poller(
                 &messages_scroll,
                 &thread_title,
                 &thread_contact_id_label,
+                &send_button,
+                &body_entry,
+                &auto_scroll_locked,
             );
 
             if status.outgoing_contact.is_some() {
@@ -1749,14 +2327,28 @@ fn attach_session_poller(
     });
 }
 
-fn start_background_inbox_sync(relay_http_primary_entry: Entry, session_tx: Sender<SessionStatus>) {
+fn start_background_inbox_sync(
+    app_settings: Rc<RefCell<AppSettings>>,
+    relay_sync_enabled: Arc<AtomicBool>,
+    session_tx: Sender<SessionStatus>,
+) {
     let inflight = Arc::new(AtomicBool::new(false));
     glib::timeout_add_local(Duration::from_millis(2200), move || {
+        if !relay_sync_enabled.load(Ordering::SeqCst) {
+            return glib::ControlFlow::Continue;
+        }
+
         if inflight.swap(true, Ordering::SeqCst) {
             return glib::ControlFlow::Continue;
         }
 
-        let relay_http = normalize_http_endpoint(&relay_http_primary_entry.text());
+        let relay_http = match app_settings.borrow().relay_endpoints.first().cloned() {
+            Some(endpoint) => normalize_http_endpoint(&endpoint),
+            None => {
+                inflight.store(false, Ordering::SeqCst);
+                return glib::ControlFlow::Continue;
+            }
+        };
         let session_tx = session_tx.clone();
         let inflight_done = Arc::clone(&inflight);
         thread::spawn(move || {
@@ -1770,6 +2362,8 @@ fn start_background_inbox_sync(relay_http_primary_entry: Entry, session_tx: Send
                         outgoing_contact: None,
                         outgoing_text: None,
                         outgoing_manifest_id: None,
+                        outgoing_local_id: None,
+                        outgoing_error: None,
                         pulled_messages: previews,
                     });
                 }
@@ -1798,7 +2392,14 @@ fn sync_inbox_once(relay_http: &str) -> Result<Vec<PulledMessagePreview>, String
     )?;
 
     let mut previews = Vec::with_capacity(messages.len());
+    let expires_at_unix_ms = (now_unix_secs().max(0) as u64)
+        .saturating_mul(1000)
+        .saturating_add(24 * 60 * 60 * 1000);
     for message in &messages {
+        let manifest_id_hex = decode_envelope_payload_b64(&message.payload_b64)
+            .ok()
+            .map(|decoded| decoded.manifest_id_hex);
+        let _ = gossip_record_local_payload(&message.payload_b64, expires_at_unix_ms);
         let text = decode_message_text_for_display(&message.payload_b64);
 
         previews.push(PulledMessagePreview {
@@ -1806,6 +2407,7 @@ fn sync_inbox_once(relay_http: &str) -> Result<Vec<PulledMessagePreview>, String
             msg_id: message.msg_id.clone(),
             text,
             received_at: message.received_at,
+            manifest_id_hex,
             receipt_manifest_id: extract_receipt_manifest_id(&message.payload_b64),
             receipt_received_at_unix_ms: extract_receipt_received_at_ms(&message.payload_b64),
         });
@@ -1822,6 +2424,279 @@ fn sync_inbox_once(relay_http: &str) -> Result<Vec<PulledMessagePreview>, String
     }
 
     Ok(previews)
+}
+
+fn start_background_gossip_sync(
+    session_tx: Sender<SessionStatus>,
+    gossip_sync_enabled: Arc<AtomicBool>,
+) {
+    thread::spawn(move || {
+        let socket = match UdpSocket::bind(("0.0.0.0", GOSSIP_LAN_PORT)) {
+            Ok(socket) => socket,
+            Err(err) => {
+                append_local_log(&format!(
+                    "gossip_sync_disabled: failed binding udp/{GOSSIP_LAN_PORT}: {err}"
+                ));
+                return;
+            }
+        };
+
+        if let Err(err) = socket.set_nonblocking(true) {
+            append_local_log(&format!(
+                "gossip_sync_disabled: set_nonblocking failed: {err}"
+            ));
+            return;
+        }
+        if let Err(err) = socket.set_broadcast(true) {
+            append_local_log(&format!(
+                "gossip_sync_disabled: set_broadcast failed: {err}"
+            ));
+            return;
+        }
+
+        append_local_log(&format!("gossip_sync_started on udp/{GOSSIP_LAN_PORT}"));
+
+        let mut seq: u64 = 0;
+        let mut last_inventory_broadcast = Instant::now() - Duration::from_secs(10);
+
+        loop {
+            if !gossip_sync_enabled.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(120));
+                continue;
+            }
+
+            if last_inventory_broadcast.elapsed() >= Duration::from_secs(3) {
+                if let Ok(identity) = ensure_local_identity() {
+                    seq = seq.saturating_add(1);
+                    let session_id = gossip_id("sess", seq);
+                    let inventory = gossip_inventory_entries(now_unix_ms()).unwrap_or_default();
+                    let frame = GossipSyncFrame::InventorySummary(
+                        crate::aethos_core::gossip_sync::InventorySummaryFrame {
+                            sync_version: GOSSIP_SYNC_VERSION,
+                            session_id,
+                            sender_wayfarer_id: identity.wayfarer_id,
+                            page: 1,
+                            has_more: false,
+                            inventory,
+                        },
+                    );
+                    let _ = send_gossip_frame(&socket, "255.255.255.255", GOSSIP_LAN_PORT, &frame);
+                }
+                last_inventory_broadcast = Instant::now();
+            }
+
+            let mut buf = [0u8; 65_535];
+            match socket.recv_from(&mut buf) {
+                Ok((len, source)) => {
+                    let frame = match parse_gossip_frame(&buf[..len]) {
+                        Ok(frame) => frame,
+                        Err(err) => {
+                            append_local_log(&format!("gossip_parse_ignored from {source}: {err}"));
+                            continue;
+                        }
+                    };
+
+                    let identity = match ensure_local_identity() {
+                        Ok(identity) => identity,
+                        Err(err) => {
+                            append_local_log(&format!("gossip_identity_unavailable: {err}"));
+                            continue;
+                        }
+                    };
+
+                    let local_wayfarer = identity.wayfarer_id;
+
+                    match frame {
+                        GossipSyncFrame::InventorySummary(inv)
+                            if inv.sender_wayfarer_id != local_wayfarer =>
+                        {
+                            let mut missing_item_ids = inv
+                                .inventory
+                                .iter()
+                                .filter(|entry| {
+                                    entry.to_wayfarer_id == local_wayfarer
+                                        && entry.expires_at_unix_ms > now_unix_ms()
+                                })
+                                .filter_map(|entry| {
+                                    gossip_has_item(&entry.item_id).ok().and_then(|exists| {
+                                        if exists {
+                                            None
+                                        } else {
+                                            Some(entry.item_id.clone())
+                                        }
+                                    })
+                                })
+                                .collect::<Vec<_>>();
+                            missing_item_ids.sort();
+
+                            seq = seq.saturating_add(1);
+                            let request = GossipSyncFrame::MissingRequest(
+                                crate::aethos_core::gossip_sync::MissingRequestFrame {
+                                    sync_version: GOSSIP_SYNC_VERSION,
+                                    session_id: inv.session_id,
+                                    sender_wayfarer_id: local_wayfarer,
+                                    page: 1,
+                                    has_more: false,
+                                    request_id: gossip_id("req", seq),
+                                    in_response_to_page: 1,
+                                    missing_item_ids,
+                                    max_transfer_items: 64,
+                                    max_transfer_bytes: 2_097_152,
+                                },
+                            );
+                            let _ = send_gossip_frame(
+                                &socket,
+                                &source.ip().to_string(),
+                                source.port(),
+                                &request,
+                            );
+                        }
+                        GossipSyncFrame::MissingRequest(req)
+                            if req.sender_wayfarer_id != local_wayfarer =>
+                        {
+                            let items = gossip_transfer_items(
+                                &req.missing_item_ids,
+                                req.max_transfer_items.max(1),
+                                req.max_transfer_bytes.max(1),
+                                now_unix_ms(),
+                            )
+                            .unwrap_or_default();
+
+                            seq = seq.saturating_add(1);
+                            let transfer = GossipSyncFrame::Transfer(
+                                crate::aethos_core::gossip_sync::TransferFrame {
+                                    sync_version: GOSSIP_SYNC_VERSION,
+                                    session_id: req.session_id,
+                                    sender_wayfarer_id: local_wayfarer,
+                                    page: 1,
+                                    has_more: false,
+                                    transfer_id: gossip_id("tx", seq),
+                                    in_response_to_request_id: req.request_id,
+                                    items,
+                                },
+                            );
+                            let _ = send_gossip_frame(
+                                &socket,
+                                &source.ip().to_string(),
+                                source.port(),
+                                &transfer,
+                            );
+                        }
+                        GossipSyncFrame::Transfer(transfer)
+                            if transfer.sender_wayfarer_id != local_wayfarer =>
+                        {
+                            let result = import_transfer_items(
+                                &transfer.sender_wayfarer_id,
+                                &local_wayfarer,
+                                &transfer.items,
+                                now_unix_ms(),
+                            );
+
+                            if let Ok(result) = result {
+                                if !result.new_messages.is_empty() {
+                                    let pulled_messages = result
+                                        .new_messages
+                                        .iter()
+                                        .map(|item| PulledMessagePreview {
+                                            from_wayfarer_id: item.from_wayfarer_id.clone(),
+                                            msg_id: item.item_id.clone(),
+                                            text: extract_chat_text_if_json(&item.text),
+                                            received_at: item.received_at_unix,
+                                            manifest_id_hex: item.manifest_id_hex.clone(),
+                                            receipt_manifest_id: None,
+                                            receipt_received_at_unix_ms: None,
+                                        })
+                                        .collect::<Vec<_>>();
+                                    let _ = session_tx.send(SessionStatus {
+                                        op: SessionOp::Inbox,
+                                        text: format!(
+                                            "LAN gossip received {} message(s)",
+                                            pulled_messages.len()
+                                        ),
+                                        ack_msg_id: pulled_messages
+                                            .first()
+                                            .map(|item| item.msg_id.clone()),
+                                        outgoing_contact: None,
+                                        outgoing_text: None,
+                                        outgoing_manifest_id: None,
+                                        outgoing_local_id: None,
+                                        outgoing_error: None,
+                                        pulled_messages,
+                                    });
+                                }
+
+                                seq = seq.saturating_add(1);
+                                let status = if result.rejected_items.is_empty() {
+                                    "accepted".to_string()
+                                } else if result.accepted_item_ids.is_empty() {
+                                    "rejected".to_string()
+                                } else {
+                                    "partial".to_string()
+                                };
+                                let receipt = GossipSyncFrame::Receipt(
+                                    crate::aethos_core::gossip_sync::ReceiptFrame {
+                                        sync_version: GOSSIP_SYNC_VERSION,
+                                        session_id: transfer.session_id,
+                                        sender_wayfarer_id: local_wayfarer,
+                                        page: 1,
+                                        has_more: false,
+                                        receipt_id: gossip_id("rcpt", seq),
+                                        in_response_to_transfer_id: transfer.transfer_id,
+                                        status,
+                                        accepted_item_ids: result.accepted_item_ids,
+                                        rejected_items: result.rejected_items,
+                                    },
+                                );
+                                let _ = send_gossip_frame(
+                                    &socket,
+                                    &source.ip().to_string(),
+                                    source.port(),
+                                    &receipt,
+                                );
+                            }
+                        }
+                        GossipSyncFrame::Receipt(receipt)
+                            if receipt.sender_wayfarer_id != local_wayfarer =>
+                        {
+                            append_local_log(&format!(
+                                "gossip_receipt {} status={} accepted={} rejected={}",
+                                receipt.receipt_id,
+                                receipt.status,
+                                receipt.accepted_item_ids.len(),
+                                receipt.rejected_items.len()
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(30));
+                }
+                Err(err) => {
+                    append_local_log(&format!("gossip_recv_error: {err}"));
+                    thread::sleep(Duration::from_millis(80));
+                }
+            }
+        }
+    });
+}
+
+fn send_gossip_frame(
+    socket: &UdpSocket,
+    host: &str,
+    port: u16,
+    frame: &GossipSyncFrame,
+) -> Result<(), String> {
+    let raw = serialize_gossip_frame(frame)?;
+    let addr = format!("{host}:{port}");
+    socket
+        .send_to(&raw, &addr)
+        .map(|_| ())
+        .map_err(|err| format!("gossip send failed ({addr}): {err}"))
+}
+
+fn gossip_id(prefix: &str, seq: u64) -> String {
+    format!("linux-{prefix}-{}-{seq}", now_unix_ms())
 }
 
 fn decode_message_text_for_display(payload_b64: &str) -> String {
@@ -2027,7 +2902,12 @@ fn render_contacts_manager(
 ) {
     clear_listbox(contacts_list);
 
-    let contacts = state.contact_aliases.keys().cloned().collect::<Vec<_>>();
+    let contacts = state
+        .contact_aliases
+        .keys()
+        .filter(|contact| contact_matches_filter(state, contact, &state.contact_filter))
+        .cloned()
+        .collect::<Vec<_>>();
     *contact_order.borrow_mut() = contacts.clone();
 
     for contact in contacts {
@@ -2056,6 +2936,23 @@ fn render_contacts_manager(
     }
 }
 
+fn contact_matches_filter(state: &ChatState, wayfarer_id: &str, filter: &str) -> bool {
+    let query = filter.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+
+    if wayfarer_id.contains(query.as_str()) {
+        return true;
+    }
+
+    state
+        .contact_aliases
+        .get(wayfarer_id)
+        .map(|alias| alias.to_ascii_lowercase().contains(query.as_str()))
+        .unwrap_or(false)
+}
+
 fn sync_contact_picker(
     state: &ChatState,
     picker: &ComboBoxText,
@@ -2074,19 +2971,38 @@ fn sync_contact_picker(
     }
 }
 
-fn sync_contact_form(state: &ChatState, contact_id_entry: &Entry, contact_alias_entry: &Entry) {
+fn sync_contact_form(
+    state: &ChatState,
+    selected_contact_id_value: &Label,
+    contact_alias_entry: &Entry,
+) {
     let Some(selected_contact) = state.selected_contact.as_ref() else {
-        contact_id_entry.set_text("");
+        selected_contact_id_value.set_text("No contact selected");
         contact_alias_entry.set_text("");
         return;
     };
 
-    contact_id_entry.set_text(selected_contact);
+    selected_contact_id_value.set_text(selected_contact);
     if let Some(alias) = state.contact_aliases.get(selected_contact) {
         contact_alias_entry.set_text(alias);
     } else {
         contact_alias_entry.set_text("");
     }
+}
+
+fn update_contact_action_buttons(
+    state: &ChatState,
+    new_contact_id_entry: &Entry,
+    add_update_contact_button: &Button,
+    remove_contact_button: &Button,
+) {
+    let has_new_contact_id = !new_contact_id_entry.text().trim().is_empty();
+    if has_new_contact_id {
+        add_update_contact_button.set_label("Add Contact");
+    } else {
+        add_update_contact_button.set_label("Update Contact");
+    }
+    remove_contact_button.set_sensitive(state.selected_contact.is_some());
 }
 
 fn attach_compact_adaptive_mode(
@@ -2124,6 +3040,9 @@ fn render_messages(
     messages_scroll: &ScrolledWindow,
     thread_title: &Label,
     thread_contact_id_label: &Label,
+    send_button: &Button,
+    body_entry: &Entry,
+    auto_scroll_locked: &Rc<Cell<bool>>,
 ) {
     clear_listbox(messages_list);
 
@@ -2144,7 +3063,29 @@ fn render_messages(
     }
 
     if let Some(messages) = state.threads.get(selected_contact) {
+        let mut last_day_key: Option<String> = None;
+        let mut last_direction: Option<ChatDirection> = None;
+
         for message in messages {
+            let (day_key, day_label) = day_key_and_label(message.created_at_unix);
+            let is_new_day = last_day_key.as_deref() != Some(day_key.as_str());
+            if is_new_day {
+                let day_row = ListBoxRow::new();
+                day_row.set_selectable(false);
+                let day_label_widget = Label::new(Some(&day_label));
+                day_label_widget.add_css_class("day-separator");
+                day_label_widget.set_xalign(0.5);
+                day_row.set_child(Some(&day_label_widget));
+                messages_list.append(&day_row);
+            }
+
+            let grouped = !is_new_day
+                && last_direction.as_ref() == Some(&message.direction)
+                && matches!(
+                    message.direction,
+                    ChatDirection::Incoming | ChatDirection::Outgoing
+                );
+
             let row = ListBoxRow::new();
             row.set_selectable(false);
 
@@ -2170,13 +3111,17 @@ fn render_messages(
             bubble.add_controller(click);
 
             let metadata = Label::new(Some(&format!("id={}", message.msg_id)));
-            let delivery_suffix = match message.direction {
-                ChatDirection::Outgoing => message
+            let delivery_suffix = match (&message.direction, &message.outbound_state) {
+                (ChatDirection::Outgoing, Some(OutboundState::Sending)) => " · sending".to_string(),
+                (ChatDirection::Outgoing, Some(OutboundState::Failed { .. })) => {
+                    " · failed (retry)".to_string()
+                }
+                (ChatDirection::Outgoing, _) => message
                     .delivered_at
                     .as_ref()
                     .map(|at| format!(" · delivered {at}"))
-                    .unwrap_or_else(|| " · pending delivery".to_string()),
-                ChatDirection::Incoming => String::new(),
+                    .unwrap_or_else(|| " · sent".to_string()),
+                (ChatDirection::Incoming, _) => String::new(),
             };
             metadata.set_text(&format!(
                 "{} · {}{}",
@@ -2185,11 +3130,50 @@ fn render_messages(
                 delivery_suffix
             ));
             metadata.add_css_class("bubble-meta");
+            match (
+                &message.direction,
+                &message.outbound_state,
+                &message.delivered_at,
+            ) {
+                (ChatDirection::Outgoing, Some(OutboundState::Failed { .. }), _) => {
+                    metadata.add_css_class("bubble-meta-failed");
+                }
+                (ChatDirection::Outgoing, Some(OutboundState::Sending), _) => {
+                    metadata.add_css_class("bubble-meta-sending");
+                }
+                (ChatDirection::Outgoing, _, Some(_)) => {
+                    metadata.add_css_class("bubble-meta-delivered");
+                }
+                (ChatDirection::Outgoing, _, None) => {
+                    metadata.add_css_class("bubble-meta-sent");
+                }
+                _ => {}
+            }
             metadata.set_xalign(0.0);
 
             let bubble_column = GtkBox::new(Orientation::Vertical, 2);
             bubble_column.append(&bubble);
-            bubble_column.append(&metadata);
+            if !grouped {
+                let meta_row = GtkBox::new(Orientation::Horizontal, 6);
+                meta_row.append(&metadata);
+
+                if matches!(message.outbound_state, Some(OutboundState::Failed { .. })) {
+                    let retry_button = Button::with_label("Retry");
+                    retry_button.add_css_class("compact");
+                    let send_button = send_button.clone();
+                    let body_entry = body_entry.clone();
+                    let retry_text = message.text.clone();
+                    retry_button.connect_clicked(move |_| {
+                        body_entry.set_text(&retry_text);
+                        send_button.emit_clicked();
+                    });
+                    meta_row.append(&retry_button);
+                }
+
+                bubble_column.append(&meta_row);
+            } else {
+                bubble.add_css_class("chat-bubble-grouped");
+            }
 
             match message.direction {
                 ChatDirection::Outgoing => {
@@ -2209,10 +3193,15 @@ fn render_messages(
             bubble_wrap.append(&bubble_column);
             row.set_child(Some(&bubble_wrap));
             messages_list.append(&row);
+
+            last_day_key = Some(day_key);
+            last_direction = Some(message.direction.clone());
         }
     }
 
-    scroll_thread_to_bottom(messages_scroll.clone());
+    if !auto_scroll_locked.get() {
+        scroll_thread_to_bottom(messages_scroll.clone());
+    }
 }
 
 fn clear_listbox(list: &ListBox) {
@@ -2225,12 +3214,82 @@ fn clear_listbox(list: &ListBox) {
     }
 }
 
+fn render_relay_list(
+    relays: &[String],
+    relay_list: &ListBox,
+    relay_order: &Rc<RefCell<Vec<String>>>,
+) {
+    clear_listbox(relay_list);
+    let mut normalized = relays
+        .iter()
+        .map(|item| normalize_http_endpoint(item))
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized.dedup();
+    *relay_order.borrow_mut() = normalized.clone();
+
+    for relay in normalized {
+        let row = ListBoxRow::new();
+        row.add_css_class("contact-row");
+        let label = Label::new(Some(&relay));
+        label.set_xalign(0.0);
+        label.set_ellipsize(EllipsizeMode::End);
+        label.set_single_line_mode(true);
+        row.set_child(Some(&label));
+        relay_list.append(&row);
+    }
+}
+
+fn select_relay_row_by_value(
+    relay_list: &ListBox,
+    relay_order: &Rc<RefCell<Vec<String>>>,
+    relay_value: &str,
+) {
+    if let Some(idx) = relay_order
+        .borrow()
+        .iter()
+        .position(|item| item == relay_value)
+    {
+        if let Some(row) = relay_list.row_at_index(idx as i32) {
+            relay_list.select_row(Some(&row));
+        }
+    }
+}
+
 fn scroll_thread_to_bottom(messages_scroll: ScrolledWindow) {
     glib::timeout_add_local(Duration::from_millis(20), move || {
         let adj = messages_scroll.vadjustment();
         let bottom = (adj.upper() - adj.page_size()).max(adj.lower());
         adj.set_value(bottom);
         glib::ControlFlow::Break
+    });
+}
+
+fn force_initial_thread_bottom(
+    messages_scroll: ScrolledWindow,
+    auto_scroll_locked: Rc<Cell<bool>>,
+) {
+    let attempts = Rc::new(Cell::new(0u8));
+    glib::timeout_add_local(Duration::from_millis(70), move || {
+        let next_attempt = attempts.get().saturating_add(1);
+        attempts.set(next_attempt);
+
+        let adj = messages_scroll.vadjustment();
+        let has_layout = adj.upper() > adj.page_size() + 1.0;
+        if has_layout {
+            auto_scroll_locked.set(false);
+            let bottom = (adj.upper() - adj.page_size()).max(adj.lower());
+            adj.set_value(bottom);
+            if next_attempt >= 3 {
+                return glib::ControlFlow::Break;
+            }
+        }
+
+        if next_attempt >= 10 {
+            glib::ControlFlow::Break
+        } else {
+            glib::ControlFlow::Continue
+        }
     });
 }
 
@@ -2315,6 +3374,47 @@ fn format_timestamp_from_unix_ms(unix_ms: u64) -> String {
     format_timestamp_from_unix((unix_ms / 1000) as i64)
 }
 
+fn day_key_and_label(unix_secs: i64) -> (String, String) {
+    if let Ok(dt) = glib::DateTime::from_unix_local(unix_secs.max(0)) {
+        let key = dt
+            .format("%Y-%m-%d")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|_| "unknown-day".to_string());
+
+        if let Ok(now) = glib::DateTime::now_local() {
+            if now
+                .format("%Y-%m-%d")
+                .map(|v| v.to_string())
+                .ok()
+                .as_deref()
+                == Some(key.as_str())
+            {
+                return (key, "Today".to_string());
+            }
+
+            if let Ok(yesterday) = now.add_days(-1) {
+                if yesterday
+                    .format("%Y-%m-%d")
+                    .map(|v| v.to_string())
+                    .ok()
+                    .as_deref()
+                    == Some(key.as_str())
+                {
+                    return (key, "Yesterday".to_string());
+                }
+            }
+        }
+
+        let label = dt
+            .format("%b %d, %Y")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|_| key.clone());
+        return (key, label);
+    }
+
+    ("unknown-day".to_string(), "Earlier".to_string())
+}
+
 fn bytes_to_hex_lower(input: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(input.len() * 2);
@@ -2330,6 +3430,21 @@ fn now_unix_secs() -> i64 {
         Ok(duration) => duration.as_secs() as i64,
         Err(_) => 0,
     }
+}
+
+fn now_unix_ms() -> u64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_millis() as u64,
+        Err(_) => 0,
+    }
+}
+
+fn next_local_outgoing_id() -> String {
+    let nanos = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_nanos(),
+        Err(_) => 0,
+    };
+    format!("local-{nanos}")
 }
 
 fn pulse_widget<W>(widget: &W, class_name: &'static str)
@@ -2627,6 +3742,69 @@ fn chat_history_file_path() -> PathBuf {
     }
 
     std::env::temp_dir().join(CHAT_HISTORY_FILE_NAME)
+}
+
+fn load_app_settings() -> Result<AppSettings, String> {
+    let path = app_settings_file_path();
+    if !path.exists() {
+        return Ok(AppSettings::default());
+    }
+
+    let content = fs::read_to_string(&path)
+        .map_err(|err| format!("failed reading app settings at {}: {err}", path.display()))?;
+    let mut settings: AppSettings = serde_json::from_str(&content)
+        .map_err(|err| format!("failed parsing app settings at {}: {err}", path.display()))?;
+    if settings.relay_endpoints.is_empty() {
+        settings.relay_endpoints = AppSettings::default().relay_endpoints;
+    }
+    settings
+        .relay_endpoints
+        .iter_mut()
+        .for_each(|endpoint| *endpoint = normalize_http_endpoint(endpoint));
+    settings.relay_endpoints.sort();
+    settings.relay_endpoints.dedup();
+    Ok(settings)
+}
+
+fn save_app_settings(settings: &AppSettings) -> Result<(), String> {
+    let path = app_settings_file_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed creating app settings directory: {err}"))?;
+    }
+
+    let mut normalized = settings.clone();
+    normalized
+        .relay_endpoints
+        .iter_mut()
+        .for_each(|endpoint| *endpoint = normalize_http_endpoint(endpoint));
+    normalized.relay_endpoints.sort();
+    normalized.relay_endpoints.dedup();
+
+    let serialized = serde_json::to_string_pretty(&normalized)
+        .map_err(|err| format!("failed serializing app settings: {err}"))?;
+    fs::write(&path, serialized)
+        .map_err(|err| format!("failed writing app settings at {}: {err}", path.display()))
+}
+
+fn app_settings_file_path() -> PathBuf {
+    if let Ok(xdg_state_home) = std::env::var("XDG_STATE_HOME") {
+        if !xdg_state_home.trim().is_empty() {
+            return Path::new(&xdg_state_home)
+                .join("aethos-linux")
+                .join(APP_SETTINGS_FILE_NAME);
+        }
+    }
+
+    if let Ok(home) = std::env::var("HOME") {
+        return Path::new(&home)
+            .join(".local")
+            .join("state")
+            .join("aethos-linux")
+            .join(APP_SETTINGS_FILE_NAME);
+    }
+
+    std::env::temp_dir().join(APP_SETTINGS_FILE_NAME)
 }
 
 fn share_qr_file_path() -> PathBuf {
@@ -3109,11 +4287,21 @@ fn apply_styles() {
             margin: 2px 0;
         }
 
+        .day-separator {
+            font-size: 11px;
+            color: rgba(151, 162, 198, 0.9);
+            margin: 8px 0 4px 0;
+        }
+
         .chat-bubble {
             border-radius: 16px;
             padding: 8px 11px;
             line-height: 1.3;
             font-size: 14px;
+        }
+
+        .chat-bubble-grouped {
+            margin-top: -2px;
         }
 
         .chat-bubble-incoming {
@@ -3135,6 +4323,22 @@ fn apply_styles() {
         .bubble-meta {
             font-size: 11px;
             color: rgba(155, 164, 196, 0.8);
+        }
+
+        .bubble-meta-sending {
+            color: rgba(172, 181, 208, 0.92);
+        }
+
+        .bubble-meta-sent {
+            color: rgba(134, 188, 245, 0.92);
+        }
+
+        .bubble-meta-delivered {
+            color: rgba(120, 224, 156, 0.92);
+        }
+
+        .bubble-meta-failed {
+            color: rgba(255, 146, 162, 0.95);
         }
 
         expander > title {

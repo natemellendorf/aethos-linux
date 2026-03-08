@@ -65,6 +65,10 @@ Native Linux GUI client scaffold for Aethos.
 - Added a dedicated `Contacts` tab for add/update/remove contact management; `Chats` is now message-only and uses selected managed contacts.
 - Added local chat-history persistence so sent/received thread messages survive app restart.
 - Added a `Share` tab with QR generation for Wayfarer ID and centered feather mark overlay.
+- Added Gossip Sync v1 frame models and validation for `inventory_summary`, `missing_request`, `transfer`, and `receipt`.
+- Added local gossip inventory persistence for canonical `EnvelopeV1` payload metadata and deduped `item_id` storage.
+- Added direct LAN gossip sync over UDP broadcast (`47655`) so Linux clients can exchange pending Aethos envelopes without a relay path.
+- Wired relay send/pull flows into the gossip inventory store so relay and direct sync pathways converge into one local message inventory.
 
 ## Identity persistence
 
@@ -105,6 +109,35 @@ curl https://sh.rustup.rs -sSf | sh -s -- -y
 source "$HOME/.cargo/env"
 ```
 
+## One-line install (curl | bash)
+
+For a quick workstation install from GitHub:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/natemellendorf/aethos-linux/main/scripts/install.sh | bash
+```
+
+This installer will:
+
+- install required Ubuntu/Debian packages (when `apt-get` is available)
+- install Rust via rustup if `cargo` is missing
+- download the selected source ref from GitHub
+- build `aethos-linux` in release mode
+- install the binary to `~/.local/bin/aethos-linux`
+
+Optional flags/environment:
+
+```bash
+# Install from a tag
+curl -fsSL https://raw.githubusercontent.com/natemellendorf/aethos-linux/main/scripts/install.sh | bash -s -- --ref v0.1.0
+
+# Skip dependency bootstrap if already provisioned
+curl -fsSL https://raw.githubusercontent.com/natemellendorf/aethos-linux/main/scripts/install.sh | bash -s -- --skip-deps
+
+# Custom binary directory
+curl -fsSL https://raw.githubusercontent.com/natemellendorf/aethos-linux/main/scripts/install.sh | bash -s -- --bin-dir "$HOME/bin"
+```
+
 ## Build, run, and test
 
 From this repository root:
@@ -133,6 +166,12 @@ point the GUI relay fields to reachable listeners, for example:
 - `http://127.0.0.1:9082`
 
 Relay terminals and startup details should follow the `aethos-relay` README setup.
+
+## Local gossip sync (direct peer path)
+
+- Gossip sync runs in the background and uses UDP broadcast on port `47655`.
+- The client emits single-page `inventory_summary` frames (MVP0 profile), responds to `missing_request`, and imports `transfer` frames into local chats.
+- Use LAN/private network segments only for this mode. Inventory metadata is visible to peers that can receive local gossip traffic.
 
 ## Design reference
 

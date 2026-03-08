@@ -68,9 +68,9 @@ starting with Ubuntu/Debian and extending to broader targets later.
 
 ### Milestone 5: Local radio transports
 
-- Abstract transport interfaces for Wi-Fi/Bluetooth/Cellular pathways.
-- Integrate Linux-compatible transport plugins.
-- Route peer communication direct-first, relay fallback second.
+- [~] Abstract transport interfaces for Wi-Fi/Bluetooth/Cellular pathways (Gossip Sync v1 LAN profile landed over UDP).
+- [~] Integrate Linux-compatible transport plugins (LAN direct gossip path landed; Bluetooth pending).
+- [~] Route peer communication direct-first, relay fallback second (relay + LAN inventory convergence landed; policy tuning pending).
 
 ### Milestone 6: Packaging and distribution
 
