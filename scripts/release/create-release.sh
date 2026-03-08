@@ -141,6 +141,7 @@ git commit -m "chore(release): ${tag}"
 git tag -a "${tag}" -m "Release ${tag}"
 
 gh release create "${tag}" \
+  --target "$(git rev-parse HEAD)" \
   --title "Aethos Linux ${tag}" \
   --generate-notes
 

@@ -6,6 +6,41 @@
 
 Native Linux GUI client scaffold for Aethos.
 
+## One-line install (curl | bash)
+
+For a quick workstation install from GitHub:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/natemellendorf/aethos-linux/main/scripts/install.sh | bash
+```
+
+This installer will:
+
+- install required Ubuntu/Debian packages (when `apt-get` is available)
+- install Rust via rustup if `cargo` is missing
+- download the selected source ref from GitHub
+- build `aethos` in release mode
+- install the binary to `~/.local/bin/aethos` (with compatibility alias `aethos-linux`)
+
+By default, if `--ref` is not provided, it resolves and installs the latest GitHub release tag.
+
+Optional flags/environment:
+
+```bash
+# Install from a specific tag
+curl -fsSL https://raw.githubusercontent.com/natemellendorf/aethos-linux/main/scripts/install.sh | bash -s -- --ref v0.2.0
+```
+
+```bash
+# Skip dependency bootstrap
+curl -fsSL https://raw.githubusercontent.com/natemellendorf/aethos-linux/main/scripts/install.sh | bash -s -- --skip-deps
+```
+
+```bash
+# Custom binary directory
+curl -fsSL https://raw.githubusercontent.com/natemellendorf/aethos-linux/main/scripts/install.sh | bash -s -- --bin-dir "$HOME/bin"
+```
+
 ## MVP 0 goals
 
 - Build all Linux work in this repository.
@@ -111,41 +146,6 @@ sudo apt install -y \
 
 curl https://sh.rustup.rs -sSf | sh -s -- -y
 source "$HOME/.cargo/env"
-```
-
-## One-line install (curl | bash)
-
-For a quick workstation install from GitHub:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/natemellendorf/aethos-linux/main/scripts/install.sh | bash
-```
-
-This installer will:
-
-- install required Ubuntu/Debian packages (when `apt-get` is available)
-- install Rust via rustup if `cargo` is missing
-- download the selected source ref from GitHub
-- build `aethos` in release mode
-- install the binary to `~/.local/bin/aethos` (with compatibility alias `aethos-linux`)
-
-By default, if `--ref` is not provided, it resolves and installs the latest GitHub release tag.
-
-Optional flags/environment:
-
-```bash
-# Install from a specific tag
-curl -fsSL https://raw.githubusercontent.com/natemellendorf/aethos-linux/main/scripts/install.sh | bash -s -- --ref v0.2.0
-```
-
-```bash
-# Skip dependency bootstrap
-curl -fsSL https://raw.githubusercontent.com/natemellendorf/aethos-linux/main/scripts/install.sh | bash -s -- --skip-deps
-```
-
-```bash
-# Custom binary directory
-curl -fsSL https://raw.githubusercontent.com/natemellendorf/aethos-linux/main/scripts/install.sh | bash -s -- --bin-dir "$HOME/bin"
 ```
 
 ## Build, run, and test
