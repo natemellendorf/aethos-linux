@@ -217,4 +217,4 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gh release upload "$TAG" out/* --clobber
+          gh release upload "$TAG" out/* --clobber -R "$GITHUB_REPOSITORY"
