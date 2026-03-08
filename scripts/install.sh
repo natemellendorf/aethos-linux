@@ -147,15 +147,20 @@ download_source() {
 build_and_install() {
   local source_dir="$1"
 
-  log "Building aethos-linux in release mode."
+  log "Building aethos in release mode."
   cargo build --release --locked --manifest-path "$source_dir/Cargo.toml"
 
-  local binary_path="$source_dir/target/release/aethos-linux"
+  local binary_path="$source_dir/target/release/aethos"
   [[ -x "$binary_path" ]] || fail "Build succeeded but binary not found at $binary_path"
 
   install -d "$BIN_DIR"
-  install -m 0755 "$binary_path" "$BIN_DIR/aethos-linux"
-  log "Installed: $BIN_DIR/aethos-linux"
+  install -m 0755 "$binary_path" "$BIN_DIR/aethos"
+
+  # Backward-compatible alias for older docs/shell history.
+  ln -sfn "$BIN_DIR/aethos" "$BIN_DIR/aethos-linux"
+
+  log "Installed: $BIN_DIR/aethos"
+  log "Alias:     $BIN_DIR/aethos-linux -> $BIN_DIR/aethos"
 }
 
 parse_args() {
@@ -212,7 +217,7 @@ main() {
   source_dir="$(download_source "$tmp_dir")"
   build_and_install "$source_dir"
 
-  log "Done. Run 'aethos-linux' after adding $BIN_DIR to PATH if needed."
+  log "Done. Run 'aethos' after adding $BIN_DIR to PATH if needed."
 }
 
 main "$@"

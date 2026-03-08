@@ -3,6 +3,10 @@ name = "aethos-linux"
 version = "0.2.0"
 edition = "2021"
 
+[[bin]]
+name = "aethos"
+path = "src/main.rs"
+
 [dependencies]
 gtk4 = "0.8"
 glib = "0.19"

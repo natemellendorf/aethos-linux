@@ -6,7 +6,7 @@ RUNTIME_ROOT="${XDG_RUNTIME_DIR:-/tmp}"
 STATE_DIR="${RUNTIME_ROOT}/aethos-linux-dev"
 LOG_DIR="${ROOT_DIR}/.dev/logs"
 
-APP_BIN="${ROOT_DIR}/target/debug/aethos-linux"
+APP_BIN="${ROOT_DIR}/target/debug/aethos"
 APP_LOG="${LOG_DIR}/app.log"
 APP_PID="${STATE_DIR}/app.pid"
 

@@ -126,16 +126,12 @@ This installer will:
 - install required Ubuntu/Debian packages (when `apt-get` is available)
 - install Rust via rustup if `cargo` is missing
 - download the selected source ref from GitHub
-- build `aethos-linux` in release mode
-- install the binary to `~/.local/bin/aethos-linux`
+- build `aethos` in release mode
+- install the binary to `~/.local/bin/aethos` (with compatibility alias `aethos-linux`)
 
 By default, if `--ref` is not provided, it resolves and installs the latest GitHub release tag.
 
 Optional flags/environment:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/natemellendorf/aethos-linux/main/scripts/install.sh | bash -s -- --ref v0.1.0
-```
 
 ```bash
 # Install from a specific tag
@@ -161,7 +157,10 @@ From this repository root:
 cargo build
 
 # Run the GUI app
-cargo run
+cargo run --bin aethos
+
+# Run installed binary
+aethos
 
 # Run tests
 cargo test
