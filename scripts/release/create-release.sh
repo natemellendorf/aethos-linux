@@ -10,7 +10,7 @@ FROM_PRERELEASE_TAG=""
 
 usage() {
   cat <<'EOF'
-Create an official Aethos Linux release.
+Create an official Aethos Client release.
 
 Usage:
   scripts/release/create-release.sh [--dry-run]
@@ -94,7 +94,7 @@ if [[ -n "${FROM_PRERELEASE_TAG}" ]]; then
 
   gh release create "${official_tag}" \
     --target "${target_commitish}" \
-    --title "Aethos Linux ${official_tag}" \
+    --title "Aethos Client ${official_tag}" \
     --notes "${prerelease_body}"
 
   gh release edit "${official_tag}" \
@@ -142,7 +142,7 @@ git tag -a "${tag}" -m "Release ${tag}"
 
 gh release create "${tag}" \
   --target "$(git rev-parse HEAD)" \
-  --title "Aethos Linux ${tag}" \
+  --title "Aethos Client ${tag}" \
   --generate-notes
 
 log "release created: ${tag}"

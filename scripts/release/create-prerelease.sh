@@ -36,7 +36,7 @@ fi
 gh release create "${tag}" \
   --prerelease \
   --target main \
-  --title "Aethos Linux pre-release ${tag}" \
+  --title "Aethos Client pre-release ${tag}" \
   --notes "${notes}"
 
 log "created prerelease ${tag}"
