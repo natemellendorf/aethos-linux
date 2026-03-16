@@ -25,6 +25,7 @@ use base64::Engine;
 use image::{imageops::FilterType, ImageBuffer, Luma, Rgba, RgbaImage};
 use qrcode::QrCode;
 use serde::{Deserialize, Serialize};
+use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::aethos_core::gossip_sync::record_local_payload as gossip_record_local_payload;
 use crate::aethos_core::gossip_sync::{
@@ -42,7 +43,7 @@ use crate::aethos_core::identity_store::{
     save_contact_aliases,
 };
 use crate::aethos_core::logging::{
-    app_log_file_path, set_verbose_logging_enabled, verbose_logging_enabled,
+    app_log_file_path, log_info, log_verbose, set_verbose_logging_enabled, verbose_logging_enabled,
 };
 use crate::aethos_core::protocol::{
     build_envelope_payload_b64_from_utf8, decode_envelope_payload_b64, is_valid_wayfarer_id,
@@ -392,12 +393,7 @@ fn send_message_blocking(request: SendMessageRequest) -> Result<SendMessageRespo
     let settings = load_app_settings()?;
     let identity = ensure_local_identity()?;
     let mut contacts = load_contact_aliases()?;
-    let outbound_body = serde_json::json!({
-        "text": body,
-        "from_wayfarer_id": identity.wayfarer_id,
-    })
-    .to_string();
-    let payload = build_envelope_payload_b64_from_utf8(wayfarer_id, &outbound_body)?;
+    let payload = build_envelope_payload_b64_from_utf8(wayfarer_id, body)?;
     let decoded = decode_envelope_payload_b64(&payload)?;
 
     let now_ms = now_unix_ms();
@@ -702,10 +698,13 @@ fn start_gossip_worker_if_needed(initial_enabled: bool) {
 
     thread::spawn(|| {
         let runtime = gossip_runtime(false);
-        let socket = match UdpSocket::bind(("0.0.0.0", GOSSIP_LAN_PORT)) {
+        let socket = match bind_gossip_socket() {
             Ok(socket) => socket,
             Err(err) => {
                 set_gossip_event(&format!("udp bind failed: {err}"));
+                log_info(&format!(
+                    "gossip_sync_disabled: failed binding udp/{GOSSIP_LAN_PORT}: {err}"
+                ));
                 runtime.running.store(false, Ordering::SeqCst);
                 return;
             }
@@ -713,16 +712,21 @@ fn start_gossip_worker_if_needed(initial_enabled: bool) {
 
         if let Err(err) = socket.set_nonblocking(true) {
             set_gossip_event(&format!("set_nonblocking failed: {err}"));
+            log_info(&format!("gossip_sync_disabled: set_nonblocking failed: {err}"));
             runtime.running.store(false, Ordering::SeqCst);
             return;
         }
         if let Err(err) = socket.set_broadcast(true) {
             set_gossip_event(&format!("set_broadcast failed: {err}"));
+            log_info(&format!("gossip_sync_disabled: set_broadcast failed: {err}"));
             runtime.running.store(false, Ordering::SeqCst);
             return;
         }
 
         set_gossip_event("listening");
+        log_info(&format!(
+            "gossip_sync_started on udp/{GOSSIP_LAN_PORT} (reuseaddr enabled)"
+        ));
         let mut peer_node_by_addr: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         let mut last_inventory_broadcast = Instant::now() - Duration::from_secs(10);
@@ -738,6 +742,7 @@ fn start_gossip_worker_if_needed(initial_enabled: bool) {
                 if gossip_broadcast_inventory(&socket).is_ok() {
                     runtime.last_activity_ms.store(now_unix_ms(), Ordering::SeqCst);
                     set_gossip_event("active");
+                    log_verbose("gossip_inventory_broadcasted");
                 }
                 last_inventory_broadcast = Instant::now();
             }
@@ -747,6 +752,7 @@ fn start_gossip_worker_if_needed(initial_enabled: bool) {
                 Ok((len, source)) => {
                     runtime.last_activity_ms.store(now_unix_ms(), Ordering::SeqCst);
                     set_gossip_event("active");
+                    log_verbose(&format!("gossip_recv bytes={} from={source}", len));
                     let _ = handle_gossip_frame(
                         &socket,
                         &buf[..len],
@@ -760,11 +766,28 @@ fn start_gossip_worker_if_needed(initial_enabled: bool) {
                 }
                 Err(err) => {
                     set_gossip_event(&format!("recv error: {err}"));
+                    log_info(&format!("gossip_recv_error: {err}"));
                     thread::sleep(Duration::from_millis(80));
                 }
             }
         }
     });
+}
+
+fn bind_gossip_socket() -> Result<UdpSocket, String> {
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
+        .map_err(|err| format!("socket create failed: {err}"))?;
+    socket
+        .set_reuse_address(true)
+        .map_err(|err| format!("set_reuse_address failed: {err}"))?;
+    let addr = std::net::SocketAddrV4::new(
+        std::net::Ipv4Addr::UNSPECIFIED,
+        GOSSIP_LAN_PORT,
+    );
+    socket
+        .bind(&addr.into())
+        .map_err(|err| format!("socket bind failed: {err}"))?;
+    Ok(socket.into())
 }
 
 fn gossip_broadcast_inventory(socket: &UdpSocket) -> Result<(), String> {
@@ -804,6 +827,12 @@ fn handle_gossip_frame(
             let node_id = hello.node_id;
             peer_node_by_addr.insert(source_key.clone(), node_id.clone());
             peer_node_by_addr.insert(source_ip_key.clone(), node_id);
+            log_verbose(&format!(
+                "gossip_peer_hello_mapped: source={} source_ip={} peers={}",
+                source_key,
+                source_ip_key,
+                peer_node_by_addr.len()
+            ));
             if let Ok(summary) = build_gossip_summary_frame(now_unix_ms()) {
                 let _ = send_gossip_frame(socket, &source.ip().to_string(), source.port(), &summary);
             }
@@ -812,8 +841,7 @@ fn handle_gossip_frame(
             }
         }
         GossipSyncFrame::Summary(summary) => {
-            let want = gossip_select_request_item_ids_from_summary(&summary, 256)?;
-            let request = build_gossip_request_frame(want, 256)?;
+            let request = build_request_from_summary(&summary, 256)?;
             let _ = send_gossip_frame(socket, &source.ip().to_string(), source.port(), &request);
         }
         GossipSyncFrame::RelayIngest(ingest) => {
@@ -840,6 +868,10 @@ fn handle_gossip_frame(
                 .or_else(|| peer_node_by_addr.get(&source_ip_key))
                 .cloned()
                 .unwrap_or_else(|| source.ip().to_string());
+            log_verbose(&format!(
+                "gossip_transfer_from_resolved_sender: source={} resolved={}",
+                source_key, peer_node_id
+            ));
             let result = import_transfer_items(
                 &peer_node_id,
                 &local_wayfarer,
@@ -848,24 +880,24 @@ fn handle_gossip_frame(
             )?;
 
             if !result.new_messages.is_empty() {
+                let imported_count = result.new_messages.len();
                 let mut chat = load_chat_state()?;
                 let mut contacts = load_contact_aliases()?;
                 let pulled = result
                     .new_messages
                     .into_iter()
-                    .filter_map(|item| {
+                    .map(|item| {
                         let sender = resolve_sender_wayfarer_from_import(
                             &item.from_wayfarer_id,
-                            &item.text,
                             &peer_node_id,
-                        )?;
-                        Some(crate::relay::client::EncounterMessagePreview {
+                        );
+                        crate::relay::client::EncounterMessagePreview {
                             from_node_id: sender,
                             item_id: item.item_id,
                             text: item.text,
                             received_at_unix: item.received_at_unix,
                             manifest_id_hex: item.manifest_id_hex,
-                        })
+                        }
                     })
                     .collect::<Vec<_>>();
                 merge_pulled_messages(&mut chat, &mut contacts, pulled);
@@ -873,6 +905,11 @@ fn handle_gossip_frame(
                 save_contact_aliases(&contacts)?;
                 runtime.last_activity_ms.store(now_unix_ms(), Ordering::SeqCst);
                 set_gossip_event("received messages");
+                log_verbose(&format!(
+                    "gossip_transfer_imported_messages={} from={}",
+                    imported_count,
+                    source
+                ));
             }
 
             let receipt = GossipSyncFrame::Receipt(ReceiptFrame {
@@ -894,6 +931,14 @@ fn send_gossip_frame(socket: &UdpSocket, host: &str, port: u16, frame: &GossipSy
         .send_to(&raw, &addr)
         .map(|_| ())
         .map_err(|err| format!("gossip send failed ({addr}): {err}"))
+}
+
+fn build_request_from_summary(
+    summary: &crate::aethos_core::gossip_sync::SummaryFrame,
+    max_want: usize,
+) -> Result<GossipSyncFrame, String> {
+    let want = gossip_select_request_item_ids_from_summary(summary, max_want)?;
+    build_gossip_request_frame(want, max_want)
 }
 
 fn mark_outgoing_message(
@@ -1043,38 +1088,17 @@ fn extract_chat_text_if_json(input: &str) -> String {
 
 fn resolve_sender_wayfarer_from_import(
     import_sender: &str,
-    text: &str,
     peer_sender_hint: &str,
-) -> Option<String> {
-    if let Some(from_json) = extract_sender_wayfarer_id_from_text(text) {
-        return Some(from_json);
-    }
-
+) -> String {
     if is_valid_wayfarer_id(import_sender) {
-        return Some(import_sender.to_string());
+        return import_sender.to_string();
     }
 
-    if is_valid_wayfarer_id(peer_sender_hint) {
-        return Some(peer_sender_hint.to_string());
-    }
-
-    None
-}
-
-fn extract_sender_wayfarer_id_from_text(input: &str) -> Option<String> {
-    let value = serde_json::from_str::<serde_json::Value>(input).ok()?;
-    let candidate = value
-        .get("from_wayfarer_id")
-        .and_then(|item| item.as_str())
-        .or_else(|| value.get("fromWayfarerId").and_then(|item| item.as_str()))
-        .or_else(|| value.get("sender_wayfarer_id").and_then(|item| item.as_str()))
-        .or_else(|| value.get("senderWayfarerId").and_then(|item| item.as_str()))?;
-    let normalized = candidate.trim().to_ascii_lowercase();
-    if is_valid_wayfarer_id(&normalized) {
-        Some(normalized)
-    } else {
-        None
-    }
+    log_info(&format!(
+        "gossip_sender_unresolved: import_sender='{}' peer_hint='{}'",
+        import_sender, peer_sender_hint
+    ));
+    "unknown-peer".to_string()
 }
 
 fn extract_receipt_manifest_id(input: &str) -> Option<String> {
@@ -1360,6 +1384,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     fn maybe_relay_target() -> Option<String> {
         std::env::var("AETHOS_RELAY_TEST_HTTP")
@@ -1388,6 +1413,72 @@ mod tests {
         let bytes = fs::read(path).expect("read qr bytes");
         let decoded = decode_wayfarer_id_from_qr_bytes(bytes).expect("decode qr payload");
         assert_eq!(decoded, id);
+    }
+
+    #[test]
+    fn empty_summary_still_produces_request_frame() {
+        let summary = crate::aethos_core::gossip_sync::SummaryFrame {
+            bloom_filter: vec![0u8; crate::aethos_core::gossip_sync::BLOOM_FILTER_BYTES],
+            item_count: 0,
+            preview_item_ids: None,
+            preview_cursor: None,
+        };
+
+        let request = build_request_from_summary(&summary, 256).expect("build request from summary");
+        match request {
+            GossipSyncFrame::Request(request) => {
+                assert!(request.want.is_empty());
+            }
+            other => panic!("expected REQUEST frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn populated_summary_produces_request_with_want_items() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aethos-tauri-test-summary-{}", rand::random::<u64>()));
+        std::env::set_var("AETHOS_STATE_DIR", &temp_dir);
+
+        let wanted_item =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        let bloom = crate::aethos_core::gossip_sync::build_bloom_filter(&[wanted_item.clone()])
+            .expect("build bloom filter");
+        let summary = crate::aethos_core::gossip_sync::SummaryFrame {
+            bloom_filter: bloom,
+            item_count: 1,
+            preview_item_ids: Some(vec![wanted_item.clone()]),
+            preview_cursor: None,
+        };
+
+        let request = build_request_from_summary(&summary, 256).expect("build request from summary");
+        match request {
+            GossipSyncFrame::Request(request) => {
+                assert!(request.want.iter().any(|item| item == &wanted_item));
+            }
+            other => panic!("expected REQUEST frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn imported_message_is_kept_when_sender_is_unresolved() {
+        let mut chat = PersistedChatState::default();
+        let mut contacts = BTreeMap::new();
+        let pulled = vec![crate::relay::client::EncounterMessagePreview {
+            from_node_id: resolve_sender_wayfarer_from_import("not-a-wayfarer", "10.0.0.7:47655"),
+            item_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .to_string(),
+            text: "hello from unresolved sender".to_string(),
+            received_at_unix: 1,
+            manifest_id_hex: None,
+        }];
+
+        merge_pulled_messages(&mut chat, &mut contacts, pulled);
+        let thread = chat
+            .threads
+            .get("unknown-peer")
+            .expect("thread should be created for unresolved sender");
+        assert_eq!(thread.len(), 1);
+        assert_eq!(thread[0].text, "hello from unresolved sender");
     }
 
     #[test]
