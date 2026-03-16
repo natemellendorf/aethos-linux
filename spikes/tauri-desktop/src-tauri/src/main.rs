@@ -450,6 +450,10 @@ fn send_message_blocking(request: SendMessageRequest) -> Result<SendMessageRespo
     let expiry_ms = now_ms.saturating_add(settings.message_ttl_seconds.saturating_mul(1000));
     let local_id = format!("local-{now_ms}-{:08x}", rand::random::<u32>());
     let item_id = gossip_record_local_payload(&payload, expiry_ms)?;
+    log_info(&format!(
+        "gossip_record_local_payload_ok: item_id={} to={} expiry_ms={}",
+        item_id, wayfarer_id, expiry_ms
+    ));
 
     let mut chat = load_chat_state()?;
     chat.selected_contact = Some(wayfarer_id.to_string());
@@ -855,6 +859,12 @@ fn gossip_broadcast_inventory(socket: &UdpSocket) -> Result<(), String> {
         let _ = send_gossip_frame(socket, "255.255.255.255", GOSSIP_LAN_PORT, &summary);
     }
     if let Ok(ingest) = build_gossip_relay_ingest_frame(now_unix_ms()) {
+        if let GossipSyncFrame::RelayIngest(frame) = &ingest {
+            log_verbose(&format!(
+                "gossip_inventory_snapshot: relay_ingest_items={}",
+                frame.item_ids.len()
+            ));
+        }
         let _ = send_gossip_frame(socket, "255.255.255.255", GOSSIP_LAN_PORT, &ingest);
     }
     Ok(())
@@ -892,10 +902,28 @@ fn handle_gossip_frame(
             }
         }
         GossipSyncFrame::Summary(summary) => {
+            log_verbose(&format!(
+                "gossip_recv_summary: from={} item_count={} preview_items={}",
+                source,
+                summary.item_count,
+                summary.preview_item_ids.as_ref().map(|v| v.len()).unwrap_or(0)
+            ));
             let request = build_request_from_summary(&summary, 256)?;
+            if let GossipSyncFrame::Request(request_frame) = &request {
+                log_verbose(&format!(
+                    "gossip_send_request_from_summary: to={} want_items={}",
+                    source,
+                    request_frame.want.len()
+                ));
+            }
             let _ = send_gossip_frame(socket, &source.ip().to_string(), source.port(), &request);
         }
         GossipSyncFrame::RelayIngest(ingest) => {
+            log_verbose(&format!(
+                "gossip_recv_relay_ingest: from={} item_ids={}",
+                source,
+                ingest.item_ids.len()
+            ));
             let mut missing_item_ids = ingest
                 .item_ids
                 .into_iter()
@@ -903,6 +931,13 @@ fn handle_gossip_frame(
                 .collect::<Vec<_>>();
             missing_item_ids.sort();
             let request = build_gossip_request_frame(missing_item_ids, 256)?;
+            if let GossipSyncFrame::Request(request_frame) = &request {
+                log_verbose(&format!(
+                    "gossip_send_request_from_relay_ingest: to={} want_items={}",
+                    source,
+                    request_frame.want.len()
+                ));
+            }
             let _ = send_gossip_frame(socket, &source.ip().to_string(), source.port(), &request);
         }
         GossipSyncFrame::Request(req) => {
