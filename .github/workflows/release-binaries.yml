@@ -128,10 +128,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          shopt -s nullglob
+          shopt -s nullglob globstar
           mkdir -p out
-          for file in dist/*/*; do
-            mv "$file" out/
+          for file in dist/**/*; do
+            if [ -f "$file" ]; then
+              mv "$file" out/
+            fi
           done
 
       - name: Generate SHA256 sums
