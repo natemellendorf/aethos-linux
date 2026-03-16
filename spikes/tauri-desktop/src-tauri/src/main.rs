@@ -392,7 +392,12 @@ fn send_message_blocking(request: SendMessageRequest) -> Result<SendMessageRespo
     let settings = load_app_settings()?;
     let identity = ensure_local_identity()?;
     let mut contacts = load_contact_aliases()?;
-    let payload = build_envelope_payload_b64_from_utf8(wayfarer_id, body)?;
+    let outbound_body = serde_json::json!({
+        "text": body,
+        "from_wayfarer_id": identity.wayfarer_id,
+    })
+    .to_string();
+    let payload = build_envelope_payload_b64_from_utf8(wayfarer_id, &outbound_body)?;
     let decoded = decode_envelope_payload_b64(&payload)?;
 
     let now_ms = now_unix_ms();
@@ -456,7 +461,7 @@ fn send_message_blocking(request: SendMessageRequest) -> Result<SendMessageRespo
     save_chat_state(&chat)?;
     save_contact_aliases(&contacts)?;
 
-    let message = latest_message_for_contact(&chat, wayfarer_id, &item_id)
+    let message = latest_message_for_contact(&chat, wayfarer_id, &item_id, &local_id)
         .ok_or_else(|| "failed to load stored outbound message".to_string())?;
 
     Ok(SendMessageResponse {
@@ -792,10 +797,13 @@ fn handle_gossip_frame(
     let identity = ensure_local_identity()?;
     let local_wayfarer = identity.wayfarer_id;
     let source_key = source.to_string();
+    let source_ip_key = source.ip().to_string();
 
     match frame {
         GossipSyncFrame::Hello(hello) if hello.node_id != local_wayfarer => {
-            peer_node_by_addr.insert(source_key.clone(), hello.node_id);
+            let node_id = hello.node_id;
+            peer_node_by_addr.insert(source_key.clone(), node_id.clone());
+            peer_node_by_addr.insert(source_ip_key.clone(), node_id);
             if let Ok(summary) = build_gossip_summary_frame(now_unix_ms()) {
                 let _ = send_gossip_frame(socket, &source.ip().to_string(), source.port(), &summary);
             }
@@ -829,6 +837,7 @@ fn handle_gossip_frame(
         GossipSyncFrame::Transfer(transfer) => {
             let peer_node_id = peer_node_by_addr
                 .get(&source_key)
+                .or_else(|| peer_node_by_addr.get(&source_ip_key))
                 .cloned()
                 .unwrap_or_else(|| source.ip().to_string());
             let result = import_transfer_items(
@@ -844,12 +853,19 @@ fn handle_gossip_frame(
                 let pulled = result
                     .new_messages
                     .into_iter()
-                    .map(|item| crate::relay::client::EncounterMessagePreview {
-                        from_node_id: item.from_wayfarer_id,
-                        item_id: item.item_id,
-                        text: item.text,
-                        received_at_unix: item.received_at_unix,
-                        manifest_id_hex: item.manifest_id_hex,
+                    .filter_map(|item| {
+                        let sender = resolve_sender_wayfarer_from_import(
+                            &item.from_wayfarer_id,
+                            &item.text,
+                            &peer_node_id,
+                        )?;
+                        Some(crate::relay::client::EncounterMessagePreview {
+                            from_node_id: sender,
+                            item_id: item.item_id,
+                            text: item.text,
+                            received_at_unix: item.received_at_unix,
+                            manifest_id_hex: item.manifest_id_hex,
+                        })
                     })
                     .collect::<Vec<_>>();
                 merge_pulled_messages(&mut chat, &mut contacts, pulled);
@@ -995,13 +1011,21 @@ fn latest_message_for_contact(
     chat: &PersistedChatState,
     contact: &str,
     item_id: &str,
+    local_id: &str,
 ) -> Option<ChatMessage> {
     chat.threads.get(contact).and_then(|thread| {
         thread
             .iter()
             .rev()
-            .find(|message| message.msg_id == item_id)
+            .find(|message| message.msg_id == item_id || message.msg_id == local_id)
             .cloned()
+            .or_else(|| {
+                thread
+                    .iter()
+                    .rev()
+                    .find(|message| matches!(message.direction, ChatDirection::Outgoing))
+                    .cloned()
+            })
     })
 }
 
@@ -1015,6 +1039,42 @@ fn extract_chat_text_if_json(input: &str) -> String {
         .and_then(|v| v.as_str())
         .map(|text| text.to_string())
         .unwrap_or_else(|| input.to_string())
+}
+
+fn resolve_sender_wayfarer_from_import(
+    import_sender: &str,
+    text: &str,
+    peer_sender_hint: &str,
+) -> Option<String> {
+    if let Some(from_json) = extract_sender_wayfarer_id_from_text(text) {
+        return Some(from_json);
+    }
+
+    if is_valid_wayfarer_id(import_sender) {
+        return Some(import_sender.to_string());
+    }
+
+    if is_valid_wayfarer_id(peer_sender_hint) {
+        return Some(peer_sender_hint.to_string());
+    }
+
+    None
+}
+
+fn extract_sender_wayfarer_id_from_text(input: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(input).ok()?;
+    let candidate = value
+        .get("from_wayfarer_id")
+        .and_then(|item| item.as_str())
+        .or_else(|| value.get("fromWayfarerId").and_then(|item| item.as_str()))
+        .or_else(|| value.get("sender_wayfarer_id").and_then(|item| item.as_str()))
+        .or_else(|| value.get("senderWayfarerId").and_then(|item| item.as_str()))?;
+    let normalized = candidate.trim().to_ascii_lowercase();
+    if is_valid_wayfarer_id(&normalized) {
+        Some(normalized)
+    } else {
+        None
+    }
 }
 
 fn extract_receipt_manifest_id(input: &str) -> Option<String> {
