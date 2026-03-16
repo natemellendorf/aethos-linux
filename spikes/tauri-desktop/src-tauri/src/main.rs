@@ -240,6 +240,18 @@ fn read_app_log(max_lines: Option<usize>) -> Result<AppLogTail, String> {
 }
 
 #[tauri::command]
+fn clear_app_log() -> Result<AppLogTail, String> {
+    let path = app_log_file_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed creating app log directory {}: {err}", parent.display()))?;
+    }
+    fs::write(&path, "")
+        .map_err(|err| format!("failed clearing app log at {}: {err}", path.display()))?;
+    read_app_log(Some(500))
+}
+
+#[tauri::command]
 fn bootstrap_state() -> Result<BootstrapState, String> {
     let mut settings = load_app_settings()?;
     if !settings.gossip_sync_enabled {
@@ -1419,6 +1431,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             app_diagnostics,
             read_app_log,
+            clear_app_log,
             bootstrap_state,
             rotate_wayfarer_id,
             reset_wayfarer_id,

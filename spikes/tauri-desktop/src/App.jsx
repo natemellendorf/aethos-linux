@@ -60,6 +60,7 @@ export default function App() {
   const [networkPulseTs, setNetworkPulseTs] = useState(0);
   const [logTail, setLogTail] = useState({ logFilePath: "", totalLines: 0, shownLines: 0, content: "" });
   const [logFollow, setLogFollow] = useState(true);
+  const [logStreaming, setLogStreaming] = useState(true);
   const logContainerRef = useRef(null);
 
   const entries = useMemo(
@@ -111,7 +112,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (tab !== "settings") return;
+    if (tab !== "settings" || !logStreaming) return;
 
     let cancelled = false;
     const fetchLogs = async () => {
@@ -131,7 +132,7 @@ export default function App() {
       cancelled = true;
       clearInterval(timer);
     };
-  }, [tab]);
+  }, [tab, logStreaming]);
 
   useEffect(() => {
     if (!logFollow || tab !== "settings") return;
@@ -519,6 +520,24 @@ export default function App() {
                     onClick={async () => setLogTail(await invoke("read_app_log", { maxLines: 500 }))}
                   >
                     Refresh Logs
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => setLogStreaming((value) => !value)}
+                  >
+                    {logStreaming ? "Stop Live Logs" : "Start Live Logs"}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="destructive"
+                    onClick={async () => {
+                      const cleared = await invoke("clear_app_log");
+                      setLogTail(cleared);
+                      setStatus("Client logs cleared");
+                    }}
+                  >
+                    Clear Logs
                   </Button>
                 </div>
 
