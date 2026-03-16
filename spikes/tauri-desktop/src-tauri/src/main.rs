@@ -753,13 +753,15 @@ fn start_gossip_worker_if_needed(initial_enabled: bool) {
                     runtime.last_activity_ms.store(now_unix_ms(), Ordering::SeqCst);
                     set_gossip_event("active");
                     log_verbose(&format!("gossip_recv bytes={} from={source}", len));
-                    let _ = handle_gossip_frame(
+                    if let Err(err) = handle_gossip_frame(
                         &socket,
                         &buf[..len],
                         source,
                         &mut peer_node_by_addr,
                         runtime,
-                    );
+                    ) {
+                        log_info(&format!("gossip_frame_handle_error from {source}: {err}"));
+                    }
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(30));
@@ -927,10 +929,21 @@ fn handle_gossip_frame(
 fn send_gossip_frame(socket: &UdpSocket, host: &str, port: u16, frame: &GossipSyncFrame) -> Result<(), String> {
     let raw = serialize_gossip_frame(frame)?;
     let addr = format!("{host}:{port}");
-    socket
+    let result = socket
         .send_to(&raw, &addr)
         .map(|_| ())
-        .map_err(|err| format!("gossip send failed ({addr}): {err}"))
+        .map_err(|err| format!("gossip send failed ({addr}): {err}"));
+    if let Err(err) = &result {
+        log_info(err);
+    } else {
+        log_verbose(&format!(
+            "gossip_send_ok: frame_type={} bytes={} addr={}",
+            gossip_frame_type(frame),
+            raw.len(),
+            addr
+        ));
+    }
+    result
 }
 
 fn build_request_from_summary(
@@ -939,6 +952,17 @@ fn build_request_from_summary(
 ) -> Result<GossipSyncFrame, String> {
     let want = gossip_select_request_item_ids_from_summary(summary, max_want)?;
     build_gossip_request_frame(want, max_want)
+}
+
+fn gossip_frame_type(frame: &GossipSyncFrame) -> &'static str {
+    match frame {
+        GossipSyncFrame::Hello(_) => "HELLO",
+        GossipSyncFrame::Summary(_) => "SUMMARY",
+        GossipSyncFrame::Request(_) => "REQUEST",
+        GossipSyncFrame::Transfer(_) => "TRANSFER",
+        GossipSyncFrame::Receipt(_) => "RECEIPT",
+        GossipSyncFrame::RelayIngest(_) => "RELAY_INGEST",
+    }
 }
 
 fn mark_outgoing_message(
