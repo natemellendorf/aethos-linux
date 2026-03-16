@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import {
   BellRing,
   CheckCircle2,
@@ -41,6 +42,13 @@ function tinyId(id = "") {
   return id ? `${id.slice(0, 10)}...${id.slice(-8)}` : "-";
 }
 
+function formatMessageTimestamp(message) {
+  const raw = Number(message?.createdAtUnix ?? message?.timestamp);
+  if (!Number.isFinite(raw) || raw <= 0) return String(message?.timestamp || "");
+  const ms = raw > 1_000_000_000_000 ? raw : raw * 1000;
+  return new Date(ms).toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" });
+}
+
 function relayChipClass(state) {
   if (state === "ok") return "bg-emerald-500/20 text-emerald-100 border-emerald-400/40";
   if (state === "warn") return "bg-amber-500/20 text-amber-100 border-amber-400/40";
@@ -71,6 +79,7 @@ export default function App() {
   const [logStreaming, setLogStreaming] = useState(true);
   const [logFilter, setLogFilter] = useState("all");
   const logContainerRef = useRef(null);
+  const threadContainerRef = useRef(null);
 
   const entries = useMemo(
     () => Object.entries(contacts).sort((a, b) => (a[1] || "").localeCompare(b[1] || "", undefined, { sensitivity: "base" })),
@@ -121,6 +130,28 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    let disposed = false;
+    let unlisten;
+    listen("chat_snapshot", (event) => {
+      if (disposed) return;
+      const snapshot = event.payload || {};
+      if (snapshot.chat) setChat(snapshot.chat);
+      if (snapshot.contacts) setContacts(snapshot.contacts);
+      setNetworkPulseTs(Date.now());
+    })
+      .then((fn) => {
+        unlisten = fn;
+      })
+      .catch(() => {
+        // keep chat view responsive
+      });
+    return () => {
+      disposed = true;
+      if (unlisten) unlisten();
+    };
+  }, []);
+
+  useEffect(() => {
     if (tab !== "settings" || !logStreaming) return;
 
     let cancelled = false;
@@ -149,6 +180,16 @@ export default function App() {
     if (!el) return;
     el.scrollTop = el.scrollHeight;
   }, [logTail, logFollow, tab]);
+
+  useEffect(() => {
+    if (tab !== "chats") return;
+    const el = threadContainerRef.current;
+    if (!el) return;
+    const raf = requestAnimationFrame(() => {
+      el.scrollTop = el.scrollHeight;
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [tab, selectedContactId, selectedThread.length]);
 
   useEffect(() => {
     const timer = setInterval(async () => {
@@ -392,11 +433,11 @@ export default function App() {
             <Card>
               <CardHeader><CardTitle>{selectedName}</CardTitle></CardHeader>
               <CardContent>
-                <div className="mb-3 max-h-[360px] space-y-2 overflow-auto rounded-lg border border-border/60 bg-background/40 p-3">
+                <div ref={threadContainerRef} className="mb-3 max-h-[360px] space-y-2 overflow-auto rounded-lg border border-border/60 bg-background/40 p-3">
                   {selectedThread.length === 0 ? <p className="text-sm text-muted-foreground">No messages in this thread yet.</p> : selectedThread.map((m) => (
                     <div key={m.msgId} className={cn("max-w-[85%] rounded-xl px-3 py-2 text-sm", m.direction === "Incoming" ? "bg-slate-700/60" : "ml-auto bg-blue-600/50")}>
                       <p>{m.text}</p>
-                      <p className="mt-1 text-[11px] text-slate-300">{m.timestamp}</p>
+                      <p className="mt-1 text-[11px] text-slate-300">{formatMessageTimestamp(m)}</p>
                     </div>
                   ))}
                 </div>
