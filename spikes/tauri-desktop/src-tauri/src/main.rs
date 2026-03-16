@@ -439,6 +439,12 @@ fn send_message_blocking(request: SendMessageRequest) -> Result<SendMessageRespo
         return Err("message body cannot be empty".to_string());
     }
 
+    log_verbose(&format!(
+        "send_message_start: to={} body_bytes={}",
+        wayfarer_id,
+        body.len()
+    ));
+
     let settings = load_app_settings()?;
     let identity = ensure_local_identity()?;
     let mut contacts = load_contact_aliases()?;
@@ -453,6 +459,10 @@ fn send_message_blocking(request: SendMessageRequest) -> Result<SendMessageRespo
     log_info(&format!(
         "gossip_record_local_payload_ok: item_id={} to={} expiry_ms={}",
         item_id, wayfarer_id, expiry_ms
+    ));
+    log_verbose(&format!(
+        "send_message_queue_saved: local_id={} item_id={} ttl_s={}",
+        local_id, item_id, settings.message_ttl_seconds
     ));
 
     let mut chat = load_chat_state()?;
@@ -512,6 +522,11 @@ fn send_message_blocking(request: SendMessageRequest) -> Result<SendMessageRespo
 
     let message = latest_message_for_contact(&chat, wayfarer_id, &item_id, &local_id)
         .ok_or_else(|| "failed to load stored outbound message".to_string())?;
+
+    log_verbose(&format!(
+        "send_message_done: to={} msg_id={} pulled_messages={} encounter='{}'",
+        wayfarer_id, message.msg_id, pulled_messages_count, encounter_status
+    ));
 
     Ok(SendMessageResponse {
         message,
@@ -855,9 +870,6 @@ fn gossip_broadcast_inventory(socket: &UdpSocket) -> Result<(), String> {
     if let Ok(hello) = build_gossip_hello_frame(&identity.wayfarer_id, &node_pubkey) {
         let _ = send_gossip_frame(socket, "255.255.255.255", GOSSIP_LAN_PORT, &hello);
     }
-    if let Ok(summary) = build_gossip_summary_frame(now_unix_ms()) {
-        let _ = send_gossip_frame(socket, "255.255.255.255", GOSSIP_LAN_PORT, &summary);
-    }
     if let Ok(ingest) = build_gossip_relay_ingest_frame(now_unix_ms()) {
         if let GossipSyncFrame::RelayIngest(frame) = &ingest {
             log_verbose(&format!(
@@ -865,8 +877,8 @@ fn gossip_broadcast_inventory(socket: &UdpSocket) -> Result<(), String> {
                 frame.item_ids.len()
             ));
         }
-        let _ = send_gossip_frame(socket, "255.255.255.255", GOSSIP_LAN_PORT, &ingest);
     }
+    log_verbose("gossip_broadcast_mode: hello-only (summary/ingest sent via unicast on HELLO)");
     Ok(())
 }
 

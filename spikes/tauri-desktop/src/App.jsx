@@ -28,6 +28,14 @@ const TABS = [
 
 const emptyRelay = { chipText: "Relays: idle", chipState: "idle", primaryStatus: "idle", secondaryStatus: "idle" };
 const emptyGossip = { enabled: false, running: false, lastActivityMs: 0, lastEvent: "unknown" };
+const LOG_FILTERS = {
+  all: [],
+  errors: ["failed", "error", "rejected", "panic"],
+  send: ["send_message_", "gossip_record_local_payload_ok"],
+  gossip: ["gossip_"],
+  relay: ["relay_"],
+  transfer: ["transfer_import_", "transfer_select_", "gossip_transfer_"]
+};
 
 function tinyId(id = "") {
   return id ? `${id.slice(0, 10)}...${id.slice(-8)}` : "-";
@@ -61,6 +69,7 @@ export default function App() {
   const [logTail, setLogTail] = useState({ logFilePath: "", totalLines: 0, shownLines: 0, content: "" });
   const [logFollow, setLogFollow] = useState(true);
   const [logStreaming, setLogStreaming] = useState(true);
+  const [logFilter, setLogFilter] = useState("all");
   const logContainerRef = useRef(null);
 
   const entries = useMemo(
@@ -304,6 +313,16 @@ export default function App() {
 
   const selectedName = selectedContactId ? contacts[selectedContactId] || tinyId(selectedContactId) : "none";
   const networkActive = Date.now() - networkPulseTs < 2200;
+  const filteredLogLines = useMemo(() => {
+    const lines = (logTail.content || "").split("\n");
+    const needles = LOG_FILTERS[logFilter] || [];
+    if (needles.length === 0) return lines;
+    return lines.filter((line) => {
+      const lower = line.toLowerCase();
+      return needles.some((needle) => lower.includes(needle.toLowerCase()));
+    });
+  }, [logTail.content, logFilter]);
+  const filteredLogContent = filteredLogLines.join("\n");
 
   return (
     <div className="min-h-screen bg-[radial-gradient(circle_at_15%_10%,rgba(76,122,255,.26),transparent_42%),radial-gradient(circle_at_88%_-10%,rgba(42,189,255,.2),transparent_35%),#060914] text-foreground">
@@ -505,7 +524,22 @@ export default function App() {
               </CardHeader>
               <CardContent>
                 <div className="mb-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-                  <Badge className="bg-slate-700/40">Showing {logTail.shownLines} / {logTail.totalLines} lines</Badge>
+                  <Badge className="bg-slate-700/40">Showing {filteredLogLines.length} / {logTail.totalLines} lines</Badge>
+                  <label className="inline-flex items-center gap-2">
+                    <span>Filter</span>
+                    <select
+                      className="rounded border border-border/70 bg-background px-2 py-1 text-xs"
+                      value={logFilter}
+                      onChange={(event) => setLogFilter(event.target.value)}
+                    >
+                      <option value="all">All</option>
+                      <option value="errors">Errors</option>
+                      <option value="send">Send Path</option>
+                      <option value="gossip">Gossip</option>
+                      <option value="relay">Relay</option>
+                      <option value="transfer">Transfer/Import</option>
+                    </select>
+                  </label>
                   <label className="inline-flex items-center gap-2">
                     <input
                       type="checkbox"
@@ -550,7 +584,7 @@ export default function App() {
                   }}
                   className="max-h-[320px] overflow-auto rounded-lg border border-border/60 bg-black/40 p-3"
                 >
-                  <pre className="whitespace-pre-wrap text-xs leading-5 text-cyan-100">{logTail.content || "(no log lines yet)"}</pre>
+                  <pre className="whitespace-pre-wrap text-xs leading-5 text-cyan-100">{filteredLogContent || "(no log lines for current filter)"}</pre>
                 </div>
               </CardContent>
             </Card>
