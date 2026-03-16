@@ -1,0 +1,29 @@
+[package]
+name = "aethos-tauri-spike"
+version = "0.1.0"
+description = "Isolated Tauri spike for Aethos desktop direction"
+authors = ["Aethos maintainers"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+base64 = "0.22"
+ciborium = "0.2"
+chacha20poly1305 = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+qrcode = "0.14"
+rand = "0.8"
+rqrr = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+serde_json = "1"
+sha2 = "0.10"
+tauri = { version = "2", default-features = false, features = ["wry"] }
+tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"] }
+url = "2"
+
+[features]
+default = []

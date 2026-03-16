@@ -1,0 +1,483 @@
+import { useEffect, useMemo, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import {
+  BellRing,
+  CheckCircle2,
+  ContactRound,
+  MessageCircle,
+  QrCode,
+  RefreshCcw,
+  Settings,
+  Share2,
+  Wifi
+} from "lucide-react";
+
+import { Badge } from "./components/ui/badge";
+import { Button } from "./components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "./components/ui/card";
+import { Input } from "./components/ui/input";
+import { Textarea } from "./components/ui/textarea";
+import { cn } from "./lib/utils";
+
+const TABS = [
+  { id: "chats", label: "Chats", icon: MessageCircle },
+  { id: "contacts", label: "Contacts", icon: ContactRound },
+  { id: "share", label: "Share", icon: Share2 },
+  { id: "settings", label: "Settings", icon: Settings }
+];
+
+const emptyRelay = { chipText: "Relays: idle", chipState: "idle", primaryStatus: "idle", secondaryStatus: "idle" };
+const emptyGossip = { enabled: false, running: false, lastActivityMs: 0, lastEvent: "unknown" };
+
+function tinyId(id = "") {
+  return id ? `${id.slice(0, 10)}...${id.slice(-8)}` : "-";
+}
+
+function relayChipClass(state) {
+  if (state === "ok") return "bg-emerald-500/20 text-emerald-100 border-emerald-400/40";
+  if (state === "warn") return "bg-amber-500/20 text-amber-100 border-amber-400/40";
+  if (state === "down") return "bg-rose-500/20 text-rose-100 border-rose-400/40";
+  if (state === "disabled") return "bg-slate-500/20 text-slate-100 border-slate-400/40";
+  return "bg-slate-700/30 text-slate-100 border-slate-400/30";
+}
+
+export default function App() {
+  const [tab, setTab] = useState("chats");
+  const [status, setStatus] = useState("Loading app state...");
+  const [identity, setIdentity] = useState(null);
+  const [settings, setSettings] = useState(null);
+  const [contacts, setContacts] = useState({});
+  const [chat, setChat] = useState({ selectedContact: null, threads: {}, newContacts: [] });
+  const [relayReports, setRelayReports] = useState([]);
+  const [relayHealth, setRelayHealth] = useState(emptyRelay);
+  const [gossipStatus, setGossipStatus] = useState(emptyGossip);
+  const [shareQr, setShareQr] = useState(null);
+  const [diagnostics, setDiagnostics] = useState(null);
+  const [composer, setComposer] = useState("");
+  const [contactDraft, setContactDraft] = useState({ wayfarerId: "", alias: "" });
+  const [showSplash, setShowSplash] = useState(true);
+  const [splashFade, setSplashFade] = useState(false);
+  const [networkPulseTs, setNetworkPulseTs] = useState(0);
+
+  const entries = useMemo(
+    () => Object.entries(contacts).sort((a, b) => (a[1] || "").localeCompare(b[1] || "", undefined, { sensitivity: "base" })),
+    [contacts]
+  );
+
+  const selectedContactId = chat.selectedContact;
+  const selectedThread = selectedContactId ? chat.threads[selectedContactId] || [] : [];
+
+  const runBootstrap = async () => {
+    const startedAt = Date.now();
+    try {
+      const [boot, diag, gossip, relay] = await Promise.all([
+        invoke("bootstrap_state"),
+        invoke("app_diagnostics"),
+        invoke("gossip_status"),
+        invoke("relay_health_status")
+      ]);
+      setIdentity(boot.identity);
+      setSettings(boot.settings);
+      setContacts(boot.contacts || {});
+      const initialChat = boot.chat || { selectedContact: null, threads: {}, newContacts: [] };
+      if (!initialChat.selectedContact && Object.keys(boot.contacts || {}).length > 0) {
+        initialChat.selectedContact = Object.keys(boot.contacts || {})[0];
+      }
+      setChat(initialChat);
+      setDiagnostics(diag);
+      setGossipStatus(gossip);
+      setRelayHealth(relay);
+      setStatus("Ready");
+      setNetworkPulseTs(Date.now());
+    } catch (error) {
+      setStatus(`Bootstrap failed: ${String(error)}`);
+    } finally {
+      const elapsed = Date.now() - startedAt;
+      const delayBeforeFade = Math.max(600, 1800 - elapsed);
+      setTimeout(() => {
+        setSplashFade(true);
+        setTimeout(() => setShowSplash(false), 1100);
+      }, delayBeforeFade);
+    }
+  };
+
+  useEffect(() => {
+    runBootstrap();
+  }, []);
+
+  useEffect(() => {
+    const timer = setInterval(async () => {
+      try {
+        const [gossip, relay] = await Promise.all([invoke("gossip_status"), invoke("relay_health_status")]);
+        setGossipStatus(gossip);
+        setRelayHealth(relay);
+        if (gossip.lastActivityMs > 0 || relay.chipState === "ok" || relay.chipState === "warn") {
+          setNetworkPulseTs(Date.now());
+        }
+      } catch {
+        // keep UI responsive
+      }
+    }, 9000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const withNetworkPulse = async (fn) => {
+    setNetworkPulseTs(Date.now());
+    const result = await fn();
+    setNetworkPulseTs(Date.now());
+    return result;
+  };
+
+  useEffect(() => {
+    const selected = chat.selectedContact || "";
+    setContactDraft({
+      wayfarerId: selected,
+      alias: selected ? contacts[selected] || "" : ""
+    });
+  }, [chat.selectedContact, contacts]);
+
+  const saveChat = async (nextChat) => {
+    const saved = await invoke("save_chat", { chat: nextChat });
+    setChat(saved);
+    return saved;
+  };
+
+  const selectContact = async (id) => {
+    const next = { ...chat, selectedContact: id, newContacts: (chat.newContacts || []).filter((c) => c !== id) };
+    const thread = [...(next.threads[id] || [])].map((m) => (m.direction === "Incoming" ? { ...m, seen: true } : m));
+    next.threads = { ...next.threads, [id]: thread };
+    await saveChat(next);
+  };
+
+  const submitContact = async (event) => {
+    event.preventDefault();
+    const wayfarerId = contactDraft.wayfarerId.trim();
+    const alias = contactDraft.alias.trim();
+    if (!wayfarerId || !alias) return setStatus("Contact ID and alias are required");
+    try {
+      const nextContacts = await withNetworkPulse(() => invoke("upsert_contact", { request: { wayfarerId, alias } }));
+      setContacts(nextContacts);
+      await selectContact(wayfarerId);
+      setStatus(`Saved contact ${alias}`);
+    } catch (error) {
+      setStatus(`Saving contact failed: ${String(error)}`);
+    }
+  };
+
+  const clearSelection = async () => {
+    const nextChat = { ...chat, selectedContact: null };
+    await saveChat(nextChat);
+    setStatus("Contact selection cleared");
+  };
+
+  const removeSelected = async () => {
+    if (!selectedContactId) return setStatus("Select a contact to remove");
+    try {
+      const nextContacts = await withNetworkPulse(() => invoke("remove_contact", { wayfarerId: selectedContactId }));
+      const nextChat = { ...chat, selectedContact: Object.keys(nextContacts)[0] || null, threads: { ...chat.threads } };
+      delete nextChat.threads[selectedContactId];
+      setContacts(nextContacts);
+      await saveChat(nextChat);
+      setStatus("Contact removed");
+    } catch (error) {
+      setStatus(`Contact removal failed: ${String(error)}`);
+    }
+  };
+
+  const sendMessage = async () => {
+    if (!selectedContactId) return setStatus("Select a contact before sending");
+    if (!composer.trim()) return setStatus("Message body cannot be empty");
+    try {
+      const response = await withNetworkPulse(() => invoke("send_message", { request: { wayfarerId: selectedContactId, body: composer.trim() } }));
+      setChat(response.chat);
+      setContacts(response.contacts);
+      setComposer("");
+      setStatus(`${response.encounterStatus} · ${tinyId(response.message.msgId)}`);
+    } catch (error) {
+      setStatus(`Send failed: ${String(error)}`);
+    }
+  };
+
+  const syncInbox = async () => {
+    try {
+      const response = await withNetworkPulse(() => invoke("sync_inbox"));
+      setChat(response.chat);
+      setContacts(response.contacts);
+      setStatus(response.status);
+    } catch (error) {
+      setStatus(`Inbox sync failed: ${String(error)}`);
+    }
+  };
+
+  const generateShareQr = async () => {
+    try {
+      const qr = await withNetworkPulse(() => invoke("generate_share_qr", { wayfarerId: identity?.wayfarerId || null }));
+      setShareQr(qr);
+      setStatus("Share QR generated");
+    } catch (error) {
+      setStatus(`Share QR generation failed: ${String(error)}`);
+    }
+  };
+
+  const announceGossip = async () => {
+    const next = await withNetworkPulse(() => invoke("gossip_announce_now"));
+    setGossipStatus(next);
+    setStatus("LAN gossip announce queued");
+  };
+
+  const importQrFile = async (file) => {
+    if (!file) return;
+    try {
+      const bytes = Array.from(new Uint8Array(await file.arrayBuffer()));
+      const wayfarerId = await invoke("decode_wayfarer_id_from_qr_bytes", { bytes });
+      const alias = contacts[wayfarerId] || `Contact ${tinyId(wayfarerId)}`;
+      const nextContacts = await withNetworkPulse(() => invoke("upsert_contact", { request: { wayfarerId, alias } }));
+      setContacts(nextContacts);
+      await selectContact(wayfarerId);
+      setStatus(`Imported contact ${tinyId(wayfarerId)}`);
+    } catch (error) {
+      setStatus(`QR import failed: ${String(error)}`);
+    }
+  };
+
+  const saveSettings = async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const payload = {
+      ...settings,
+      relaySyncEnabled: form.get("relay_sync_enabled") === "on",
+      gossipSyncEnabled: form.get("gossip_sync_enabled") === "on",
+      verboseLoggingEnabled: form.get("verbose_logging_enabled") === "on",
+      messageTtlSeconds: Number(form.get("message_ttl_seconds") || settings.messageTtlSeconds),
+      relayEndpoints: String(form.get("relay_endpoints") || "")
+        .split("\n")
+        .map((v) => v.trim())
+        .filter(Boolean)
+    };
+    try {
+      const saved = await withNetworkPulse(() => invoke("update_settings", { settings: payload }));
+      setSettings(saved);
+      setRelayHealth(await invoke("relay_health_status"));
+      setGossipStatus(await invoke("gossip_status"));
+      setStatus("Settings saved");
+    } catch (error) {
+      setStatus(`Settings update failed: ${String(error)}`);
+    }
+  };
+
+  const selectedName = selectedContactId ? contacts[selectedContactId] || tinyId(selectedContactId) : "none";
+  const networkActive = Date.now() - networkPulseTs < 2200;
+
+  return (
+    <div className="min-h-screen bg-[radial-gradient(circle_at_15%_10%,rgba(76,122,255,.26),transparent_42%),radial-gradient(circle_at_88%_-10%,rgba(42,189,255,.2),transparent_35%),#060914] text-foreground">
+      <div className="w-full px-5 pt-4">
+        <div className={cn("overflow-hidden rounded-full border border-border/60 px-3 py-2", networkActive ? "bg-cyan-500/10" : "bg-slate-900/50")}>
+          <div className="network-pulse-track">
+            {Array.from({ length: 8 }).map((_, idx) => (
+              <span
+                key={idx}
+                className={cn("network-pulse-dot", networkActive ? "is-active" : "")}
+                style={{ animationDelay: `${idx * 0.11}s` }}
+              />
+            ))}
+          </div>
+        </div>
+      </div>
+
+      <div className="mx-auto max-w-7xl p-5">
+
+        <Card className="mb-4 bg-gradient-to-r from-indigo-900/70 to-cyan-900/50">
+          <CardHeader>
+            <CardTitle className="text-3xl">Aethos Desktop</CardTitle>
+            <p className="text-sm text-muted-foreground">React + Tailwind + shadcn/ui rewrite track</p>
+          </CardHeader>
+        </Card>
+
+        <div className="mb-3 flex flex-wrap gap-2">
+          {TABS.map((t) => {
+            const Icon = t.icon;
+            return (
+              <Button key={t.id} variant={tab === t.id ? "default" : "ghost"} className="gap-2" onClick={() => setTab(t.id)}>
+                <Icon className="h-4 w-4" />
+                {t.label}
+              </Button>
+            );
+          })}
+        </div>
+
+        <div className="mb-4 flex flex-wrap gap-2 text-xs">
+          <Badge className={cn("gap-2", relayChipClass(relayHealth.chipState))}>
+            <Wifi className="h-3.5 w-3.5" />
+            {relayHealth.chipText}
+          </Badge>
+          <Badge className={cn("gap-2", gossipStatus.enabled ? "bg-blue-500/20 border-blue-400/40" : "bg-slate-500/20 border-slate-400/40")}>
+            <BellRing className="h-3.5 w-3.5" />
+            LAN Gossip: {gossipStatus.enabled ? (gossipStatus.running ? "running" : "starting") : "disabled"}
+          </Badge>
+        </div>
+
+        {tab === "chats" && (
+          <div className="grid gap-4 lg:grid-cols-[300px_1fr]">
+            <Card>
+              <CardHeader><CardTitle>Contacts</CardTitle></CardHeader>
+              <CardContent className="space-y-2">
+                {entries.map(([id, alias]) => {
+                  const unread = (chat.threads[id] || []).filter((m) => m.direction === "Incoming" && !m.seen).length;
+                  const isNew = (chat.newContacts || []).includes(id);
+                  return (
+                    <button key={id} className={cn("w-full rounded-lg border p-3 text-left", id === selectedContactId ? "border-blue-300 bg-blue-500/20" : "border-border/60 bg-background/50")} onClick={() => selectContact(id)}>
+                      <div className="flex items-center justify-between gap-2"><span className="truncate font-semibold">{alias || tinyId(id)}</span>{isNew ? <Badge className="bg-violet-500/20">NEW</Badge> : unread > 0 ? <Badge>{unread}</Badge> : null}</div>
+                      <p className="mt-1 truncate text-xs text-muted-foreground">{tinyId(id)}</p>
+                    </button>
+                  );
+                })}
+              </CardContent>
+            </Card>
+            <Card>
+              <CardHeader><CardTitle>{selectedName}</CardTitle></CardHeader>
+              <CardContent>
+                <div className="mb-3 max-h-[360px] space-y-2 overflow-auto rounded-lg border border-border/60 bg-background/40 p-3">
+                  {selectedThread.length === 0 ? <p className="text-sm text-muted-foreground">No messages in this thread yet.</p> : selectedThread.map((m) => (
+                    <div key={m.msgId} className={cn("max-w-[85%] rounded-xl px-3 py-2 text-sm", m.direction === "Incoming" ? "bg-slate-700/60" : "ml-auto bg-blue-600/50")}>
+                      <p>{m.text}</p>
+                      <p className="mt-1 text-[11px] text-slate-300">{m.timestamp}</p>
+                    </div>
+                  ))}
+                </div>
+                <div className="mb-2 flex gap-2"><Button variant="secondary" onClick={syncInbox}><RefreshCcw className="mr-2 h-4 w-4" />Sync Inbox</Button></div>
+                <Textarea value={composer} onChange={(e) => setComposer(e.target.value)} rows={3} placeholder="Write a message..." />
+                <Button className="mt-2 w-full" onClick={sendMessage}>Send</Button>
+              </CardContent>
+            </Card>
+          </div>
+        )}
+
+        {tab === "contacts" && (
+          <div className="grid gap-4 lg:grid-cols-2">
+            <Card>
+              <CardHeader><CardTitle>Manage Contacts</CardTitle></CardHeader>
+              <CardContent>
+                <p className="mb-3 text-sm text-muted-foreground">Editing: <strong>{selectedName}</strong> {selectedContactId ? `(${tinyId(selectedContactId)})` : ""}</p>
+                <form className="space-y-3" onSubmit={submitContact}>
+                  <Input name="wayfarer_id" value={contactDraft.wayfarerId} onChange={(e) => setContactDraft((d) => ({ ...d, wayfarerId: e.target.value }))} placeholder="64 lowercase hex chars" />
+                  <Input name="alias" value={contactDraft.alias} onChange={(e) => setContactDraft((d) => ({ ...d, alias: e.target.value }))} placeholder="Display name" />
+                  <div className="flex flex-wrap gap-2">
+                    <Button type="submit">Save Contact</Button>
+                    <Button type="button" variant="destructive" onClick={removeSelected}>Remove Selected</Button>
+                    <Button type="button" variant="ghost" onClick={clearSelection}>Clear Selection</Button>
+                    <label className="inline-flex cursor-pointer items-center">
+                      <input className="hidden" type="file" accept="image/png,image/jpeg,image/jpg" onChange={(e) => importQrFile(e.target.files && e.target.files[0])} />
+                      <span className="inline-flex h-10 items-center rounded-md border border-border/70 px-4 text-sm font-medium hover:bg-white/10">Import QR</span>
+                    </label>
+                  </div>
+                </form>
+              </CardContent>
+            </Card>
+            <Card>
+              <CardHeader><CardTitle>Address Book</CardTitle></CardHeader>
+              <CardContent className="space-y-2">
+                {entries.map(([id, alias]) => (
+                  <button key={id} className={cn("w-full rounded-lg border p-3 text-left", id === selectedContactId ? "border-cyan-300 bg-cyan-500/20" : "border-border/60 bg-background/50")} onClick={() => selectContact(id)}>
+                    <p className="truncate font-semibold">{alias || tinyId(id)}</p>
+                    <p className="truncate text-xs text-muted-foreground">{id}</p>
+                  </button>
+                ))}
+              </CardContent>
+            </Card>
+          </div>
+        )}
+
+        {tab === "share" && (
+          <Card>
+            <CardHeader><CardTitle>Share Your Wayfarer ID</CardTitle></CardHeader>
+            <CardContent className="space-y-3">
+              <pre className="overflow-auto rounded-lg border border-border/60 bg-background/60 p-3 text-xs">{identity?.wayfarerId || "Unavailable"}</pre>
+              <div className="flex flex-wrap gap-2">
+                <Button variant="secondary" onClick={generateShareQr}><QrCode className="mr-2 h-4 w-4" />Generate QR</Button>
+                {shareQr?.pngBase64 ? (
+                  <Button variant="ghost" onClick={() => {
+                    const bin = atob(shareQr.pngBase64);
+                    const bytes = new Uint8Array(bin.length);
+                    for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
+                    const blob = new Blob([bytes], { type: "image/png" });
+                    const href = URL.createObjectURL(blob);
+                    const link = document.createElement("a");
+                    link.href = href;
+                    link.download = "aethos-share-wayfarer-qr.png";
+                    document.body.appendChild(link);
+                    link.click();
+                    link.remove();
+                    setTimeout(() => URL.revokeObjectURL(href), 400);
+                    setStatus("QR image downloaded");
+                  }}>Download QR</Button>
+                ) : null}
+              </div>
+              {shareQr?.pngBase64 ? <img alt="Share QR" src={`data:image/png;base64,${shareQr.pngBase64}`} className="max-w-xs rounded-xl border border-border bg-white p-2" /> : null}
+            </CardContent>
+          </Card>
+        )}
+
+        {tab === "settings" && settings && (
+          <div className="grid gap-4 lg:grid-cols-2">
+            <Card>
+              <CardHeader><CardTitle>Sync Settings</CardTitle></CardHeader>
+              <CardContent>
+                <form className="space-y-3" onSubmit={saveSettings}>
+                  <label className="flex items-center gap-2 text-sm"><input type="checkbox" name="relay_sync_enabled" defaultChecked={settings.relaySyncEnabled} /> Enable relay sync</label>
+                  <label className="flex items-center gap-2 text-sm"><input type="checkbox" name="gossip_sync_enabled" defaultChecked={settings.gossipSyncEnabled} /> Enable LAN gossip sync</label>
+                  <label className="flex items-center gap-2 text-sm"><input type="checkbox" name="verbose_logging_enabled" defaultChecked={settings.verboseLoggingEnabled} /> Enable verbose logging</label>
+                  <Input name="message_ttl_seconds" type="number" defaultValue={settings.messageTtlSeconds} />
+                  <Textarea name="relay_endpoints" rows={4} defaultValue={(settings.relayEndpoints || []).join("\n")} />
+                  <div className="flex flex-wrap gap-2">
+                    <Button type="submit"><CheckCircle2 className="mr-2 h-4 w-4" />Save Settings</Button>
+                    <Button type="button" variant="ghost" onClick={announceGossip}>Announce LAN Gossip</Button>
+                  </div>
+                </form>
+              </CardContent>
+            </Card>
+            <Card>
+              <CardHeader><CardTitle>Diagnostics</CardTitle></CardHeader>
+              <CardContent className="space-y-2 text-sm text-muted-foreground">
+                <p>{diagnostics ? `${diagnostics.platform}/${diagnostics.arch}` : "Loading"}</p>
+                <p>Primary relay: {relayHealth.primaryStatus}</p>
+                <p>Secondary relay: {relayHealth.secondaryStatus}</p>
+                <p>Gossip event: {gossipStatus.lastEvent}</p>
+                <div className="pt-2">
+                  <Button variant="secondary" size="sm" onClick={async () => {
+                    const reports = await invoke("run_relay_diagnostics", { request: { relayEndpoints: settings.relayEndpoints, authToken: null, traceItemId: null } });
+                    setRelayReports(reports);
+                    setStatus("Relay diagnostics completed");
+                  }}>Run Relay Diagnostics</Button>
+                </div>
+                {relayReports.length > 0 ? relayReports.map((report, idx) => (
+                  <div key={idx} className="rounded border border-border/50 bg-background/40 p-2 text-xs text-foreground">
+                    <p className="font-semibold">{report.relayHttp}</p>
+                    <p>Handshake: {report.handshakeStatus}</p>
+                    <p>Encounter: {report.encounterStatus}</p>
+                  </div>
+                )) : null}
+              </CardContent>
+            </Card>
+          </div>
+        )}
+
+        <Card className="mt-4">
+          <CardContent className="flex items-center gap-2 py-3 text-sm text-cyan-100">
+            <Badge className="bg-cyan-500/20 border-cyan-400/40">Status</Badge>
+            <span>{status}</span>
+          </CardContent>
+        </Card>
+
+        {showSplash ? (
+          <div className={cn("fixed inset-0 z-50 flex items-center justify-center bg-[rgba(5,8,18,0.45)] backdrop-blur-xl transition-opacity duration-1000", splashFade ? "opacity-0" : "opacity-100")}>
+            <div className="rounded-2xl border border-cyan-300/30 bg-slate-900/40 px-10 py-8 text-center shadow-2xl">
+              <img src="/logo.png" alt="Aethos logo" className="mx-auto mb-4 h-20 w-20 rounded-2xl object-cover" />
+              <h2 className="text-2xl font-semibold tracking-wide">Aethos</h2>
+              <p className="mt-1 text-sm text-cyan-100/80">Loading secure channels...</p>
+            </div>
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
