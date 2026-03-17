@@ -140,10 +140,11 @@ git add Cargo.toml Cargo.lock
 git commit -m "chore(release): ${tag}"
 git tag -a "${tag}" -m "Release ${tag}"
 
+git push origin main --follow-tags
+
 gh release create "${tag}" \
-  --target "$(git rev-parse HEAD)" \
   --title "Aethos Client ${tag}" \
   --generate-notes
 
 log "release created: ${tag}"
-log "next step: git push origin main --follow-tags"
+log "release published to GitHub: ${tag}"
