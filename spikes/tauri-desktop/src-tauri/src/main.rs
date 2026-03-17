@@ -26,6 +26,7 @@ use image::{imageops::FilterType, ImageBuffer, Luma, Rgba, RgbaImage};
 use qrcode::QrCode;
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
+use tauri::Emitter;
 
 use crate::aethos_core::gossip_sync::record_local_payload as gossip_record_local_payload;
 use crate::aethos_core::gossip_sync::{
@@ -54,6 +55,7 @@ use crate::relay::client::{
 };
 
 const SHARE_QR_FILE_NAME: &str = "share-wayfarer-qr.png";
+const CHAT_SNAPSHOT_EVENT: &str = "chat_snapshot";
 
 struct GossipRuntime {
     enabled: AtomicBool,
@@ -85,6 +87,7 @@ struct GossipStatus {
 }
 
 static GOSSIP_RUNTIME: OnceLock<GossipRuntime> = OnceLock::new();
+static APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -112,6 +115,13 @@ struct IdentityView {
 struct BootstrapState {
     identity: IdentityView,
     settings: AppSettings,
+    contacts: BTreeMap<String, String>,
+    chat: PersistedChatState,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatSnapshot {
     contacts: BTreeMap<String, String>,
     chat: PersistedChatState,
 }
@@ -185,6 +195,15 @@ struct RelayHealthStatus {
     chip_state: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppLogTail {
+    log_file_path: String,
+    total_lines: usize,
+    shown_lines: usize,
+    content: String,
+}
+
 #[tauri::command]
 fn app_diagnostics() -> AppDiagnostics {
     AppDiagnostics {
@@ -200,6 +219,46 @@ fn app_diagnostics() -> AppDiagnostics {
         verbose_logging_enabled: verbose_logging_enabled(),
         log_file_path: app_log_file_path().display().to_string(),
     }
+}
+
+#[tauri::command]
+fn read_app_log(max_lines: Option<usize>) -> Result<AppLogTail, String> {
+    let limit = max_lines.unwrap_or(400).clamp(50, 5000);
+    let path = app_log_file_path();
+    let raw = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => {
+            return Err(format!(
+                "failed reading app log at {}: {err}",
+                path.display()
+            ))
+        }
+    };
+
+    let all_lines = raw.lines().collect::<Vec<_>>();
+    let total_lines = all_lines.len();
+    let tail_start = total_lines.saturating_sub(limit);
+    let shown = all_lines[tail_start..].join("\n");
+
+    Ok(AppLogTail {
+        log_file_path: path.display().to_string(),
+        total_lines,
+        shown_lines: total_lines.saturating_sub(tail_start),
+        content: shown,
+    })
+}
+
+#[tauri::command]
+fn clear_app_log() -> Result<AppLogTail, String> {
+    let path = app_log_file_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed creating app log directory {}: {err}", parent.display()))?;
+    }
+    fs::write(&path, "")
+        .map_err(|err| format!("failed clearing app log at {}: {err}", path.display()))?;
+    read_app_log(Some(500))
 }
 
 #[tauri::command]
@@ -353,6 +412,7 @@ fn upsert_contact(request: UpsertContactRequest) -> Result<BTreeMap<String, Stri
     let mut contacts = load_contact_aliases()?;
     contacts.insert(request.wayfarer_id, alias.to_string());
     save_contact_aliases(&contacts)?;
+    emit_chat_snapshot_event_best_effort("upsert_contact");
     Ok(contacts)
 }
 
@@ -361,6 +421,7 @@ fn remove_contact(wayfarer_id: String) -> Result<BTreeMap<String, String>, Strin
     let mut contacts = load_contact_aliases()?;
     contacts.remove(wayfarer_id.trim());
     save_contact_aliases(&contacts)?;
+    emit_chat_snapshot_event_best_effort("remove_contact");
     Ok(contacts)
 }
 
@@ -369,7 +430,16 @@ fn save_chat(chat: PersistedChatState) -> Result<PersistedChatState, String> {
     let mut normalized = chat;
     normalize_chat_state(&mut normalized);
     save_chat_state(&normalized)?;
+    emit_chat_snapshot_event_best_effort("save_chat");
     Ok(normalized)
+}
+
+#[tauri::command]
+fn chat_snapshot() -> Result<ChatSnapshot, String> {
+    Ok(ChatSnapshot {
+        contacts: load_contact_aliases()?,
+        chat: load_chat_state()?,
+    })
 }
 
 #[tauri::command]
@@ -390,17 +460,35 @@ fn send_message_blocking(request: SendMessageRequest) -> Result<SendMessageRespo
         return Err("message body cannot be empty".to_string());
     }
 
-    let settings = load_app_settings()?;
-    let identity = ensure_local_identity()?;
-    let mut contacts = load_contact_aliases()?;
-    let payload = build_envelope_payload_b64_from_utf8(wayfarer_id, body)?;
-    let decoded = decode_envelope_payload_b64(&payload)?;
+    log_verbose(&format!(
+        "send_message_start: to={} body_bytes={}",
+        wayfarer_id,
+        body.len()
+    ));
 
     let now_ms = now_unix_ms();
     let now_secs = now_unix_secs();
+    let settings = load_app_settings()?;
+    let identity = ensure_local_identity()?;
+    let mut contacts = load_contact_aliases()?;
     let expiry_ms = now_ms.saturating_add(settings.message_ttl_seconds.saturating_mul(1000));
     let local_id = format!("local-{now_ms}-{:08x}", rand::random::<u32>());
+    let outbound_payload = build_outbound_chat_payload(body, &local_id, now_ms);
+    let payload = build_envelope_payload_b64_from_utf8(wayfarer_id, &outbound_payload)?;
+    let decoded = decode_envelope_payload_b64(&payload)?;
     let item_id = gossip_record_local_payload(&payload, expiry_ms)?;
+    if let Some(runtime) = GOSSIP_RUNTIME.get() {
+        runtime.force_announce.store(true, Ordering::SeqCst);
+        set_gossip_event("announce queued");
+    }
+    log_info(&format!(
+        "gossip_record_local_payload_ok: item_id={} to={} expiry_ms={}",
+        item_id, wayfarer_id, expiry_ms
+    ));
+    log_verbose(&format!(
+        "send_message_queue_saved: local_id={} item_id={} ttl_s={}",
+        local_id, item_id, settings.message_ttl_seconds
+    ));
 
     let mut chat = load_chat_state()?;
     chat.selected_contact = Some(wayfarer_id.to_string());
@@ -456,9 +544,15 @@ fn send_message_blocking(request: SendMessageRequest) -> Result<SendMessageRespo
 
     save_chat_state(&chat)?;
     save_contact_aliases(&contacts)?;
+    emit_chat_snapshot_event_best_effort("send_message_blocking");
 
     let message = latest_message_for_contact(&chat, wayfarer_id, &item_id, &local_id)
         .ok_or_else(|| "failed to load stored outbound message".to_string())?;
+
+    log_verbose(&format!(
+        "send_message_done: to={} msg_id={} pulled_messages={} encounter='{}'",
+        wayfarer_id, message.msg_id, pulled_messages_count, encounter_status
+    ));
 
     Ok(SendMessageResponse {
         message,
@@ -505,6 +599,7 @@ fn sync_inbox_blocking() -> Result<SyncInboxResponse, String> {
     merge_pulled_messages(&mut chat, &mut contacts, report.pulled_messages);
     save_chat_state(&chat)?;
     save_contact_aliases(&contacts)?;
+    emit_chat_snapshot_event_best_effort("sync_inbox_blocking");
 
     Ok(SyncInboxResponse {
         chat,
@@ -753,13 +848,15 @@ fn start_gossip_worker_if_needed(initial_enabled: bool) {
                     runtime.last_activity_ms.store(now_unix_ms(), Ordering::SeqCst);
                     set_gossip_event("active");
                     log_verbose(&format!("gossip_recv bytes={} from={source}", len));
-                    let _ = handle_gossip_frame(
+                    if let Err(err) = handle_gossip_frame(
                         &socket,
                         &buf[..len],
                         source,
                         &mut peer_node_by_addr,
                         runtime,
-                    );
+                    ) {
+                        log_info(&format!("gossip_frame_handle_error from {source}: {err}"));
+                    }
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(30));
@@ -800,12 +897,15 @@ fn gossip_broadcast_inventory(socket: &UdpSocket) -> Result<(), String> {
     if let Ok(hello) = build_gossip_hello_frame(&identity.wayfarer_id, &node_pubkey) {
         let _ = send_gossip_frame(socket, "255.255.255.255", GOSSIP_LAN_PORT, &hello);
     }
-    if let Ok(summary) = build_gossip_summary_frame(now_unix_ms()) {
-        let _ = send_gossip_frame(socket, "255.255.255.255", GOSSIP_LAN_PORT, &summary);
-    }
     if let Ok(ingest) = build_gossip_relay_ingest_frame(now_unix_ms()) {
-        let _ = send_gossip_frame(socket, "255.255.255.255", GOSSIP_LAN_PORT, &ingest);
+        if let GossipSyncFrame::RelayIngest(frame) = &ingest {
+            log_verbose(&format!(
+                "gossip_inventory_snapshot: relay_ingest_items={}",
+                frame.item_ids.len()
+            ));
+        }
     }
+    log_verbose("gossip_broadcast_mode: hello-only (summary/ingest sent via unicast on HELLO)");
     Ok(())
 }
 
@@ -841,10 +941,28 @@ fn handle_gossip_frame(
             }
         }
         GossipSyncFrame::Summary(summary) => {
+            log_verbose(&format!(
+                "gossip_recv_summary: from={} item_count={} preview_items={}",
+                source,
+                summary.item_count,
+                summary.preview_item_ids.as_ref().map(|v| v.len()).unwrap_or(0)
+            ));
             let request = build_request_from_summary(&summary, 256)?;
+            if let GossipSyncFrame::Request(request_frame) = &request {
+                log_verbose(&format!(
+                    "gossip_send_request_from_summary: to={} want_items={}",
+                    source,
+                    request_frame.want.len()
+                ));
+            }
             let _ = send_gossip_frame(socket, &source.ip().to_string(), source.port(), &request);
         }
         GossipSyncFrame::RelayIngest(ingest) => {
+            log_verbose(&format!(
+                "gossip_recv_relay_ingest: from={} item_ids={}",
+                source,
+                ingest.item_ids.len()
+            ));
             let mut missing_item_ids = ingest
                 .item_ids
                 .into_iter()
@@ -852,6 +970,13 @@ fn handle_gossip_frame(
                 .collect::<Vec<_>>();
             missing_item_ids.sort();
             let request = build_gossip_request_frame(missing_item_ids, 256)?;
+            if let GossipSyncFrame::Request(request_frame) = &request {
+                log_verbose(&format!(
+                    "gossip_send_request_from_relay_ingest: to={} want_items={}",
+                    source,
+                    request_frame.want.len()
+                ));
+            }
             let _ = send_gossip_frame(socket, &source.ip().to_string(), source.port(), &request);
         }
         GossipSyncFrame::Request(req) => {
@@ -903,6 +1028,7 @@ fn handle_gossip_frame(
                 merge_pulled_messages(&mut chat, &mut contacts, pulled);
                 save_chat_state(&chat)?;
                 save_contact_aliases(&contacts)?;
+                emit_chat_snapshot_event_best_effort("gossip_transfer_import");
                 runtime.last_activity_ms.store(now_unix_ms(), Ordering::SeqCst);
                 set_gossip_event("received messages");
                 log_verbose(&format!(
@@ -927,10 +1053,21 @@ fn handle_gossip_frame(
 fn send_gossip_frame(socket: &UdpSocket, host: &str, port: u16, frame: &GossipSyncFrame) -> Result<(), String> {
     let raw = serialize_gossip_frame(frame)?;
     let addr = format!("{host}:{port}");
-    socket
+    let result = socket
         .send_to(&raw, &addr)
         .map(|_| ())
-        .map_err(|err| format!("gossip send failed ({addr}): {err}"))
+        .map_err(|err| format!("gossip send failed ({addr}): {err}"));
+    if let Err(err) = &result {
+        log_info(err);
+    } else {
+        log_verbose(&format!(
+            "gossip_send_ok: frame_type={} bytes={} addr={}",
+            gossip_frame_type(frame),
+            raw.len(),
+            addr
+        ));
+    }
+    result
 }
 
 fn build_request_from_summary(
@@ -939,6 +1076,17 @@ fn build_request_from_summary(
 ) -> Result<GossipSyncFrame, String> {
     let want = gossip_select_request_item_ids_from_summary(summary, max_want)?;
     build_gossip_request_frame(want, max_want)
+}
+
+fn gossip_frame_type(frame: &GossipSyncFrame) -> &'static str {
+    match frame {
+        GossipSyncFrame::Hello(_) => "HELLO",
+        GossipSyncFrame::Summary(_) => "SUMMARY",
+        GossipSyncFrame::Request(_) => "REQUEST",
+        GossipSyncFrame::Transfer(_) => "TRANSFER",
+        GossipSyncFrame::Receipt(_) => "RECEIPT",
+        GossipSyncFrame::RelayIngest(_) => "RELAY_INGEST",
+    }
 }
 
 fn mark_outgoing_message(
@@ -1084,6 +1232,36 @@ fn extract_chat_text_if_json(input: &str) -> String {
         .and_then(|v| v.as_str())
         .map(|text| text.to_string())
         .unwrap_or_else(|| input.to_string())
+}
+
+fn build_outbound_chat_payload(text: &str, client_msg_id: &str, sent_at_unix_ms: u64) -> String {
+    serde_json::json!({
+        "text": text,
+        "client_msg_id": client_msg_id,
+        "sent_at_unix_ms": sent_at_unix_ms,
+    })
+    .to_string()
+}
+
+fn emit_chat_snapshot_event() -> Result<(), String> {
+    let Some(handle) = APP_HANDLE.get() else {
+        return Ok(());
+    };
+
+    let snapshot = ChatSnapshot {
+        contacts: load_contact_aliases()?,
+        chat: load_chat_state()?,
+    };
+
+    handle
+        .emit(CHAT_SNAPSHOT_EVENT, snapshot)
+        .map_err(|err| format!("failed emitting {CHAT_SNAPSHOT_EVENT}: {err}"))
+}
+
+fn emit_chat_snapshot_event_best_effort(context: &str) {
+    if let Err(err) = emit_chat_snapshot_event() {
+        log_verbose(&format!("chat_snapshot_emit_failed context={context}: {err}"));
+    }
 }
 
 fn resolve_sender_wayfarer_from_import(
@@ -1355,9 +1533,16 @@ fn draw_line(img: &mut RgbaImage, mut x0: i32, mut y0: i32, x1: i32, y1: i32, co
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .setup(|app| {
+            let _ = APP_HANDLE.set(app.handle().clone());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             app_diagnostics,
+            read_app_log,
+            clear_app_log,
             bootstrap_state,
+            chat_snapshot,
             rotate_wayfarer_id,
             reset_wayfarer_id,
             update_settings,
@@ -1479,6 +1664,33 @@ mod tests {
             .expect("thread should be created for unresolved sender");
         assert_eq!(thread.len(), 1);
         assert_eq!(thread[0].text, "hello from unresolved sender");
+    }
+
+    #[test]
+    fn outbound_chat_payload_json_keeps_display_text() {
+        let payload = build_outbound_chat_payload("hello", "local-123", 42);
+        assert_eq!(extract_chat_text_if_json(&payload), "hello");
+    }
+
+    #[test]
+    fn outbound_chat_payload_changes_manifest_for_same_text() {
+        let recipient = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        let payload_a = build_envelope_payload_b64_from_utf8(
+            recipient,
+            &build_outbound_chat_payload("same text", "local-1", 1000),
+        )
+        .expect("build payload a");
+        let payload_b = build_envelope_payload_b64_from_utf8(
+            recipient,
+            &build_outbound_chat_payload("same text", "local-2", 1000),
+        )
+        .expect("build payload b");
+
+        let decoded_a = decode_envelope_payload_b64(&payload_a).expect("decode payload a");
+        let decoded_b = decode_envelope_payload_b64(&payload_b).expect("decode payload b");
+
+        assert_ne!(decoded_a.manifest_id_hex, decoded_b.manifest_id_hex);
     }
 
     #[test]

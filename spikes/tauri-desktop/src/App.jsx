@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import {
   BellRing,
   CheckCircle2,
@@ -9,7 +10,8 @@ import {
   RefreshCcw,
   Settings,
   Share2,
-  Wifi
+  Wifi,
+  Wind
 } from "lucide-react";
 
 import { Badge } from "./components/ui/badge";
@@ -28,17 +30,24 @@ const TABS = [
 
 const emptyRelay = { chipText: "Relays: idle", chipState: "idle", primaryStatus: "idle", secondaryStatus: "idle" };
 const emptyGossip = { enabled: false, running: false, lastActivityMs: 0, lastEvent: "unknown" };
+const LOG_FILTERS = {
+  all: [],
+  errors: ["failed", "error", "rejected", "panic"],
+  send: ["send_message_", "gossip_record_local_payload_ok"],
+  gossip: ["gossip_"],
+  relay: ["relay_"],
+  transfer: ["transfer_import_", "transfer_select_", "gossip_transfer_"]
+};
 
 function tinyId(id = "") {
   return id ? `${id.slice(0, 10)}...${id.slice(-8)}` : "-";
 }
 
-function relayChipClass(state) {
-  if (state === "ok") return "bg-emerald-500/20 text-emerald-100 border-emerald-400/40";
-  if (state === "warn") return "bg-amber-500/20 text-amber-100 border-amber-400/40";
-  if (state === "down") return "bg-rose-500/20 text-rose-100 border-rose-400/40";
-  if (state === "disabled") return "bg-slate-500/20 text-slate-100 border-slate-400/40";
-  return "bg-slate-700/30 text-slate-100 border-slate-400/30";
+function formatMessageTimestamp(message) {
+  const raw = Number(message?.createdAtUnix ?? message?.timestamp);
+  if (!Number.isFinite(raw) || raw <= 0) return String(message?.timestamp || "");
+  const ms = raw > 1_000_000_000_000 ? raw : raw * 1000;
+  return new Date(ms).toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" });
 }
 
 export default function App() {
@@ -58,6 +67,14 @@ export default function App() {
   const [showSplash, setShowSplash] = useState(true);
   const [splashFade, setSplashFade] = useState(false);
   const [networkPulseTs, setNetworkPulseTs] = useState(0);
+  const [logTail, setLogTail] = useState({ logFilePath: "", totalLines: 0, shownLines: 0, content: "" });
+  const [logFollow, setLogFollow] = useState(true);
+  const [logStreaming, setLogStreaming] = useState(true);
+  const [logFilter, setLogFilter] = useState("all");
+  const [arrivingMessageIds, setArrivingMessageIds] = useState({});
+  const logContainerRef = useRef(null);
+  const threadContainerRef = useRef(null);
+  const seenThreadMessageIdsRef = useRef(new Set());
 
   const entries = useMemo(
     () => Object.entries(contacts).sort((a, b) => (a[1] || "").localeCompare(b[1] || "", undefined, { sensitivity: "base" })),
@@ -67,14 +84,53 @@ export default function App() {
   const selectedContactId = chat.selectedContact;
   const selectedThread = selectedContactId ? chat.threads[selectedContactId] || [] : [];
 
+  useEffect(() => {
+    const baseline = new Set(selectedThread.map((message) => message.msgId));
+    seenThreadMessageIdsRef.current = baseline;
+    setArrivingMessageIds({});
+  }, [selectedContactId]);
+
+  useEffect(() => {
+    const prior = seenThreadMessageIdsRef.current;
+    const nowIds = selectedThread.map((message) => message.msgId);
+    const nextSet = new Set(nowIds);
+    const addedIncoming = selectedThread
+      .filter((message) => !prior.has(message.msgId) && message.direction === "Incoming")
+      .map((message) => message.msgId);
+
+    seenThreadMessageIdsRef.current = nextSet;
+    if (addedIncoming.length === 0) return;
+
+    setArrivingMessageIds((existing) => {
+      const next = { ...existing };
+      addedIncoming.forEach((id) => {
+        next[id] = true;
+      });
+      return next;
+    });
+
+    const timer = setTimeout(() => {
+      setArrivingMessageIds((existing) => {
+        const next = { ...existing };
+        addedIncoming.forEach((id) => {
+          delete next[id];
+        });
+        return next;
+      });
+    }, 1200);
+
+    return () => clearTimeout(timer);
+  }, [selectedThread]);
+
   const runBootstrap = async () => {
     const startedAt = Date.now();
     try {
-      const [boot, diag, gossip, relay] = await Promise.all([
+      const [boot, diag, gossip, relay, log] = await Promise.all([
         invoke("bootstrap_state"),
         invoke("app_diagnostics"),
         invoke("gossip_status"),
-        invoke("relay_health_status")
+        invoke("relay_health_status"),
+        invoke("read_app_log", { maxLines: 500 })
       ]);
       setIdentity(boot.identity);
       setSettings(boot.settings);
@@ -87,6 +143,7 @@ export default function App() {
       setDiagnostics(diag);
       setGossipStatus(gossip);
       setRelayHealth(relay);
+      setLogTail(log);
       setStatus("Ready");
       setNetworkPulseTs(Date.now());
     } catch (error) {
@@ -104,6 +161,68 @@ export default function App() {
   useEffect(() => {
     runBootstrap();
   }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten;
+    listen("chat_snapshot", (event) => {
+      if (disposed) return;
+      const snapshot = event.payload || {};
+      if (snapshot.chat) setChat(snapshot.chat);
+      if (snapshot.contacts) setContacts(snapshot.contacts);
+      setNetworkPulseTs(Date.now());
+    })
+      .then((fn) => {
+        unlisten = fn;
+      })
+      .catch(() => {
+        // keep chat view responsive
+      });
+    return () => {
+      disposed = true;
+      if (unlisten) unlisten();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (tab !== "settings" || !logStreaming) return;
+
+    let cancelled = false;
+    const fetchLogs = async () => {
+      try {
+        const log = await invoke("read_app_log", { maxLines: 500 });
+        if (!cancelled) {
+          setLogTail(log);
+        }
+      } catch {
+        // keep settings page responsive
+      }
+    };
+
+    fetchLogs();
+    const timer = setInterval(fetchLogs, 1500);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [tab, logStreaming]);
+
+  useEffect(() => {
+    if (!logFollow || tab !== "settings") return;
+    const el = logContainerRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [logTail, logFollow, tab]);
+
+  useEffect(() => {
+    if (tab !== "chats") return;
+    const el = threadContainerRef.current;
+    if (!el) return;
+    const raf = requestAnimationFrame(() => {
+      el.scrollTop = el.scrollHeight;
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [tab, selectedContactId, selectedThread.length]);
 
   useEffect(() => {
     const timer = setInterval(async () => {
@@ -248,6 +367,7 @@ export default function App() {
       relaySyncEnabled: form.get("relay_sync_enabled") === "on",
       gossipSyncEnabled: form.get("gossip_sync_enabled") === "on",
       verboseLoggingEnabled: form.get("verbose_logging_enabled") === "on",
+      enterToSend: form.get("enter_to_send") === "on",
       messageTtlSeconds: Number(form.get("message_ttl_seconds") || settings.messageTtlSeconds),
       relayEndpoints: String(form.get("relay_endpoints") || "")
         .split("\n")
@@ -259,6 +379,7 @@ export default function App() {
       setSettings(saved);
       setRelayHealth(await invoke("relay_health_status"));
       setGossipStatus(await invoke("gossip_status"));
+      setLogTail(await invoke("read_app_log", { maxLines: 500 }));
       setStatus("Settings saved");
     } catch (error) {
       setStatus(`Settings update failed: ${String(error)}`);
@@ -267,53 +388,88 @@ export default function App() {
 
   const selectedName = selectedContactId ? contacts[selectedContactId] || tinyId(selectedContactId) : "none";
   const networkActive = Date.now() - networkPulseTs < 2200;
+  const relayOnline = relayHealth.chipState === "ok" || relayHealth.chipState === "warn";
+  const gossipOnline = gossipStatus.enabled && gossipStatus.running;
+  const filteredLogLines = useMemo(() => {
+    const lines = (logTail.content || "").split("\n");
+    const needles = LOG_FILTERS[logFilter] || [];
+    if (needles.length === 0) return lines;
+    return lines.filter((line) => {
+      const lower = line.toLowerCase();
+      return needles.some((needle) => lower.includes(needle.toLowerCase()));
+    });
+  }, [logTail.content, logFilter]);
+  const filteredLogContent = filteredLogLines.join("\n");
 
   return (
-    <div className="min-h-screen bg-[radial-gradient(circle_at_15%_10%,rgba(76,122,255,.26),transparent_42%),radial-gradient(circle_at_88%_-10%,rgba(42,189,255,.2),transparent_35%),#060914] text-foreground">
-      <div className="w-full px-5 pt-4">
-        <div className={cn("overflow-hidden rounded-full border border-border/60 px-3 py-2", networkActive ? "bg-cyan-500/10" : "bg-slate-900/50")}>
-          <div className="network-pulse-track">
-            {Array.from({ length: 8 }).map((_, idx) => (
-              <span
-                key={idx}
-                className={cn("network-pulse-dot", networkActive ? "is-active" : "")}
-                style={{ animationDelay: `${idx * 0.11}s` }}
-              />
-            ))}
-          </div>
-        </div>
-      </div>
-
+    <div className="relative min-h-screen overflow-x-hidden bg-[radial-gradient(circle_at_15%_10%,rgba(76,122,255,.26),transparent_42%),radial-gradient(circle_at_88%_-10%,rgba(42,189,255,.2),transparent_35%),#060914] text-foreground">
+      <div className="app-atmosphere" aria-hidden="true" />
+      <div className="app-atmosphere-grid" aria-hidden="true" />
       <div className="mx-auto max-w-7xl p-5">
 
-        <Card className="mb-4 bg-gradient-to-r from-indigo-900/70 to-cyan-900/50">
-          <CardHeader>
-            <CardTitle className="text-3xl">Aethos Desktop</CardTitle>
-            <p className="text-sm text-muted-foreground">React + Tailwind + shadcn/ui rewrite track</p>
-          </CardHeader>
-        </Card>
-
-        <div className="mb-3 flex flex-wrap gap-2">
-          {TABS.map((t) => {
-            const Icon = t.icon;
-            return (
-              <Button key={t.id} variant={tab === t.id ? "default" : "ghost"} className="gap-2" onClick={() => setTab(t.id)}>
-                <Icon className="h-4 w-4" />
-                {t.label}
-              </Button>
-            );
-          })}
+        <div className="hero-stack">
+          <Card className="hero-banner mb-4 overflow-hidden border-indigo-300/20">
+            <CardContent className="relative p-0">
+              <div className="hero-glow" aria-hidden="true" />
+              <div className="hero-wind" aria-hidden="true" />
+              <div className="hero-stars" aria-hidden="true">
+                {Array.from({ length: 10 }).map((_, idx) => (
+                  <span key={idx} className="hero-star" style={{ animationDelay: `${idx * 0.9}s` }} />
+                ))}
+              </div>
+              <div className="relative grid gap-6 px-6 py-7 md:grid-cols-[1.4fr_1fr] md:px-8">
+                <div className="space-y-4">
+                  <p className="inline-flex items-center gap-2 rounded-full border border-cyan-200/30 bg-cyan-300/10 px-3 py-1 text-xs font-semibold tracking-[0.22em] text-cyan-50/90">
+                    <Wind className="h-3.5 w-3.5" />
+                    DELAY-TOLERANT MESSAGING
+                  </p>
+                  <CardTitle className="hero-title text-4xl md:text-5xl">AETHOS</CardTitle>
+                  <p className="max-w-xl text-sm leading-relaxed text-blue-100/90 md:text-base">
+                    Messages float across relay and local airwaves, surviving gaps and reconnects so conversations keep moving.
+                  </p>
+                  <div className="hero-mesh-strip">
+                    <div className={cn("network-orbit", networkActive ? "is-active" : "")}>
+                      <span className="network-core" />
+                      <span className="network-orbit-ring ring-a" />
+                      <span className="network-orbit-ring ring-b" />
+                      <span className="network-orbit-dot dot-a" />
+                      <span className="network-orbit-dot dot-b" />
+                      <span className="network-orbit-dot dot-c" />
+                      <p className="network-label">mesh signal {networkActive ? "flowing" : "standing by"}</p>
+                    </div>
+                  </div>
+                </div>
+                <div className="hero-mark-wrap">
+                  <div className="hero-mark-ring" />
+                  <div className="hero-mark-shell">
+                    <img src="/logo.png" alt="Aethos mark" className="hero-mark" />
+                  </div>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
         </div>
 
-        <div className="mb-4 flex flex-wrap gap-2 text-xs">
-          <Badge className={cn("gap-2", relayChipClass(relayHealth.chipState))}>
-            <Wifi className="h-3.5 w-3.5" />
-            {relayHealth.chipText}
-          </Badge>
-          <Badge className={cn("gap-2", gossipStatus.enabled ? "bg-blue-500/20 border-blue-400/40" : "bg-slate-500/20 border-slate-400/40")}>
-            <BellRing className="h-3.5 w-3.5" />
-            LAN Gossip: {gossipStatus.enabled ? (gossipStatus.running ? "running" : "starting") : "disabled"}
-          </Badge>
+        <div className="tabs-dock mb-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            {TABS.map((t) => {
+              const Icon = t.icon;
+              return (
+                <Button key={t.id} variant={tab === t.id ? "default" : "ghost"} className="gap-2" onClick={() => setTab(t.id)}>
+                  <Icon className="h-4 w-4" />
+                  {t.label}
+                </Button>
+              );
+            })}
+            <div className="flex items-center gap-2">
+              <span className={cn("tab-status-dot", relayOnline ? "is-online" : "is-offline")} title="Relay status">
+                <Wifi className="h-3.5 w-3.5" />
+              </span>
+              <span className={cn("tab-status-dot", gossipOnline ? "is-online" : "is-offline")} title="LAN gossip status">
+                <BellRing className="h-3.5 w-3.5" />
+              </span>
+            </div>
+          </div>
         </div>
 
         {tab === "chats" && (
@@ -336,16 +492,28 @@ export default function App() {
             <Card>
               <CardHeader><CardTitle>{selectedName}</CardTitle></CardHeader>
               <CardContent>
-                <div className="mb-3 max-h-[360px] space-y-2 overflow-auto rounded-lg border border-border/60 bg-background/40 p-3">
+                <div ref={threadContainerRef} className="mb-3 max-h-[360px] space-y-2 overflow-auto rounded-lg border border-border/60 bg-background/40 p-3">
                   {selectedThread.length === 0 ? <p className="text-sm text-muted-foreground">No messages in this thread yet.</p> : selectedThread.map((m) => (
-                    <div key={m.msgId} className={cn("max-w-[85%] rounded-xl px-3 py-2 text-sm", m.direction === "Incoming" ? "bg-slate-700/60" : "ml-auto bg-blue-600/50")}>
+                    <div key={m.msgId} className={cn("message-bubble max-w-[85%] rounded-xl px-3 py-2 text-sm", m.direction === "Incoming" ? "message-bubble-incoming" : "message-bubble-outgoing ml-auto", arrivingMessageIds[m.msgId] ? "message-arrive" : "") }>
                       <p>{m.text}</p>
-                      <p className="mt-1 text-[11px] text-slate-300">{m.timestamp}</p>
+                      <p className="mt-1 text-[11px] text-slate-300">{formatMessageTimestamp(m)}</p>
                     </div>
                   ))}
                 </div>
                 <div className="mb-2 flex gap-2"><Button variant="secondary" onClick={syncInbox}><RefreshCcw className="mr-2 h-4 w-4" />Sync Inbox</Button></div>
-                <Textarea value={composer} onChange={(e) => setComposer(e.target.value)} rows={3} placeholder="Write a message..." />
+                <Textarea
+                  value={composer}
+                  onChange={(e) => setComposer(e.target.value)}
+                  onKeyDown={(event) => {
+                    const enterToSend = settings?.enterToSend !== false;
+                    if (!enterToSend) return;
+                    if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing || event.repeat) return;
+                    event.preventDefault();
+                    void sendMessage();
+                  }}
+                  rows={3}
+                  placeholder={settings?.enterToSend === false ? "Write a message..." : "Write a message... (Enter to send, Shift+Enter newline)"}
+                />
                 <Button className="mt-2 w-full" onClick={sendMessage}>Send</Button>
               </CardContent>
             </Card>
@@ -418,14 +586,16 @@ export default function App() {
         )}
 
         {tab === "settings" && settings && (
-          <div className="grid gap-4 lg:grid-cols-2">
-            <Card>
+          <div className="space-y-4">
+            <div className="grid gap-4 lg:grid-cols-2">
+              <Card>
               <CardHeader><CardTitle>Sync Settings</CardTitle></CardHeader>
               <CardContent>
                 <form className="space-y-3" onSubmit={saveSettings}>
                   <label className="flex items-center gap-2 text-sm"><input type="checkbox" name="relay_sync_enabled" defaultChecked={settings.relaySyncEnabled} /> Enable relay sync</label>
                   <label className="flex items-center gap-2 text-sm"><input type="checkbox" name="gossip_sync_enabled" defaultChecked={settings.gossipSyncEnabled} /> Enable LAN gossip sync</label>
                   <label className="flex items-center gap-2 text-sm"><input type="checkbox" name="verbose_logging_enabled" defaultChecked={settings.verboseLoggingEnabled} /> Enable verbose logging</label>
+                  <label className="flex items-center gap-2 text-sm"><input type="checkbox" name="enter_to_send" defaultChecked={settings.enterToSend !== false} /> Enter sends message (Shift+Enter newline)</label>
                   <Input name="message_ttl_seconds" type="number" defaultValue={settings.messageTtlSeconds} />
                   <Textarea name="relay_endpoints" rows={4} defaultValue={(settings.relayEndpoints || []).join("\n")} />
                   <div className="flex flex-wrap gap-2">
@@ -434,8 +604,8 @@ export default function App() {
                   </div>
                 </form>
               </CardContent>
-            </Card>
-            <Card>
+              </Card>
+              <Card>
               <CardHeader><CardTitle>Diagnostics</CardTitle></CardHeader>
               <CardContent className="space-y-2 text-sm text-muted-foreground">
                 <p>{diagnostics ? `${diagnostics.platform}/${diagnostics.arch}` : "Loading"}</p>
@@ -456,6 +626,79 @@ export default function App() {
                     <p>Encounter: {report.encounterStatus}</p>
                   </div>
                 )) : null}
+              </CardContent>
+              </Card>
+            </div>
+
+            <Card>
+              <CardHeader>
+                <CardTitle>Live Client Logs</CardTitle>
+                <p className="text-xs text-muted-foreground">{logTail.logFilePath || "Log path unavailable"}</p>
+              </CardHeader>
+              <CardContent>
+                <div className="mb-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                  <Badge className="bg-slate-700/40">Showing {filteredLogLines.length} / {logTail.totalLines} lines</Badge>
+                  <label className="inline-flex items-center gap-2">
+                    <span>Filter</span>
+                    <select
+                      className="rounded border border-border/70 bg-background px-2 py-1 text-xs"
+                      value={logFilter}
+                      onChange={(event) => setLogFilter(event.target.value)}
+                    >
+                      <option value="all">All</option>
+                      <option value="errors">Errors</option>
+                      <option value="send">Send Path</option>
+                      <option value="gossip">Gossip</option>
+                      <option value="relay">Relay</option>
+                      <option value="transfer">Transfer/Import</option>
+                    </select>
+                  </label>
+                  <label className="inline-flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={logFollow}
+                      onChange={(event) => setLogFollow(event.target.checked)}
+                    />
+                    Auto-follow
+                  </label>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={async () => setLogTail(await invoke("read_app_log", { maxLines: 500 }))}
+                  >
+                    Refresh Logs
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => setLogStreaming((value) => !value)}
+                  >
+                    {logStreaming ? "Stop Live Logs" : "Start Live Logs"}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="destructive"
+                    onClick={async () => {
+                      const cleared = await invoke("clear_app_log");
+                      setLogTail(cleared);
+                      setStatus("Client logs cleared");
+                    }}
+                  >
+                    Clear Logs
+                  </Button>
+                </div>
+
+                <div
+                  ref={logContainerRef}
+                  onScroll={(event) => {
+                    const el = event.currentTarget;
+                    const nearBottom = el.scrollHeight - (el.scrollTop + el.clientHeight) < 20;
+                    if (logFollow && !nearBottom) setLogFollow(false);
+                  }}
+                  className="max-h-[320px] overflow-auto rounded-lg border border-border/60 bg-black/40 p-3"
+                >
+                  <pre className="whitespace-pre-wrap text-xs leading-5 text-cyan-100">{filteredLogContent || "(no log lines for current filter)"}</pre>
+                </div>
               </CardContent>
             </Card>
           </div>

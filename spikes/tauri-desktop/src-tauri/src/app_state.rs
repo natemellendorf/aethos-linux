@@ -14,6 +14,11 @@ const DEFAULT_RELAY_HTTP_SECONDARY: &str = "http://192.168.1.200:9082";
 const DEFAULT_MESSAGE_TTL_SECONDS: u64 = 3600;
 const MIN_MESSAGE_TTL_SECONDS: u64 = 60;
 const MAX_MESSAGE_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
+const DEFAULT_ENTER_TO_SEND: bool = true;
+
+fn default_enter_to_send() -> bool {
+    DEFAULT_ENTER_TO_SEND
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ChatDirection {
@@ -101,6 +106,9 @@ pub struct AppSettings {
     #[serde(alias = "message_ttl_seconds")]
     #[serde(default = "default_message_ttl_seconds")]
     pub message_ttl_seconds: u64,
+    #[serde(alias = "enter_to_send")]
+    #[serde(default = "default_enter_to_send")]
+    pub enter_to_send: bool,
 }
 
 impl Default for AppSettings {
@@ -114,6 +122,7 @@ impl Default for AppSettings {
                 DEFAULT_RELAY_HTTP_SECONDARY.to_string(),
             ],
             message_ttl_seconds: DEFAULT_MESSAGE_TTL_SECONDS,
+            enter_to_send: DEFAULT_ENTER_TO_SEND,
         }
     }
 }

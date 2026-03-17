@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Aethos Tauri Spike",
+  "productName": "Aethos",
   "version": "0.1.0",
   "identifier": "org.aethos.spike.tauri",
   "build": {
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Aethos Tauri Spike",
+        "title": "Aethos",
         "width": 1160,
         "height": 800,
         "resizable": true
