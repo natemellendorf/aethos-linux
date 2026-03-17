@@ -993,13 +993,15 @@ fn handle_gossip_frame(
                 .or_else(|| peer_node_by_addr.get(&source_ip_key))
                 .cloned()
                 .unwrap_or_else(|| source.ip().to_string());
+            let transport_peer = source.to_string();
             log_verbose(&format!(
                 "gossip_transfer_from_resolved_sender: source={} resolved={}",
                 source_key, peer_node_id
             ));
             let result = import_transfer_items(
-                &peer_node_id,
                 &local_wayfarer,
+                Some(&transport_peer),
+                Some(&peer_node_id),
                 &transfer.objects,
                 now_unix_ms(),
             )?;
@@ -1012,12 +1014,10 @@ fn handle_gossip_frame(
                     .new_messages
                     .into_iter()
                     .map(|item| {
-                        let sender = resolve_sender_wayfarer_from_import(
-                            &item.from_wayfarer_id,
-                            &peer_node_id,
-                        );
                         crate::relay::client::EncounterMessagePreview {
-                            from_node_id: sender,
+                            author_wayfarer_id: item.author_wayfarer_id,
+                            session_peer: item.session_peer,
+                            transport_peer: item.transport_peer,
                             item_id: item.item_id,
                             text: item.text,
                             received_at_unix: item.received_at_unix,
@@ -1129,22 +1129,23 @@ fn merge_pulled_messages(
     pulled_messages: Vec<crate::relay::client::EncounterMessagePreview>,
 ) {
     for pulled in pulled_messages {
+        let sender_label = display_sender_label(&pulled);
         if let Some(receipt_manifest) = extract_receipt_manifest_id(&pulled.text) {
-            apply_delivery_receipt(chat, &pulled.from_node_id, &receipt_manifest, pulled.received_at_unix);
+            apply_delivery_receipt(chat, &sender_label, &receipt_manifest, pulled.received_at_unix);
             continue;
         }
 
-        let is_new_contact = !contacts.contains_key(&pulled.from_node_id);
+        let is_new_contact = !contacts.contains_key(&sender_label);
         if is_new_contact {
-            contacts.insert(pulled.from_node_id.clone(), pulled.from_node_id.clone());
-            if !chat.new_contacts.iter().any(|value| value == &pulled.from_node_id) {
-                chat.new_contacts.push(pulled.from_node_id.clone());
+            contacts.insert(sender_label.clone(), sender_label.clone());
+            if !chat.new_contacts.iter().any(|value| value == &sender_label) {
+                chat.new_contacts.push(sender_label.clone());
             }
         }
 
-        let seen_on_insert = chat.selected_contact.as_deref() == Some(pulled.from_node_id.as_str());
+        let seen_on_insert = chat.selected_contact.as_deref() == Some(sender_label.as_str());
 
-        let thread = chat.threads.entry(pulled.from_node_id.clone()).or_default();
+        let thread = chat.threads.entry(sender_label.clone()).or_default();
         let exists = thread.iter().any(|existing| {
             existing.msg_id == pulled.item_id
                 || (pulled.manifest_id_hex.is_some()
@@ -1170,12 +1171,28 @@ fn merge_pulled_messages(
         });
 
         if chat.selected_contact.is_none() {
-            chat.selected_contact = Some(pulled.from_node_id.clone());
-            mark_contact_seen(chat, &pulled.from_node_id);
+            chat.selected_contact = Some(sender_label.clone());
+            mark_contact_seen(chat, &sender_label);
         }
     }
 
     normalize_chat_state(chat);
+}
+
+fn display_sender_label(pulled: &crate::relay::client::EncounterMessagePreview) -> String {
+    if let Some(author) = pulled.author_wayfarer_id.as_ref() {
+        return author.clone();
+    }
+
+    if let Some(session_peer) = pulled.session_peer.as_ref() {
+        return format!("session peer: {session_peer}");
+    }
+
+    if let Some(transport_peer) = pulled.transport_peer.as_ref() {
+        return format!("transport peer: {transport_peer}");
+    }
+
+    "unknown peer".to_string()
 }
 
 fn apply_delivery_receipt(
@@ -1262,21 +1279,6 @@ fn emit_chat_snapshot_event_best_effort(context: &str) {
     if let Err(err) = emit_chat_snapshot_event() {
         log_verbose(&format!("chat_snapshot_emit_failed context={context}: {err}"));
     }
-}
-
-fn resolve_sender_wayfarer_from_import(
-    import_sender: &str,
-    peer_sender_hint: &str,
-) -> String {
-    if is_valid_wayfarer_id(import_sender) {
-        return import_sender.to_string();
-    }
-
-    log_info(&format!(
-        "gossip_sender_unresolved: import_sender='{}' peer_hint='{}'",
-        import_sender, peer_sender_hint
-    ));
-    "unknown-peer".to_string()
 }
 
 fn extract_receipt_manifest_id(input: &str) -> Option<String> {
@@ -1649,7 +1651,9 @@ mod tests {
         let mut chat = PersistedChatState::default();
         let mut contacts = BTreeMap::new();
         let pulled = vec![crate::relay::client::EncounterMessagePreview {
-            from_node_id: resolve_sender_wayfarer_from_import("not-a-wayfarer", "10.0.0.7:47655"),
+            author_wayfarer_id: None,
+            session_peer: None,
+            transport_peer: None,
             item_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                 .to_string(),
             text: "hello from unresolved sender".to_string(),
@@ -1660,7 +1664,7 @@ mod tests {
         merge_pulled_messages(&mut chat, &mut contacts, pulled);
         let thread = chat
             .threads
-            .get("unknown-peer")
+            .get("unknown peer")
             .expect("thread should be created for unresolved sender");
         assert_eq!(thread.len(), 1);
         assert_eq!(thread[0].text, "hello from unresolved sender");

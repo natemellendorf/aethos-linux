@@ -243,6 +243,7 @@ pub fn build_summary_frame(now_ms: u64) -> Result<GossipSyncFrame, String> {
     Ok(frame)
 }
 
+#[allow(dead_code)]
 pub fn select_request_item_ids_from_summary(
     summary: &SummaryFrame,
     max_want: usize,
@@ -275,11 +276,7 @@ fn select_request_item_ids_from_summary_with_context(
         return Ok(Vec::new());
     }
 
-    let local_have = local_have_item_ids
-        .iter()
-        .cloned()
-        .into_iter()
-        .collect::<BTreeSet<_>>();
+    let local_have = local_have_item_ids.iter().cloned().collect::<BTreeSet<_>>();
     let mut preview_eligible = Vec::new();
     let mut preview_seen = BTreeSet::new();
     for item_id in summary.preview_item_ids.as_deref().unwrap_or(&[]) {
@@ -530,17 +527,27 @@ pub fn import_transfer_items(
             None => {
                 store.items.insert(object.item_id.clone(), incoming);
                 accepted_item_ids.push(object.item_id.clone());
-                let text = decode_envelope_payload_utf8_preview(&object.envelope_b64)
-                    .unwrap_or_else(|_| "[binary payload]".to_string());
-                new_messages.push(ImportedEnvelope {
-                    item_id: object.item_id.clone(),
-                    author_wayfarer_id: None,
-                    transport_peer: transport_peer.map(|value| value.to_string()),
-                    session_peer: session_peer_wayfarer_id.map(|value| value.to_string()),
-                    text,
-                    received_at_unix: (now_ms / 1000) as i64,
-                    manifest_id_hex: Some(parsed.manifest_id_hex),
-                });
+                match decode_envelope_payload_utf8_preview(&object.envelope_b64) {
+                    Ok(text) => {
+                        new_messages.push(ImportedEnvelope {
+                            item_id: object.item_id.clone(),
+                            author_wayfarer_id: None,
+                            transport_peer: transport_peer.map(|value| value.to_string()),
+                            session_peer: session_peer_wayfarer_id.map(|value| value.to_string()),
+                            text,
+                            received_at_unix: (now_ms / 1000) as i64,
+                            manifest_id_hex: Some(parsed.manifest_id_hex),
+                        });
+                    }
+                    Err(_) => {
+                        log_verbose(&format!(
+                            "transfer_import_skip_non_utf8_payload: item_id={} transport_peer={} session_peer={}",
+                            object.item_id,
+                            transport_peer.unwrap_or("none"),
+                            session_peer_wayfarer_id.unwrap_or("none")
+                        ));
+                    }
+                }
             }
         }
     }
@@ -667,14 +674,26 @@ fn build_summary_preview_item_ids(now_ms: u64) -> Result<Vec<String>, String> {
     let mut ranked = store
         .items
         .values()
-        .map(|item| (item.recorded_at_unix_ms, item.item_id.clone()))
+        .map(|item| {
+            (
+                item.expiry_unix_ms,
+                item.hop_count,
+                decode_item_id(&item.item_id).unwrap_or_default(),
+                item.item_id.clone(),
+            )
+        })
         .collect::<Vec<_>>();
-    ranked.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    ranked.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
 
     let mut preview_item_ids = ranked
         .into_iter()
         .take(MAX_SUMMARY_PREVIEW_ITEMS)
-        .map(|(_, item_id)| item_id)
+        .map(|(_, _, _, item_id)| item_id)
         .collect::<Vec<_>>();
     preview_item_ids.sort_by_key(|item_id| decode_item_id(item_id).unwrap_or_default());
     preview_item_ids.dedup();
@@ -687,10 +706,10 @@ fn validate_transfer(frame: &TransferFrame) -> Result<(), String> {
     }
     let mut total_bytes = 0u64;
     for object in &frame.objects {
-        validate_transfer_object(object)?;
-        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(&object.envelope_b64)
-            .map_err(|err| format!("TRANSFER envelope decode failed: {err}"))?;
+        let Ok(raw) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&object.envelope_b64)
+        else {
+            continue;
+        };
         total_bytes = total_bytes.saturating_add(raw.len() as u64);
         if total_bytes > MAX_TRANSFER_BYTES {
             return Err("TRANSFER decoded payload exceeds MAX_TRANSFER_BYTES".to_string());
@@ -1097,18 +1116,58 @@ mod tests {
     }
 
     #[test]
-    fn validate_transfer_rejects_item_id_mismatch() {
-        let envelope_b64 =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(vec![0x81, 0x00]);
-        let transfer = TransferFrame {
-            objects: vec![TransferObject {
-                item_id: item(0xaa),
-                envelope_b64,
-                expiry_unix_ms: now_unix_ms() + 10_000,
-                hop_count: 1,
-            }],
+    fn parse_and_import_transfer_allows_mixed_validity_objects() {
+        let _lock = test_env_lock().lock().expect("lock test env");
+        let temp_dir = unique_test_state_dir("aethos-gossip-import-test");
+        let _env_guard = EnvVarGuard::set("XDG_STATE_HOME", &temp_dir);
+
+        let local_wayfarer = item(0x77);
+        let valid_payload = crate::aethos_core::protocol::build_envelope_payload_b64_from_utf8(
+            &local_wayfarer,
+            "hello",
+        )
+        .expect("valid payload");
+        let valid_item = super::item_id_from_envelope_bytes(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(&valid_payload)
+                .expect("decode valid payload"),
+        );
+
+        let frame = GossipSyncFrame::Transfer(TransferFrame {
+            objects: vec![
+                TransferObject {
+                    item_id: item(0xaa),
+                    envelope_b64: "not-base64url".to_string(),
+                    expiry_unix_ms: now_unix_ms() + 60_000,
+                    hop_count: 1,
+                },
+                TransferObject {
+                    item_id: valid_item.clone(),
+                    envelope_b64: valid_payload,
+                    expiry_unix_ms: now_unix_ms() + 60_000,
+                    hop_count: 1,
+                },
+            ],
+        });
+
+        let raw = serialize_frame(&frame).expect("serialize transfer");
+        let parsed = parse_frame(&raw).expect("parse should allow mixed validity objects");
+        let GossipSyncFrame::Transfer(parsed_transfer) = parsed else {
+            panic!("expected transfer frame")
         };
-        assert!(validate_transfer(&transfer).is_err());
+
+        let imported = import_transfer_items(
+            &local_wayfarer,
+            Some("10.0.0.3:47655"),
+            Some(&item(0x66)),
+            &parsed_transfer.objects,
+            now_unix_ms(),
+        )
+        .expect("import mixed objects");
+
+        assert_eq!(imported.accepted_item_ids, vec![valid_item]);
+        assert_eq!(imported.rejected_items.len(), 1);
+        assert_eq!(imported.rejected_items[0].code, "MALFORMED_OBJECT");
     }
 
     #[test]
@@ -1184,5 +1243,42 @@ mod tests {
         .expect("import");
         assert_eq!(imported.new_messages.len(), 1);
         assert!(imported.new_messages[0].author_wayfarer_id.is_none());
+    }
+
+    #[test]
+    fn import_transfer_skips_non_utf8_payload_from_chat_preview() {
+        let _lock = test_env_lock().lock().expect("lock test env");
+        let temp_dir = unique_test_state_dir("aethos-gossip-import-test");
+        let _env_guard = EnvVarGuard::set("XDG_STATE_HOME", &temp_dir);
+
+        let local_wayfarer = item(0x24);
+        let payload = crate::aethos_core::protocol::build_envelope_payload_b64(
+            &local_wayfarer,
+            &[0xff, 0xfe, 0xfd, 0x00],
+        )
+        .expect("payload");
+        let object = TransferObject {
+            item_id: super::item_id_from_envelope_bytes(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(&payload)
+                    .expect("decode payload"),
+            ),
+            envelope_b64: payload,
+            expiry_unix_ms: now_unix_ms() + 60_000,
+            hop_count: 1,
+        };
+
+        let imported = import_transfer_items(
+            &local_wayfarer,
+            Some("10.0.0.10:47655"),
+            Some(&item(0x11)),
+            &[object],
+            now_unix_ms(),
+        )
+        .expect("import");
+
+        assert_eq!(imported.accepted_item_ids.len(), 1);
+        assert!(imported.rejected_items.is_empty());
+        assert!(imported.new_messages.is_empty());
     }
 }
