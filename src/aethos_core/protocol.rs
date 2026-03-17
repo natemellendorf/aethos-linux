@@ -4,9 +4,12 @@ use std::io::Cursor;
 use base64::Engine;
 use ciborium::value::Value;
 use ciborium::{de::from_reader, ser::into_writer};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::Serialize;
 use serde_bytes::ByteBuf;
 use sha2::{Digest, Sha256};
+
+const ENVELOPE_V1_SIGNING_DOMAIN: &[u8] = b"AETHOS_ENVELOPE_V1";
 
 pub fn is_valid_wayfarer_id(value: &str) -> bool {
     value.len() == 64
@@ -27,12 +30,15 @@ pub struct EnvelopeV1 {
     pub to_wayfarer_id: [u8; 32],
     pub manifest_id: Vec<u8>,
     pub body: Vec<u8>,
+    pub author_pubkey: [u8; 32],
+    pub author_sig: [u8; 64],
 }
 
 #[derive(Debug, Clone)]
 pub struct DecodedEnvelopeV1 {
     pub to_wayfarer_id_hex: String,
     pub manifest_id_hex: String,
+    pub author_wayfarer_id_hex: String,
     pub body: Vec<u8>,
 }
 
@@ -48,6 +54,14 @@ impl EnvelopeV1 {
             ByteBuf::from(self.manifest_id.clone()),
         );
         payload_fields.insert("body".to_string(), ByteBuf::from(self.body.clone()));
+        payload_fields.insert(
+            "author_pubkey".to_string(),
+            ByteBuf::from(self.author_pubkey.to_vec()),
+        );
+        payload_fields.insert(
+            "author_sig".to_string(),
+            ByteBuf::from(self.author_sig.to_vec()),
+        );
         let value = to_cbor_value(&payload_fields)
             .map_err(|err| format!("failed serializing envelope cbor: {err}"))?;
         encode_cbor_value_deterministic(&value)
@@ -57,17 +71,34 @@ impl EnvelopeV1 {
 pub fn build_envelope_payload_b64_from_utf8(
     to_wayfarer_id_hex: &str,
     body_utf8: &str,
+    author_signing_key_seed: &[u8; 32],
 ) -> Result<String, String> {
-    build_envelope_payload_b64(to_wayfarer_id_hex, body_utf8.as_bytes())
+    build_envelope_payload_b64(
+        to_wayfarer_id_hex,
+        body_utf8.as_bytes(),
+        author_signing_key_seed,
+    )
 }
 
-pub fn build_envelope_payload_b64(to_wayfarer_id_hex: &str, body: &[u8]) -> Result<String, String> {
+pub fn build_envelope_payload_b64(
+    to_wayfarer_id_hex: &str,
+    body: &[u8],
+    author_signing_key_seed: &[u8; 32],
+) -> Result<String, String> {
     let to_wayfarer_id = parse_wayfarer_id_hex(to_wayfarer_id_hex)?;
     let manifest_id = Sha256::digest(body).to_vec();
+    let signing_payload = build_signing_payload_v1(&to_wayfarer_id, &manifest_id, body)?;
+    let signing_digest = envelope_signing_digest_v1(&signing_payload);
+    let signing_key = SigningKey::from_bytes(author_signing_key_seed);
+    let author_pubkey = signing_key.verifying_key().to_bytes();
+    let author_sig = signing_key.sign(&signing_digest).to_bytes();
+
     let envelope = EnvelopeV1 {
         to_wayfarer_id,
         manifest_id,
         body: body.to_vec(),
+        author_pubkey,
+        author_sig,
     };
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(envelope.canonical_bytes_v1()?))
 }
@@ -97,18 +128,27 @@ fn parse_envelope_cbor(raw: &[u8]) -> Result<DecodedEnvelopeV1, String> {
         let Value::Text(key_text) = key else {
             return Err("envelope cbor keys must be UTF-8 strings".to_string());
         };
-        if let Value::Bytes(bytes) = value {
-            field_map.insert(key_text, bytes);
+        let Value::Bytes(bytes) = value else {
+            return Err("envelope cbor values must be byte strings".to_string());
+        };
+        if field_map.insert(key_text, bytes).is_some() {
+            return Err("envelope cbor contains duplicate keys".to_string());
         }
     }
 
-    if !field_map.contains_key("to_wayfarer_id")
-        || !field_map.contains_key("manifest_id")
-        || !field_map.contains_key("body")
+    let expected_keys = [
+        "to_wayfarer_id",
+        "manifest_id",
+        "body",
+        "author_pubkey",
+        "author_sig",
+    ];
+    if field_map.len() != expected_keys.len()
+        || expected_keys
+            .iter()
+            .any(|required| !field_map.contains_key(*required))
     {
-        return Err(
-            "envelope cbor missing required keys: to_wayfarer_id, manifest_id, body".to_string(),
-        );
+        return Err("envelope cbor must contain exactly required keys".to_string());
     }
 
     let to_wayfarer_id = field_map
@@ -116,9 +156,10 @@ fn parse_envelope_cbor(raw: &[u8]) -> Result<DecodedEnvelopeV1, String> {
         .cloned()
         .ok_or_else(|| "missing envelope field to_wayfarer_id".to_string())?
         .to_vec();
-    if to_wayfarer_id.len() != 32 {
-        return Err("invalid to_wayfarer_id length in envelope".to_string());
-    }
+    let to_wayfarer_id_arr: [u8; 32] = to_wayfarer_id
+        .as_slice()
+        .try_into()
+        .map_err(|_| "invalid to_wayfarer_id length in envelope".to_string())?;
 
     let manifest_id = field_map
         .get("manifest_id")
@@ -135,11 +176,69 @@ fn parse_envelope_cbor(raw: &[u8]) -> Result<DecodedEnvelopeV1, String> {
         .ok_or_else(|| "missing envelope field body".to_string())?
         .to_vec();
 
+    let author_pubkey = field_map
+        .get("author_pubkey")
+        .cloned()
+        .ok_or_else(|| "missing envelope field author_pubkey".to_string())?
+        .to_vec();
+    let author_pubkey_arr: [u8; 32] = author_pubkey
+        .try_into()
+        .map_err(|_| "invalid author_pubkey length in envelope".to_string())?;
+
+    let author_sig = field_map
+        .get("author_sig")
+        .cloned()
+        .ok_or_else(|| "missing envelope field author_sig".to_string())?
+        .to_vec();
+    let author_sig_arr: [u8; 64] = author_sig
+        .try_into()
+        .map_err(|_| "invalid author_sig length in envelope".to_string())?;
+
+    let signing_payload = build_signing_payload_v1(&to_wayfarer_id_arr, &manifest_id, &body)?;
+    let signing_digest = envelope_signing_digest_v1(&signing_payload);
+
+    let verifying_key = VerifyingKey::from_bytes(&author_pubkey_arr)
+        .map_err(|err| format!("invalid author_pubkey: {err}"))?;
+    let signature = Signature::from_bytes(&author_sig_arr);
+    verifying_key
+        .verify(&signing_digest, &signature)
+        .map_err(|_| "invalid envelope signature".to_string())?;
+
+    let author_wayfarer_id_hex = bytes_to_hex_lower(&Sha256::digest(author_pubkey_arr));
+
     Ok(DecodedEnvelopeV1 {
-        to_wayfarer_id_hex: bytes_to_hex_lower(&to_wayfarer_id),
+        to_wayfarer_id_hex: bytes_to_hex_lower(&to_wayfarer_id_arr),
         manifest_id_hex: bytes_to_hex_lower(&manifest_id),
+        author_wayfarer_id_hex,
         body,
     })
+}
+
+fn build_signing_payload_v1(
+    to_wayfarer_id: &[u8; 32],
+    manifest_id: &[u8],
+    body: &[u8],
+) -> Result<Vec<u8>, String> {
+    let mut signing_fields = BTreeMap::<String, ByteBuf>::new();
+    signing_fields.insert(
+        "to_wayfarer_id".to_string(),
+        ByteBuf::from(to_wayfarer_id.to_vec()),
+    );
+    signing_fields.insert(
+        "manifest_id".to_string(),
+        ByteBuf::from(manifest_id.to_vec()),
+    );
+    signing_fields.insert("body".to_string(), ByteBuf::from(body.to_vec()));
+    let value = to_cbor_value(&signing_fields)
+        .map_err(|err| format!("failed serializing signing payload cbor: {err}"))?;
+    encode_cbor_value_deterministic(&value)
+}
+
+fn envelope_signing_digest_v1(signing_payload: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(ENVELOPE_V1_SIGNING_DOMAIN);
+    hasher.update(signing_payload);
+    hasher.finalize().into()
 }
 
 pub fn to_cbor_value<T: Serialize>(value: &T) -> Result<Value, String> {
@@ -236,30 +335,39 @@ mod tests {
     };
     use base64::Engine;
     use ciborium::value::Value;
+    use ed25519_dalek::SigningKey;
     use sha2::{Digest, Sha256};
 
     const VECTOR_TO_WAYFARER_ID: &str =
         "1111111111111111111111111111111111111111111111111111111111111111";
     const VECTOR_BODY: &str = "hello";
-    const VECTOR_ENVELOPE_HEX: &str = "a364626f64794568656c6c6f6b6d616e69666573745f696458202cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b98246e746f5f77617966617265725f696458201111111111111111111111111111111111111111111111111111111111111111";
-    const VECTOR_ITEM_ID_HEX: &str =
-        "462e8f38ba0e88386d4b547fd6d3e63d8c263431bc19ea3bd2fb788ee6fcb702";
-    const VECTOR_ENVELOPE_B64URL: &str = "o2Rib2R5RWhlbGxva21hbmlmZXN0X2lkWCAs8k26X7CjDiboOyrFueKeGxYeXB-nQl5zBDNik4uYJG50b193YXlmYXJlcl9pZFggERERERERERERERERERERERERERERERERERERERERERE";
+    const TEST_SIGNING_KEY_SEED: [u8; 32] = [7u8; 32];
+
+    fn expected_author_wayfarer_id() -> String {
+        let verifying_key = SigningKey::from_bytes(&TEST_SIGNING_KEY_SEED).verifying_key();
+        bytes_to_hex_lower(&Sha256::digest(verifying_key.to_bytes()))
+    }
 
     #[test]
-    fn envelope_v1_matches_canonical_vector() {
-        let envelope_b64 = build_envelope_payload_b64_from_utf8(VECTOR_TO_WAYFARER_ID, VECTOR_BODY)
-            .expect("build vector envelope");
+    fn envelope_v1_contains_signed_author_fields() {
+        let envelope_b64 = build_envelope_payload_b64_from_utf8(
+            VECTOR_TO_WAYFARER_ID,
+            VECTOR_BODY,
+            &TEST_SIGNING_KEY_SEED,
+        )
+        .expect("build vector envelope");
         let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(&envelope_b64)
             .expect("decode envelope bytes");
 
-        assert_eq!(bytes_to_hex_lower(&raw), VECTOR_ENVELOPE_HEX);
+        let decoded = decode_envelope_payload_b64(&envelope_b64).expect("decode envelope");
+        assert_eq!(decoded.to_wayfarer_id_hex, VECTOR_TO_WAYFARER_ID);
         assert_eq!(
-            bytes_to_hex_lower(&Sha256::digest(&raw)),
-            VECTOR_ITEM_ID_HEX
+            decoded.author_wayfarer_id_hex,
+            expected_author_wayfarer_id()
         );
-        assert_eq!(envelope_b64, VECTOR_ENVELOPE_B64URL);
+        assert_eq!(decoded.body, VECTOR_BODY.as_bytes());
+        assert!(!raw.is_empty());
     }
 
     #[test]
@@ -267,6 +375,9 @@ mod tests {
         let to_wayfarer = vec![0x11u8; 32];
         let manifest = Sha256::digest(VECTOR_BODY.as_bytes()).to_vec();
         let body = VECTOR_BODY.as_bytes().to_vec();
+        let signing_key = SigningKey::from_bytes(&TEST_SIGNING_KEY_SEED);
+        let author_pubkey = signing_key.verifying_key().to_bytes().to_vec();
+        let author_sig = vec![0u8; 64];
         let noncanonical = Value::Map(vec![
             (
                 Value::Text("to_wayfarer_id".to_string()),
@@ -277,6 +388,14 @@ mod tests {
                 Value::Bytes(manifest),
             ),
             (Value::Text("body".to_string()), Value::Bytes(body)),
+            (
+                Value::Text("author_pubkey".to_string()),
+                Value::Bytes(author_pubkey),
+            ),
+            (
+                Value::Text("author_sig".to_string()),
+                Value::Bytes(author_sig),
+            ),
         ]);
         let noncanonical_raw = {
             let mut out = Vec::new();
@@ -310,8 +429,38 @@ mod tests {
 
     #[test]
     fn envelope_payload_decoder_accepts_vector() {
-        let decoded = decode_envelope_payload_b64(VECTOR_ENVELOPE_B64URL).expect("decode envelope");
+        let envelope_b64 = build_envelope_payload_b64_from_utf8(
+            VECTOR_TO_WAYFARER_ID,
+            VECTOR_BODY,
+            &TEST_SIGNING_KEY_SEED,
+        )
+        .expect("build vector envelope");
+        let decoded = decode_envelope_payload_b64(&envelope_b64).expect("decode envelope");
         assert_eq!(decoded.to_wayfarer_id_hex, VECTOR_TO_WAYFARER_ID);
         assert_eq!(decoded.body, VECTOR_BODY.as_bytes());
+        assert_eq!(
+            decoded.author_wayfarer_id_hex,
+            expected_author_wayfarer_id()
+        );
+    }
+
+    #[test]
+    fn envelope_decode_rejects_tampered_signature() {
+        let envelope_b64 = build_envelope_payload_b64_from_utf8(
+            VECTOR_TO_WAYFARER_ID,
+            VECTOR_BODY,
+            &TEST_SIGNING_KEY_SEED,
+        )
+        .expect("build vector envelope");
+        let mut raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&envelope_b64)
+            .expect("decode envelope bytes");
+        let last = raw.len() - 1;
+        raw[last] ^= 0x01;
+        let tampered_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw);
+
+        assert!(decode_envelope_payload_b64(&tampered_b64)
+            .expect_err("tampered signature must fail")
+            .contains("invalid envelope signature"));
     }
 }

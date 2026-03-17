@@ -38,8 +38,9 @@ use crate::aethos_core::gossip_sync::{
     GossipSyncFrame, GOSSIP_LAN_PORT,
 };
 use crate::aethos_core::identity_store::{
-    delete_wayfarer_id, ensure_local_identity, load_contact_aliases, load_relay_session_cache,
-    regenerate_local_identity, save_contact_aliases, save_relay_session_cache, RelaySessionCache,
+    delete_wayfarer_id, ensure_local_identity, load_contact_aliases, load_local_signing_key_seed,
+    load_relay_session_cache, regenerate_local_identity, save_contact_aliases,
+    save_relay_session_cache, RelaySessionCache,
 };
 use crate::aethos_core::logging::{
     app_log_file_path as shared_app_log_file_path, log_info as shared_log_info,
@@ -2175,7 +2176,29 @@ fn build_ui(app: &Application) {
                 });
                 return;
             }
-            let payload_b64 = match build_envelope_payload_b64_from_utf8(&to, &outgoing_text) {
+            let author_signing_seed = match load_local_signing_key_seed() {
+                Ok(seed) => seed,
+                Err(err) => {
+                    let _ = session_tx.send(SessionStatus {
+                        op: SessionOp::Send,
+                        text: format!("send failed: local signing key unavailable: {err}"),
+                        ack_msg_id: None,
+                        outgoing_contact: None,
+                        outgoing_text: None,
+                        outgoing_manifest_id: None,
+                        outgoing_local_id: None,
+                        outgoing_expiry_unix_ms: None,
+                        outgoing_error: None,
+                        pulled_messages: Vec::new(),
+                    });
+                    return;
+                }
+            };
+            let payload_b64 = match build_envelope_payload_b64_from_utf8(
+                &to,
+                &outgoing_text,
+                &author_signing_seed,
+            ) {
                 Ok(payload) => payload,
                 Err(err) => {
                     let _ = session_tx.send(SessionStatus {

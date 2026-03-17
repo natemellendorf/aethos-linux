@@ -531,7 +531,7 @@ pub fn import_transfer_items(
                     Ok(text) => {
                         new_messages.push(ImportedEnvelope {
                             item_id: object.item_id.clone(),
-                            author_wayfarer_id: None,
+                            author_wayfarer_id: Some(parsed.author_wayfarer_id_hex.clone()),
                             transport_peer: transport_peer.map(|value| value.to_string()),
                             session_peer: session_peer_wayfarer_id.map(|value| value.to_string()),
                             text,
@@ -1122,9 +1122,11 @@ mod tests {
         let _env_guard = EnvVarGuard::set("XDG_STATE_HOME", &temp_dir);
 
         let local_wayfarer = item(0x77);
+        let signing_seed = [5u8; 32];
         let valid_payload = crate::aethos_core::protocol::build_envelope_payload_b64_from_utf8(
             &local_wayfarer,
             "hello",
+            &signing_seed,
         )
         .expect("valid payload");
         let valid_item = super::item_id_from_envelope_bytes(
@@ -1177,9 +1179,11 @@ mod tests {
         let _env_guard = EnvVarGuard::set("XDG_STATE_HOME", &temp_dir);
 
         let local_wayfarer = item(0x99);
+        let signing_seed = [6u8; 32];
         let payload = crate::aethos_core::protocol::build_envelope_payload_b64_from_utf8(
             &local_wayfarer,
             "hello",
+            &signing_seed,
         )
         .expect("payload");
         let object = TransferObject {
@@ -1202,7 +1206,11 @@ mod tests {
         .expect("import");
         assert_eq!(imported.new_messages.len(), 1);
         let msg = &imported.new_messages[0];
-        assert!(msg.author_wayfarer_id.is_none());
+        assert!(msg
+            .author_wayfarer_id
+            .as_ref()
+            .map(|value| value.len() == 64)
+            .unwrap_or(false));
         assert_eq!(msg.transport_peer.as_deref(), Some("10.0.0.2:47655"));
         let expected_session_peer = item(0x55);
         assert_eq!(
@@ -1218,9 +1226,11 @@ mod tests {
         let _env_guard = EnvVarGuard::set("XDG_STATE_HOME", &temp_dir);
 
         let local_wayfarer = item(0x42);
+        let signing_seed = [7u8; 32];
         let payload = crate::aethos_core::protocol::build_envelope_payload_b64_from_utf8(
             &local_wayfarer,
             "hello",
+            &signing_seed,
         )
         .expect("payload");
         let object = TransferObject {
@@ -1242,7 +1252,11 @@ mod tests {
         )
         .expect("import");
         assert_eq!(imported.new_messages.len(), 1);
-        assert!(imported.new_messages[0].author_wayfarer_id.is_none());
+        assert!(imported.new_messages[0]
+            .author_wayfarer_id
+            .as_ref()
+            .map(|value| value.len() == 64)
+            .unwrap_or(false));
     }
 
     #[test]
@@ -1252,9 +1266,11 @@ mod tests {
         let _env_guard = EnvVarGuard::set("XDG_STATE_HOME", &temp_dir);
 
         let local_wayfarer = item(0x24);
+        let signing_seed = [8u8; 32];
         let payload = crate::aethos_core::protocol::build_envelope_payload_b64(
             &local_wayfarer,
             &[0xff, 0xfe, 0xfd, 0x00],
+            &signing_seed,
         )
         .expect("payload");
         let object = TransferObject {

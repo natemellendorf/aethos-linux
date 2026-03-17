@@ -76,6 +76,17 @@ pub fn regenerate_local_identity() -> Result<LocalIdentitySummary, String> {
     summary_from_identity(&identity)
 }
 
+pub fn load_local_signing_key_seed() -> Result<[u8; 32], String> {
+    let identity = ensure_stored_identity()?;
+    let signing_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&identity.signing_key_b64)
+        .map_err(|err| format!("failed to decode signing key: {err}"))?;
+
+    signing_bytes
+        .try_into()
+        .map_err(|_| "decoded signing key had invalid length".to_string())
+}
+
 pub fn delete_wayfarer_id() -> Result<(), String> {
     let identity_path = identity_file_path();
     if identity_path.exists() {

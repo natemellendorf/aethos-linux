@@ -40,8 +40,8 @@ use crate::aethos_core::gossip_sync::{
     GossipSyncFrame, ReceiptFrame, MAX_TRANSFER_BYTES, GOSSIP_LAN_PORT,
 };
 use crate::aethos_core::identity_store::{
-    delete_wayfarer_id, ensure_local_identity, load_contact_aliases, regenerate_local_identity,
-    save_contact_aliases,
+    delete_wayfarer_id, ensure_local_identity, load_contact_aliases, load_local_signing_key_seed,
+    regenerate_local_identity, save_contact_aliases,
 };
 use crate::aethos_core::logging::{
     app_log_file_path, log_info, log_verbose, set_verbose_logging_enabled, verbose_logging_enabled,
@@ -470,11 +470,13 @@ fn send_message_blocking(request: SendMessageRequest) -> Result<SendMessageRespo
     let now_secs = now_unix_secs();
     let settings = load_app_settings()?;
     let identity = ensure_local_identity()?;
+    let author_signing_seed = load_local_signing_key_seed()?;
     let mut contacts = load_contact_aliases()?;
     let expiry_ms = now_ms.saturating_add(settings.message_ttl_seconds.saturating_mul(1000));
     let local_id = format!("local-{now_ms}-{:08x}", rand::random::<u32>());
     let outbound_payload = build_outbound_chat_payload(body, &local_id, now_ms);
-    let payload = build_envelope_payload_b64_from_utf8(wayfarer_id, &outbound_payload)?;
+    let payload =
+        build_envelope_payload_b64_from_utf8(wayfarer_id, &outbound_payload, &author_signing_seed)?;
     let decoded = decode_envelope_payload_b64(&payload)?;
     let item_id = gossip_record_local_payload(&payload, expiry_ms)?;
     if let Some(runtime) = GOSSIP_RUNTIME.get() {
@@ -1129,7 +1131,8 @@ fn merge_pulled_messages(
     pulled_messages: Vec<crate::relay::client::EncounterMessagePreview>,
 ) {
     for pulled in pulled_messages {
-        let sender_label = display_sender_label(&pulled);
+        let sender_label = resolve_contact_id_for_preview(&pulled);
+        let sender_alias = resolve_contact_alias_for_preview(&pulled);
         if let Some(receipt_manifest) = extract_receipt_manifest_id(&pulled.text) {
             apply_delivery_receipt(chat, &sender_label, &receipt_manifest, pulled.received_at_unix);
             continue;
@@ -1137,7 +1140,7 @@ fn merge_pulled_messages(
 
         let is_new_contact = !contacts.contains_key(&sender_label);
         if is_new_contact {
-            contacts.insert(sender_label.clone(), sender_label.clone());
+            contacts.insert(sender_label.clone(), sender_alias);
             if !chat.new_contacts.iter().any(|value| value == &sender_label) {
                 chat.new_contacts.push(sender_label.clone());
             }
@@ -1179,20 +1182,32 @@ fn merge_pulled_messages(
     normalize_chat_state(chat);
 }
 
-fn display_sender_label(pulled: &crate::relay::client::EncounterMessagePreview) -> String {
+fn resolve_contact_id_for_preview(pulled: &crate::relay::client::EncounterMessagePreview) -> String {
     if let Some(author) = pulled.author_wayfarer_id.as_ref() {
-        return author.clone();
+        if is_valid_wayfarer_id(author) {
+            return author.clone();
+        }
+    }
+
+    "unknown-peer".to_string()
+}
+
+fn resolve_contact_alias_for_preview(pulled: &crate::relay::client::EncounterMessagePreview) -> String {
+    if let Some(author) = pulled.author_wayfarer_id.as_ref() {
+        if is_valid_wayfarer_id(author) {
+            return author.clone();
+        }
     }
 
     if let Some(session_peer) = pulled.session_peer.as_ref() {
-        return format!("session peer: {session_peer}");
+        return format!("Unknown peer ({session_peer})");
     }
 
     if let Some(transport_peer) = pulled.transport_peer.as_ref() {
-        return format!("transport peer: {transport_peer}");
+        return format!("Unknown peer ({transport_peer})");
     }
 
-    "unknown peer".to_string()
+    "Unknown peer".to_string()
 }
 
 fn apply_delivery_receipt(
@@ -1664,7 +1679,7 @@ mod tests {
         merge_pulled_messages(&mut chat, &mut contacts, pulled);
         let thread = chat
             .threads
-            .get("unknown peer")
+            .get("unknown-peer")
             .expect("thread should be created for unresolved sender");
         assert_eq!(thread.len(), 1);
         assert_eq!(thread[0].text, "hello from unresolved sender");
@@ -1679,15 +1694,18 @@ mod tests {
     #[test]
     fn outbound_chat_payload_changes_manifest_for_same_text() {
         let recipient = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let signing_seed = [9u8; 32];
 
         let payload_a = build_envelope_payload_b64_from_utf8(
             recipient,
             &build_outbound_chat_payload("same text", "local-1", 1000),
+            &signing_seed,
         )
         .expect("build payload a");
         let payload_b = build_envelope_payload_b64_from_utf8(
             recipient,
             &build_outbound_chat_payload("same text", "local-2", 1000),
+            &signing_seed,
         )
         .expect("build payload b");
 

@@ -43,7 +43,9 @@ const LOG_FILTERS = {
 };
 
 function tinyId(id = "") {
-  return id ? `${id.slice(0, 10)}...${id.slice(-8)}` : "-";
+  if (!id) return "-";
+  if (id.length <= 24) return id;
+  return `${id.slice(0, 10)}...${id.slice(-8)}`;
 }
 
 function formatMessageTimestamp(message) {
@@ -343,6 +345,9 @@ export default function App() {
 
   const sendMessage = async () => {
     if (!selectedContactId) return setStatus("Select a contact before sending");
+    if (!canSendToSelectedContact) {
+      return setStatus("Cannot send to unresolved peer thread. Select a saved Wayfarer contact.");
+    }
     const body = composer.trim();
     if (!body) return setStatus("Message body cannot be empty");
 
@@ -467,6 +472,7 @@ export default function App() {
   };
 
   const selectedName = selectedContactId ? contacts[selectedContactId] || tinyId(selectedContactId) : "none";
+  const canSendToSelectedContact = /^[0-9a-f]{64}$/.test(selectedContactId || "");
   const networkActive = Date.now() - networkPulseTs < 2200;
   const relayOnline = relayHealth.chipState === "ok" || relayHealth.chipState === "warn";
   const gossipOnline = gossipStatus.enabled && gossipStatus.running;
@@ -591,6 +597,7 @@ export default function App() {
                 <div className="mb-1 flex gap-2"><Button variant="secondary" className="h-9" onClick={syncInbox}><RefreshCcw className="mr-2 h-4 w-4" />Sync Inbox</Button></div>
                 <Textarea
                   value={composer}
+                  disabled={!canSendToSelectedContact}
                   onChange={(e) => setComposer(e.target.value)}
                   onKeyDown={(event) => {
                     const enterToSend = settings?.enterToSend !== false;
@@ -600,9 +607,9 @@ export default function App() {
                     void sendMessage();
                   }}
                   rows={2}
-                  placeholder={settings?.enterToSend === false ? "Write a message..." : "Write a message... (Enter to send, Shift+Enter newline)"}
+                  placeholder={!canSendToSelectedContact ? "Cannot reply to unresolved peer. Select a saved contact." : (settings?.enterToSend === false ? "Write a message..." : "Write a message... (Enter to send, Shift+Enter newline)")}
                 />
-                <Button className="mt-1 h-9 w-full" onClick={sendMessage}>Send</Button>
+                <Button className="mt-1 h-9 w-full" disabled={!canSendToSelectedContact} onClick={sendMessage}>Send</Button>
               </CardContent>
             </Card>
           </div>
