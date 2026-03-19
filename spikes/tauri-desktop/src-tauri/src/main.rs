@@ -1,3 +1,5 @@
+#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+
 mod app_state;
 
 #[allow(dead_code)]
@@ -935,7 +937,6 @@ fn handle_gossip_frame(
             let node_id = hello.node_id;
             peer_node_by_addr.insert(source_key.clone(), node_id.clone());
             peer_node_by_addr.insert(source_ip_key.clone(), node_id);
-            emit_sound_event_best_effort("encounter", "gossip_hello");
             log_verbose(&format!(
                 "gossip_peer_hello_mapped: source={} source_ip={} peers={}",
                 source_key,
