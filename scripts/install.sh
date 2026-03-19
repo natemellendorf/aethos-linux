@@ -7,6 +7,10 @@ REPO="${AETHOS_REPO:-$DEFAULT_REPO}"
 REF="${AETHOS_REF:-}"
 PREFIX="${AETHOS_PREFIX:-$HOME/.local}"
 BIN_DIR="${AETHOS_BIN_DIR:-$PREFIX/bin}"
+OS_NAME=""
+ARCH_NAME=""
+TARGET_TRIPLE=""
+ARCHIVE_EXT="tar.gz"
 
 usage() {
   cat <<'EOF'
@@ -77,6 +81,9 @@ detect_target() {
   os="$(uname -s)"
   arch="$(uname -m)"
 
+  OS_NAME="$os"
+  ARCH_NAME="$arch"
+
   case "$os" in
     Linux)
       case "$arch" in
@@ -98,6 +105,63 @@ detect_target() {
       fail "unsupported OS: ${os} (use scripts/install.ps1 on Windows)"
       ;;
   esac
+}
+
+select_release_asset() {
+  local release_json="$1"
+
+  RELEASE_JSON="$release_json" python3 - "$OS_NAME" "$ARCH_NAME" "$REF" "$TARGET_TRIPLE" <<'PY'
+import json
+import os
+import sys
+
+os_name, arch_name, ref, target = sys.argv[1:5]
+data = json.loads(os.environ.get("RELEASE_JSON", "{}"))
+assets = data.get("assets", [])
+
+def first_match(predicate):
+    for item in assets:
+        name = item.get("name", "")
+        if predicate(name):
+            return name, item.get("browser_download_url", "")
+    return "", ""
+
+# 1) Legacy CLI tarball naming (still supported)
+legacy = f"aethos-{ref}-{target}.tar.gz"
+for item in assets:
+    if item.get("name") == legacy:
+        print(f"{legacy}\t{item.get('browser_download_url', '')}")
+        raise SystemExit(0)
+
+name_l = lambda n: n.lower()
+arch_tokens = {
+    "x86_64": ["x86_64", "amd64", "x64"],
+    "aarch64": ["aarch64", "arm64"],
+    "arm64": ["aarch64", "arm64"],
+}.get(arch_name, [arch_name.lower()])
+
+def has_arch(name):
+    lower = name_l(name)
+    return any(tok in lower for tok in arch_tokens)
+
+if os_name == "Linux":
+    name, url = first_match(lambda n: name_l(n).endswith(".appimage") and has_arch(n))
+    if not name:
+        name, url = first_match(lambda n: name_l(n).endswith(".appimage"))
+    if not name:
+        name, url = first_match(lambda n: name_l(n).endswith(".deb") and has_arch(n))
+elif os_name == "Darwin":
+    name, url = first_match(lambda n: name_l(n).endswith(".dmg") and has_arch(n))
+    if not name:
+        name, url = first_match(lambda n: name_l(n).endswith(".dmg"))
+else:
+    name, url = "", ""
+
+if not name:
+    print("\t")
+else:
+    print(f"{name}\t{url}")
+PY
 }
 
 resolve_ref() {
@@ -145,27 +209,51 @@ install_from_release_asset() {
   trap "rm -rf '$tmp_dir'" EXIT
 
   release_json="$(fetch_release_json)"
-  asset_name="aethos-${REF}-${TARGET_TRIPLE}.${ARCHIVE_EXT}"
-  asset_url="$(asset_download_url "${release_json}" "${asset_name}")"
+  IFS=$'\t' read -r asset_name asset_url < <(select_release_asset "${release_json}")
 
-  [[ -n "${asset_url}" ]] || fail "release ${REF} does not contain asset ${asset_name}"
+  [[ -n "${asset_url}" ]] || fail "release ${REF} does not contain a supported installer asset for ${OS_NAME}/${ARCH_NAME}"
 
   archive_path="${tmp_dir}/${asset_name}"
   log "Downloading ${asset_name}"
   curl -fL "${asset_url}" -o "${archive_path}"
 
-  mkdir -p "${tmp_dir}/extract"
-  tar -xzf "${archive_path}" -C "${tmp_dir}/extract"
-
-  local binary_path="${tmp_dir}/extract/aethos"
-  [[ -f "${binary_path}" ]] || fail "archive missing expected binary: aethos"
-
-  install -d "${BIN_DIR}"
-  install -m 0755 "${binary_path}" "${BIN_DIR}/aethos"
-  ln -sfn "${BIN_DIR}/aethos" "${BIN_DIR}/aethos-linux"
-
-  log "Installed: ${BIN_DIR}/aethos"
-  log "Alias:     ${BIN_DIR}/aethos-linux -> ${BIN_DIR}/aethos"
+  case "${asset_name,,}" in
+    *.tar.gz)
+      mkdir -p "${tmp_dir}/extract"
+      tar -xzf "${archive_path}" -C "${tmp_dir}/extract"
+      local binary_path="${tmp_dir}/extract/aethos"
+      [[ -f "${binary_path}" ]] || fail "archive missing expected binary: aethos"
+      install -d "${BIN_DIR}"
+      install -m 0755 "${binary_path}" "${BIN_DIR}/aethos"
+      ln -sfn "${BIN_DIR}/aethos" "${BIN_DIR}/aethos-linux"
+      log "Installed: ${BIN_DIR}/aethos"
+      ;;
+    *.appimage)
+      install -d "${BIN_DIR}"
+      install -m 0755 "${archive_path}" "${BIN_DIR}/aethos"
+      ln -sfn "${BIN_DIR}/aethos" "${BIN_DIR}/aethos-linux"
+      log "Installed AppImage launcher at: ${BIN_DIR}/aethos"
+      ;;
+    *.deb)
+      if has_cmd sudo; then
+        log "Installing Debian package via sudo dpkg -i"
+        sudo dpkg -i "${archive_path}" || fail "dpkg install failed"
+      else
+        fail "Downloaded .deb but sudo is unavailable. Install manually: sudo dpkg -i ${archive_path}"
+      fi
+      ;;
+    *.dmg)
+      if has_cmd open; then
+        log "Opening macOS DMG installer"
+        open "${archive_path}" || fail "failed opening DMG"
+      else
+        fail "Downloaded .dmg to ${archive_path}; open it manually"
+      fi
+      ;;
+    *)
+      fail "unsupported installer asset selected: ${asset_name}"
+      ;;
+  esac
 
   if [[ ":$PATH:" != *":${BIN_DIR}:"* ]]; then
     log "${BIN_DIR} is not in PATH. Add with:"
@@ -215,7 +303,7 @@ main() {
   ensure_runtime_deps
   resolve_ref
   install_from_release_asset
-  log "Done. Run 'aethos'"
+  log "Done. Run 'aethos' (or complete installer prompts if applicable)"
 }
 
 main "$@"
