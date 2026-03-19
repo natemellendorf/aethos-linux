@@ -12,7 +12,7 @@ use gtk4::{
     RevealerTransitionType, ScrolledWindow, Stack, StackSwitcher, TextView,
     STYLE_PROVIDER_PRIORITY_APPLICATION,
 };
-use image::{imageops::FilterType, ImageBuffer, Luma, Rgba, RgbaImage};
+use image::{ImageBuffer, Luma, Rgba, RgbaImage};
 use qrcode::QrCode;
 use serde_json::json;
 use std::cell::{Cell, RefCell};
@@ -56,8 +56,7 @@ use crate::relay::client::{
 };
 
 const APP_ID: &str = "org.aethos.linux";
-const DEFAULT_RELAY_HTTP_PRIMARY: &str = "http://192.168.1.200:8082";
-const DEFAULT_RELAY_HTTP_SECONDARY: &str = "http://192.168.1.200:9082";
+const DEFAULT_RELAY_ENDPOINT: &str = "wss://aethos-relay.network";
 const CHAT_HISTORY_FILE_NAME: &str = "chat-history.json";
 const SHARE_QR_FILE_NAME: &str = "share-wayfarer-qr.png";
 const APP_SETTINGS_FILE_NAME: &str = "settings.json";
@@ -179,10 +178,7 @@ impl Default for AppSettings {
             relay_sync_enabled: true,
             gossip_sync_enabled: true,
             verbose_logging_enabled: false,
-            relay_endpoints: vec![
-                DEFAULT_RELAY_HTTP_PRIMARY.to_string(),
-                DEFAULT_RELAY_HTTP_SECONDARY.to_string(),
-            ],
+            relay_endpoints: vec![DEFAULT_RELAY_ENDPOINT.to_string()],
             message_ttl_seconds: DEFAULT_MESSAGE_TTL_SECONDS,
         }
     }
@@ -4090,63 +4086,61 @@ where
     });
 }
 
+#[cfg(not(target_os = "linux"))]
 fn ensure_linux_desktop_integration() -> Result<(), String> {
-    #[cfg(not(target_os = "linux"))]
-    {
-        return Ok(());
-    }
+    Ok(())
+}
 
-    #[cfg(target_os = "linux")]
-    {
-        let home = std::env::var("HOME")
-            .map_err(|_| "HOME not set for desktop integration".to_string())?;
+#[cfg(target_os = "linux")]
+fn ensure_linux_desktop_integration() -> Result<(), String> {
+    let home =
+        std::env::var("HOME").map_err(|_| "HOME not set for desktop integration".to_string())?;
 
-        let applications_dir = Path::new(&home).join(".local/share/applications");
-        let icon_root = Path::new(&home).join(".local/share/icons/hicolor");
+    let applications_dir = Path::new(&home).join(".local/share/applications");
+    let icon_root = Path::new(&home).join(".local/share/icons/hicolor");
 
-        fs::create_dir_all(&applications_dir)
-            .map_err(|err| format!("failed creating applications dir: {err}"))?;
+    fs::create_dir_all(&applications_dir)
+        .map_err(|err| format!("failed creating applications dir: {err}"))?;
 
-        let icon_source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/img/logo.png");
-        if icon_source.exists() {
-            let image = image::open(&icon_source)
-                .map_err(|err| format!("failed to decode app icon source: {err}"))?;
-            let icon_sizes: [u32; 9] = [16, 24, 32, 48, 64, 96, 128, 256, 512];
+    let icon_source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/img/logo.png");
+    if icon_source.exists() {
+        let image = image::open(&icon_source)
+            .map_err(|err| format!("failed to decode app icon source: {err}"))?;
+        let icon_sizes: [u32; 9] = [16, 24, 32, 48, 64, 96, 128, 256, 512];
 
-            for size in icon_sizes {
-                let icon_dir = icon_root.join(format!("{size}x{size}/apps"));
-                fs::create_dir_all(&icon_dir).map_err(|err| {
-                    format!("failed creating icon dir {}: {err}", icon_dir.display())
-                })?;
-                let icon_target = icon_dir.join(format!("{}.png", APP_ID));
-                let resized = image.resize_exact(size, size, FilterType::Lanczos3);
-                resized.save(&icon_target).map_err(|err| {
-                    format!(
-                        "failed writing resized icon {}: {err}",
-                        icon_target.display()
-                    )
-                })?;
-            }
+        for size in icon_sizes {
+            let icon_dir = icon_root.join(format!("{size}x{size}/apps"));
+            fs::create_dir_all(&icon_dir)
+                .map_err(|err| format!("failed creating icon dir {}: {err}", icon_dir.display()))?;
+            let icon_target = icon_dir.join(format!("{}.png", APP_ID));
+            let resized = image.resize_exact(size, size, image::imageops::FilterType::Lanczos3);
+            resized.save(&icon_target).map_err(|err| {
+                format!(
+                    "failed writing resized icon {}: {err}",
+                    icon_target.display()
+                )
+            })?;
         }
-
-        let desktop_path = applications_dir.join(format!("{}.desktop", APP_ID));
-        let exec = std::env::current_exe()
-            .map_err(|err| format!("failed to determine executable path: {err}"))?;
-
-        let desktop = format!(
-            "[Desktop Entry]\nType=Application\nName=Aethos\nExec={}\nIcon={}\nTerminal=false\nCategories=Network;Chat;\nStartupNotify=true\nStartupWMClass={}\n",
-            shell_escape(exec.as_os_str().to_string_lossy().as_ref()),
-            APP_ID,
-            APP_ID,
-        );
-
-        fs::write(&desktop_path, desktop)
-            .map_err(|err| format!("failed to write desktop entry: {err}"))?;
     }
+
+    let desktop_path = applications_dir.join(format!("{}.desktop", APP_ID));
+    let exec = std::env::current_exe()
+        .map_err(|err| format!("failed to determine executable path: {err}"))?;
+
+    let desktop = format!(
+        "[Desktop Entry]\nType=Application\nName=Aethos\nExec={}\nIcon={}\nTerminal=false\nCategories=Network;Chat;\nStartupNotify=true\nStartupWMClass={}\n",
+        shell_escape(exec.as_os_str().to_string_lossy().as_ref()),
+        APP_ID,
+        APP_ID,
+    );
+
+    fs::write(&desktop_path, desktop)
+        .map_err(|err| format!("failed to write desktop entry: {err}"))?;
 
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn shell_escape(value: &str) -> String {
     if !value.contains([' ', '\'', '"']) {
         return value.to_string();

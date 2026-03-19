@@ -9,8 +9,7 @@ use crate::relay::client::normalize_http_endpoint;
 
 const CHAT_HISTORY_FILE_NAME: &str = "chat-history.json";
 const APP_SETTINGS_FILE_NAME: &str = "settings.json";
-const DEFAULT_RELAY_HTTP_PRIMARY: &str = "http://192.168.1.200:8082";
-const DEFAULT_RELAY_HTTP_SECONDARY: &str = "http://192.168.1.200:9082";
+const DEFAULT_RELAY_ENDPOINT: &str = "wss://aethos-relay.network";
 const DEFAULT_MESSAGE_TTL_SECONDS: u64 = 3600;
 const MIN_MESSAGE_TTL_SECONDS: u64 = 60;
 const MAX_MESSAGE_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
@@ -117,10 +116,7 @@ impl Default for AppSettings {
             relay_sync_enabled: true,
             gossip_sync_enabled: true,
             verbose_logging_enabled: false,
-            relay_endpoints: vec![
-                DEFAULT_RELAY_HTTP_PRIMARY.to_string(),
-                DEFAULT_RELAY_HTTP_SECONDARY.to_string(),
-            ],
+            relay_endpoints: vec![DEFAULT_RELAY_ENDPOINT.to_string()],
             message_ttl_seconds: DEFAULT_MESSAGE_TTL_SECONDS,
             enter_to_send: DEFAULT_ENTER_TO_SEND,
         }

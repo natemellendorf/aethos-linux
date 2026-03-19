@@ -50,10 +50,9 @@ powershell -ExecutionPolicy Bypass -Command "$tmp = Join-Path $env:TEMP 'install
 - Build all desktop client work in this repository.
 - Provide a native GUI scaffold for Linux/macOS/Windows.
 - Generate a local Wayfarer ID.
-- Communicate with Aethos Relays listening at:
-  - `http://192.168.1.200:8082`
-  - `http://192.168.1.200:9082`
-- Connect over WebSocket to those endpoints using `/ws` (`ws://.../ws` derived from `http://...`).
+- Communicate with the default Aethos relay endpoint:
+  - `wss://aethos-relay.network`
+- Connect over secure WebSocket by default (`wss://`).
 
 ## MVP 1 progress
 
@@ -268,11 +267,10 @@ Versioning strategy:
 
 ## Local relay testing
 
-The default `192.168.1.200` endpoints are placeholders. In local/dev environments,
-point the GUI relay fields to reachable listeners, for example:
+The default endpoint is `wss://aethos-relay.network`.
+In local/dev environments, point the GUI relay field to a reachable listener, for example:
 
 - `http://127.0.0.1:8082`
-- `http://127.0.0.1:9082`
 
 Relay terminals and startup details should follow the `aethos-relay` README setup.
 

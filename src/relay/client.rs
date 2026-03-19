@@ -21,7 +21,11 @@ pub const RELAY_CONNECT_TIMEOUT_SECS: u64 = 5;
 
 pub fn normalize_http_endpoint(endpoint: &str) -> String {
     let trimmed = endpoint.trim();
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+    if trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+        || trimmed.starts_with("ws://")
+        || trimmed.starts_with("wss://")
+    {
         return trimmed.to_string();
     }
     format!("http://{trimmed}")
@@ -34,16 +38,21 @@ pub fn to_ws_endpoint(http_like: &str) -> String {
     };
 
     let next_scheme = match url.scheme() {
-        "http" => "ws",
-        "https" => "wss",
+        "http" => Some("ws"),
+        "https" => Some("wss"),
+        "ws" | "wss" => None,
         _ => return http_like.to_string(),
     };
 
-    if url.set_scheme(next_scheme).is_err() {
-        return http_like.to_string();
+    if let Some(next_scheme) = next_scheme {
+        if url.set_scheme(next_scheme).is_err() {
+            return http_like.to_string();
+        }
     }
 
-    url.set_path("/ws");
+    if url.path().is_empty() || url.path() == "/" {
+        url.set_path("/ws");
+    }
     url.set_query(None);
     url.set_fragment(None);
     url.to_string()
