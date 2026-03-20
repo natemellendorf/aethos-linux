@@ -30,3 +30,6 @@ webbrowser = "1"
 
 [features]
 default = []
+
+[dev-dependencies]
+rand = "0.8"

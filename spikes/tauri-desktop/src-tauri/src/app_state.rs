@@ -147,6 +147,12 @@ pub fn load_chat_state() -> Result<PersistedChatState, String> {
             path.display()
         )
     })?;
+    if content.trim().is_empty() {
+        let reset = PersistedChatState::default();
+        save_chat_state(&reset)?;
+        return Ok(reset);
+    }
+
     let mut state: PersistedChatState = match serde_json::from_str(&content) {
         Ok(parsed) => parsed,
         Err(first_err) => {
@@ -154,12 +160,23 @@ pub fn load_chat_state() -> Result<PersistedChatState, String> {
                 .replace("\"Sending\"", "\"sending\"")
                 .replace("\"Sent\"", "\"sent\"")
                 .replace("\"Failed\"", "\"failed\"");
-            serde_json::from_str(&migrated).map_err(|err| {
-                format!(
-                    "failed to parse chat history file at {}: {first_err}; retry after legacy migration failed: {err}",
-                    path.display()
-                )
-            })?
+            match serde_json::from_str(&migrated) {
+                Ok(parsed) => parsed,
+                Err(err)
+                    if matches!(first_err.classify(), serde_json::error::Category::Eof)
+                        || matches!(err.classify(), serde_json::error::Category::Eof) =>
+                {
+                    let reset = PersistedChatState::default();
+                    save_chat_state(&reset)?;
+                    return Ok(reset);
+                }
+                Err(err) => {
+                    return Err(format!(
+                        "failed to parse chat history file at {}: {first_err}; retry after legacy migration failed: {err}",
+                        path.display()
+                    ));
+                }
+            }
         }
     };
     normalize_chat_state(&mut state);
@@ -173,12 +190,7 @@ pub fn save_chat_state(state: &PersistedChatState) -> Result<(), String> {
     ensure_parent_dir(&path)?;
     let serialized = serde_json::to_string_pretty(&normalized)
         .map_err(|err| format!("failed to serialize chat history: {err}"))?;
-    fs::write(&path, serialized).map_err(|err| {
-        format!(
-            "failed to write chat history file at {}: {err}",
-            path.display()
-        )
-    })
+    atomic_write_string(&path, &serialized)
 }
 
 pub fn load_app_settings() -> Result<AppSettings, String> {
@@ -189,8 +201,26 @@ pub fn load_app_settings() -> Result<AppSettings, String> {
 
     let content = fs::read_to_string(&path)
         .map_err(|err| format!("failed reading app settings at {}: {err}", path.display()))?;
-    let mut settings: AppSettings = serde_json::from_str(&content)
-        .map_err(|err| format!("failed parsing app settings at {}: {err}", path.display()))?;
+    if content.trim().is_empty() {
+        let reset = AppSettings::default();
+        let _ = save_app_settings(&reset)?;
+        return Ok(reset);
+    }
+
+    let mut settings: AppSettings = match serde_json::from_str(&content) {
+        Ok(parsed) => parsed,
+        Err(err) if matches!(err.classify(), serde_json::error::Category::Eof) => {
+            let reset = AppSettings::default();
+            let _ = save_app_settings(&reset)?;
+            return Ok(reset);
+        }
+        Err(err) => {
+            return Err(format!(
+                "failed parsing app settings at {}: {err}",
+                path.display()
+            ));
+        }
+    };
     normalize_settings(&mut settings);
     Ok(settings)
 }
@@ -202,9 +232,22 @@ pub fn save_app_settings(settings: &AppSettings) -> Result<AppSettings, String> 
     ensure_parent_dir(&path)?;
     let serialized = serde_json::to_string_pretty(&normalized)
         .map_err(|err| format!("failed serializing app settings: {err}"))?;
-    fs::write(&path, serialized)
-        .map_err(|err| format!("failed writing app settings at {}: {err}", path.display()))?;
+    atomic_write_string(&path, &serialized)?;
     Ok(normalized)
+}
+
+fn atomic_write_string(path: &Path, serialized: &str) -> Result<(), String> {
+    ensure_parent_dir(path)?;
+    let temp_path = path.with_extension(format!("tmp-{}", now_unix_ms()));
+    fs::write(&temp_path, serialized)
+        .map_err(|err| format!("failed writing temp file at {}: {err}", temp_path.display()))?;
+    fs::rename(&temp_path, path).map_err(|err| {
+        format!(
+            "failed to atomically replace {} with {}: {err}",
+            path.display(),
+            temp_path.display()
+        )
+    })
 }
 
 fn normalize_settings(settings: &mut AppSettings) {
@@ -300,6 +343,76 @@ pub fn now_unix_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let original = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(original) = self.original.take() {
+                std::env::set_var(self.key, original);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn unique_state_dir(prefix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("{prefix}-{}", rand::random::<u64>()))
+    }
+
+    #[test]
+    fn load_app_settings_recovers_from_empty_file() {
+        let _lock = TEST_ENV_LOCK.lock().expect("lock");
+        let state_dir = unique_state_dir("aethos-settings-empty");
+        let _guard = EnvVarGuard::set("AETHOS_STATE_DIR", &state_dir);
+        fs::create_dir_all(&state_dir).expect("mkdir");
+
+        let settings_path = app_settings_file_path();
+        fs::write(&settings_path, "").expect("write empty file");
+
+        let settings = load_app_settings().expect("load should recover");
+        assert_eq!(
+            settings.relay_endpoints,
+            vec![DEFAULT_RELAY_ENDPOINT.to_string()]
+        );
+        let persisted = fs::read_to_string(settings_path).expect("read persisted settings");
+        assert!(!persisted.trim().is_empty());
+    }
+
+    #[test]
+    fn load_chat_state_recovers_from_empty_file() {
+        let _lock = TEST_ENV_LOCK.lock().expect("lock");
+        let state_dir = unique_state_dir("aethos-chat-empty");
+        let _guard = EnvVarGuard::set("AETHOS_STATE_DIR", &state_dir);
+        fs::create_dir_all(&state_dir).expect("mkdir");
+
+        let chat_path = chat_history_file_path();
+        fs::write(&chat_path, "").expect("write empty file");
+
+        let chat = load_chat_state().expect("load should recover");
+        assert!(chat.threads.is_empty());
+        let persisted = fs::read_to_string(chat_path).expect("read persisted chat");
+        assert!(!persisted.trim().is_empty());
+    }
 }
 
 fn default_message_ttl_seconds() -> u64 {
