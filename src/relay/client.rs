@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::net::TcpStream;
+use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
-use tungstenite::{client, Message};
+use tungstenite::stream::MaybeTlsStream;
+use tungstenite::{connect, Message};
 use url::Url;
 
 use crate::aethos_core::gossip_sync::{
@@ -17,7 +19,8 @@ use crate::aethos_core::identity_store::LocalIdentitySummary;
 use crate::aethos_core::logging::log_verbose;
 use crate::aethos_core::protocol::decode_envelope_payload_utf8_preview;
 
-pub const RELAY_CONNECT_TIMEOUT_SECS: u64 = 5;
+type RelaySocket = tungstenite::WebSocket<MaybeTlsStream<TcpStream>>;
+static RUSTLS_PROVIDER_INIT: Once = Once::new();
 
 pub fn normalize_http_endpoint(endpoint: &str) -> String {
     let trimmed = endpoint.trim();
@@ -359,10 +362,9 @@ fn is_nonfatal_read_timeout(err: &str) -> bool {
         || lower.contains("os error 11")
 }
 
-fn open_relay_socket(
-    relay_ws: &str,
-    auth_token: Option<&str>,
-) -> Result<tungstenite::WebSocket<TcpStream>, String> {
+fn open_relay_socket(relay_ws: &str, auth_token: Option<&str>) -> Result<RelaySocket, String> {
+    ensure_rustls_provider_installed();
+
     let Ok(url) = Url::parse(relay_ws) else {
         return Err("invalid relay URL".to_string());
     };
@@ -376,20 +378,6 @@ fn open_relay_socket(
         "relay_socket_connecting: relay_ws={} addr={}",
         relay_ws, socket_addr
     ));
-    let timeout = Duration::from_secs(RELAY_CONNECT_TIMEOUT_SECS);
-
-    let Ok(stream) = TcpStream::connect_timeout(
-        &socket_addr
-            .parse()
-            .map_err(|err| format!("invalid socket address: {err}"))?,
-        timeout,
-    ) else {
-        return Err(format!("tcp connection timeout/failure to {socket_addr}"));
-    };
-
-    let _ = stream.set_read_timeout(Some(timeout));
-    let _ = stream.set_write_timeout(Some(timeout));
-
     let mut request = tungstenite::client::IntoClientRequest::into_client_request(relay_ws)
         .map_err(|err| format!("invalid websocket request: {err}"))?;
 
@@ -400,13 +388,19 @@ fn open_relay_socket(
         request.headers_mut().insert("Authorization", header_value);
     }
 
-    client(request, stream)
+    connect(request)
         .map(|(socket, _)| socket)
         .map_err(|err| format!("websocket handshake failed: {err}"))
 }
 
+fn ensure_rustls_provider_installed() {
+    RUSTLS_PROVIDER_INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 fn complete_hello_handshake(
-    socket: &mut tungstenite::WebSocket<TcpStream>,
+    socket: &mut RelaySocket,
     identity: &LocalIdentitySummary,
 ) -> Result<HelloFrame, String> {
     let node_pubkey_raw = base64::engine::general_purpose::STANDARD
@@ -430,10 +424,7 @@ fn complete_hello_handshake(
     }
 }
 
-fn send_binary_frame(
-    socket: &mut tungstenite::WebSocket<TcpStream>,
-    frame: &GossipSyncFrame,
-) -> Result<(), String> {
+fn send_binary_frame(socket: &mut RelaySocket, frame: &GossipSyncFrame) -> Result<(), String> {
     let raw = serialize_frame(frame)?;
     let framed = encode_stream_frame(&raw)?;
     log_verbose(&format!(
@@ -447,9 +438,7 @@ fn send_binary_frame(
         .map_err(|err| format!("websocket send failed: {err}"))
 }
 
-fn read_binary_frame(
-    socket: &mut tungstenite::WebSocket<TcpStream>,
-) -> Result<GossipSyncFrame, String> {
+fn read_binary_frame(socket: &mut RelaySocket) -> Result<GossipSyncFrame, String> {
     match socket.read() {
         Ok(Message::Binary(raw)) => parse_relay_binary_message(&raw),
         Ok(Message::Ping(payload)) => {
