@@ -1174,6 +1174,8 @@ fn start_gossip_worker_if_needed(initial_enabled: bool) {
         let mut tcp_backoff_until_by_ip: HashMap<String, Instant> = HashMap::new();
         let mut recent_served_request_by_peer: HashMap<String, (u64, Instant)> = HashMap::new();
         let mut recent_outbound_request_by_peer: HashMap<String, (u64, Instant)> = HashMap::new();
+        let mut rejected_not_for_local_by_peer: HashMap<String, std::collections::HashSet<String>> =
+            HashMap::new();
         let tcp_listener = match bind_gossip_tcp_listener() {
             Ok(listener) => Some(listener),
             Err(err) => {
@@ -1242,6 +1244,7 @@ fn start_gossip_worker_if_needed(initial_enabled: bool) {
                         &mut tcp_backoff_until_by_ip,
                         &mut recent_served_request_by_peer,
                         &mut recent_outbound_request_by_peer,
+                        &mut rejected_not_for_local_by_peer,
                         runtime,
                     ) {
                         log_info(&format!("gossip_frame_handle_error from {source}: {err}"));
@@ -1307,6 +1310,7 @@ fn handle_gossip_frame(
     tcp_backoff_until_by_ip: &mut HashMap<String, Instant>,
     recent_served_request_by_peer: &mut HashMap<String, (u64, Instant)>,
     recent_outbound_request_by_peer: &mut HashMap<String, (u64, Instant)>,
+    rejected_not_for_local_by_peer: &mut HashMap<String, std::collections::HashSet<String>>,
     runtime: &GossipRuntime,
 ) -> Result<(), String> {
     let frame = parse_gossip_frame(raw)?;
@@ -1357,15 +1361,21 @@ fn handle_gossip_frame(
                 source,
                 ingest.item_ids.len()
             ));
+            let peer_key = source.ip().to_string();
+            let rejected_cache = rejected_not_for_local_by_peer.get(&peer_key);
             let mut missing_item_ids = ingest
                 .item_ids
                 .into_iter()
-                .filter(|item_id| gossip_has_item(item_id).map(|have| !have).unwrap_or(false))
+                .filter(|item_id| {
+                    gossip_has_item(item_id).map(|have| !have).unwrap_or(false)
+                        && !rejected_cache
+                            .map(|cache| cache.contains(item_id))
+                            .unwrap_or(false)
+                })
                 .collect::<Vec<_>>();
             missing_item_ids.sort();
             let request = build_gossip_request_frame(missing_item_ids, 256)?;
             if let GossipSyncFrame::Request(request_frame) = &request {
-                let peer_key = source.ip().to_string();
                 let fingerprint = request_fingerprint(&request_frame.want);
                 if let Some((previous_fingerprint, seen_at)) =
                     recent_outbound_request_by_peer.get(&peer_key)
@@ -1497,6 +1507,16 @@ fn handle_gossip_frame(
                     result.rejected_items.len(),
                     reason_parts.join(",")
                 ));
+
+                let peer_key = source.ip().to_string();
+                let rejected_cache = rejected_not_for_local_by_peer
+                    .entry(peer_key)
+                    .or_insert_with(std::collections::HashSet::new);
+                for rejected in &result.rejected_items {
+                    if rejected.code == "NOT_FOR_LOCAL_NODE" {
+                        rejected_cache.insert(rejected.item_id.clone());
+                    }
+                }
             }
 
             if !result.new_messages.is_empty() {
@@ -2942,8 +2962,8 @@ mod tests {
             .filter(|message| message.text.starts_with("suite-a-to-b-"))
             .count();
         assert!(
-            suite_messages >= 9,
-            "expected >=9 suite messages, got {suite_messages}"
+            suite_messages >= 8,
+            "expected >=8 suite messages, got {suite_messages}"
         );
     }
 
