@@ -40,7 +40,7 @@ use crate::aethos_core::gossip_sync::{
     import_transfer_items, parse_frame as parse_gossip_frame,
     select_request_item_ids_from_summary as gossip_select_request_item_ids_from_summary,
     serialize_frame as serialize_gossip_frame, transfer_items_for_request as gossip_transfer_items,
-    GossipSyncFrame, ReceiptFrame, MAX_TRANSFER_BYTES, GOSSIP_LAN_PORT,
+    GossipSyncFrame, ReceiptFrame, GOSSIP_LAN_PORT,
 };
 use crate::aethos_core::identity_store::{
     delete_wayfarer_id, ensure_local_identity, load_contact_aliases, load_local_signing_key_seed,
@@ -61,6 +61,8 @@ const SHARE_QR_FILE_NAME: &str = "share-wayfarer-qr.png";
 const CHAT_SNAPSHOT_EVENT: &str = "chat_snapshot";
 const SOUND_EVENT: &str = "sound_event";
 const MAX_ATTACHMENT_BYTES: u64 = 2 * 1024 * 1024;
+const LAN_TRANSFER_MAX_ITEMS_PER_FRAME: usize = 2;
+const LAN_TRANSFER_MAX_OBJECT_BYTES: u64 = 1024;
 
 struct GossipRuntime {
     enabled: AtomicBool,
@@ -1313,12 +1315,66 @@ fn handle_gossip_frame(
             let _ = send_gossip_frame(socket, &source.ip().to_string(), source.port(), &request);
         }
         GossipSyncFrame::Request(req) => {
-            let objects = gossip_transfer_items(&req.want, 32, MAX_TRANSFER_BYTES, now_unix_ms())
+            let mut pending = req.want;
+            let mut chunk_idx = 0usize;
+            while !pending.is_empty() {
+                chunk_idx = chunk_idx.saturating_add(1);
+                let objects = gossip_transfer_items(
+                    &pending,
+                    LAN_TRANSFER_MAX_ITEMS_PER_FRAME as u32,
+                    LAN_TRANSFER_MAX_OBJECT_BYTES,
+                    now_unix_ms(),
+                )
                 .unwrap_or_default();
-            let transfer = GossipSyncFrame::Transfer(crate::aethos_core::gossip_sync::TransferFrame {
-                objects,
-            });
-            let _ = send_gossip_frame(socket, &source.ip().to_string(), source.port(), &transfer);
+
+                if objects.is_empty() {
+                    log_verbose(&format!(
+                        "gossip_transfer_chunk_empty: to={} pending={} chunk={} max_items={} max_object_bytes={}",
+                        source,
+                        pending.len(),
+                        chunk_idx,
+                        LAN_TRANSFER_MAX_ITEMS_PER_FRAME,
+                        LAN_TRANSFER_MAX_OBJECT_BYTES
+                    ));
+                    break;
+                }
+
+                let sent_ids = objects
+                    .iter()
+                    .map(|object| object.item_id.clone())
+                    .collect::<std::collections::HashSet<_>>();
+                let sent_count = sent_ids.len();
+                let before = pending.len();
+                pending.retain(|item_id| !sent_ids.contains(item_id));
+                let removed = before.saturating_sub(pending.len());
+
+                log_verbose(&format!(
+                    "gossip_transfer_chunk_send: to={} chunk={} sent_items={} removed_from_pending={} pending_after={} max_items={} max_object_bytes={}",
+                    source,
+                    chunk_idx,
+                    sent_count,
+                    removed,
+                    pending.len(),
+                    LAN_TRANSFER_MAX_ITEMS_PER_FRAME,
+                    LAN_TRANSFER_MAX_OBJECT_BYTES
+                ));
+
+                let transfer =
+                    GossipSyncFrame::Transfer(crate::aethos_core::gossip_sync::TransferFrame {
+                        objects,
+                    });
+                let _ = send_gossip_frame(socket, &source.ip().to_string(), source.port(), &transfer);
+
+                if removed == 0 {
+                    log_verbose(&format!(
+                        "gossip_transfer_chunk_no_progress: to={} chunk={} pending={} aborting",
+                        source,
+                        chunk_idx,
+                        pending.len()
+                    ));
+                    break;
+                }
+            }
         }
         GossipSyncFrame::Transfer(transfer) => {
             let peer_node_id = peer_node_by_addr
