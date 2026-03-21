@@ -46,6 +46,8 @@ const LOG_FILTERS = {
 
 const RELEASES_LATEST_URL = "https://api.github.com/repos/natemellendorf/aethos-client/releases/latest";
 const DEFAULT_RELAY_ENDPOINT = "wss://aethos-relay.network";
+const DONATE_CRYPTO_ADDRESS = "0x114227a8B460E462f408F138a929660531790ee3";
+const DONATE_PAYPAL_URL = "https://www.paypal.com/donate/?hosted_button_id=TPTTR6TRKBYKS";
 
 function tinyId(id = "") {
   if (!id) return "-";
@@ -178,6 +180,7 @@ export default function App() {
   const [currentVersion, setCurrentVersion] = useState("0.0.0");
   const [updateNotice, setUpdateNotice] = useState(null);
   const [updateDismissed, setUpdateDismissed] = useState(false);
+  const [copyToast, setCopyToast] = useState("");
   const [relayHealth, setRelayHealth] = useState(emptyRelay);
   const [gossipStatus, setGossipStatus] = useState(emptyGossip);
   const [shareQr, setShareQr] = useState(null);
@@ -555,6 +558,36 @@ export default function App() {
     setComposerAttachment(null);
   };
 
+  const copyDonateAddress = async () => {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(DONATE_CRYPTO_ADDRESS);
+      } else {
+        const input = document.createElement("textarea");
+        input.value = DONATE_CRYPTO_ADDRESS;
+        input.setAttribute("readonly", "");
+        input.style.position = "absolute";
+        input.style.left = "-9999px";
+        document.body.appendChild(input);
+        input.select();
+        const ok = document.execCommand("copy");
+        input.remove();
+        if (!ok) throw new Error("clipboard_copy_failed");
+      }
+      setStatus("Crypto donation address copied");
+      setCopyToast("ETH address copied to clipboard");
+    } catch {
+      setStatus("Could not copy crypto donation address");
+      soundManager.play("error");
+    }
+  };
+
+  useEffect(() => {
+    if (!copyToast) return;
+    const timer = setTimeout(() => setCopyToast(""), 2200);
+    return () => clearTimeout(timer);
+  }, [copyToast]);
+
   const sendMessage = async () => {
     if (!selectedContactId) return setStatus("Select a contact before sending");
     if (!canSendToSelectedContact) {
@@ -790,6 +823,28 @@ export default function App() {
                     <img src="/logo.png" alt="Aethos mark" className="hero-mark" />
                   </div>
                 </div>
+                <div className="hero-donate-actions">
+                  <Button type="button" variant="secondary" size="sm" className="h-7 px-2 text-[11px]" onClick={copyDonateAddress}>
+                    ETH
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 border border-cyan-200/20 bg-background/30 px-2 text-[11px] hover:bg-cyan-500/10"
+                    onClick={async () => {
+                      try {
+                        await invoke("open_external_url", { url: DONATE_PAYPAL_URL });
+                        setStatus("Opened PayPal donation link");
+                      } catch {
+                        setStatus("Could not open PayPal donation link");
+                        soundManager.play("error");
+                      }
+                    }}
+                  >
+                    PayPal
+                  </Button>
+                </div>
               </div>
             </CardContent>
           </Card>
@@ -819,6 +874,12 @@ export default function App() {
             </div>
           </div>
         </div>
+
+        {copyToast ? (
+          <div className="mb-2 inline-flex items-center rounded-md border border-cyan-300/40 bg-cyan-500/15 px-3 py-1.5 text-xs font-medium text-cyan-100">
+            {copyToast}
+          </div>
+        ) : null}
 
         {updateNotice && !updateDismissed ? (
           <Card className="mb-2 border-cyan-300/30 bg-cyan-500/8">

@@ -225,6 +225,16 @@ body {
   width: clamp(74px, 11vw, 110px);
 }
 
+.hero-donate-actions {
+  position: absolute;
+  right: 10px;
+  bottom: 2px;
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  z-index: 5;
+}
+
 .hero-mark {
   position: relative;
   z-index: 2;
@@ -279,6 +289,12 @@ body {
     right: 10px;
     width: 70px;
     min-height: 62px;
+  }
+
+  .hero-donate-actions {
+    right: 8px;
+    bottom: 2px;
+    gap: 4px;
   }
 
   .hero-title {
