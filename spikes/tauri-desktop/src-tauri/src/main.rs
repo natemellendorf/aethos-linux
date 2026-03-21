@@ -10,10 +10,9 @@ mod aethos_core;
 mod relay;
 
 use std::collections::BTreeMap;
-use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::fs;
-use std::net::UdpSocket;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -42,7 +41,8 @@ use crate::aethos_core::gossip_sync::{
     import_transfer_items, parse_frame as parse_gossip_frame,
     select_request_item_ids_from_summary as gossip_select_request_item_ids_from_summary,
     serialize_frame as serialize_gossip_frame, transfer_items_for_request as gossip_transfer_items,
-    GossipSyncFrame, ReceiptFrame, GOSSIP_LAN_PORT,
+    GossipSyncFrame, ReceiptFrame, GOSSIP_LAN_PORT, MAX_FRAME_BYTES, MAX_TRANSFER_BYTES,
+    MAX_TRANSFER_ITEMS,
 };
 use crate::aethos_core::identity_store::{
     delete_wayfarer_id, ensure_local_identity, load_contact_aliases, load_local_signing_key_seed,
@@ -63,10 +63,7 @@ const SHARE_QR_FILE_NAME: &str = "share-wayfarer-qr.png";
 const CHAT_SNAPSHOT_EVENT: &str = "chat_snapshot";
 const SOUND_EVENT: &str = "sound_event";
 const MAX_ATTACHMENT_BYTES: u64 = 2 * 1024 * 1024;
-const LAN_TRANSFER_MAX_ITEMS_PER_FRAME: usize = 2;
-const LAN_TRANSFER_MAX_OBJECT_BYTES: u64 = 1024;
-const LAN_REQUEST_MAX_WANT_ITEMS: usize = 4;
-const LAN_DUP_REQUEST_COOLDOWN_MS: u64 = 500;
+const LAN_TRANSFER_TCP_PORT: u16 = GOSSIP_LAN_PORT;
 
 struct GossipRuntime {
     enabled: AtomicBool,
@@ -1163,7 +1160,13 @@ fn start_gossip_worker_if_needed(initial_enabled: bool) {
         ));
         let mut peer_node_by_addr: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
-        let mut recent_request_fingerprint_by_peer: HashMap<String, (u64, Instant)> = HashMap::new();
+        let tcp_listener = match bind_gossip_tcp_listener() {
+            Ok(listener) => Some(listener),
+            Err(err) => {
+                log_info(&format!("gossip_tcp_listener_disabled: {err}"));
+                None
+            }
+        };
         let mut last_inventory_broadcast = Instant::now() - Duration::from_secs(10);
 
         loop {
@@ -1182,6 +1185,33 @@ fn start_gossip_worker_if_needed(initial_enabled: bool) {
                 last_inventory_broadcast = Instant::now();
             }
 
+            if let Some(listener) = tcp_listener.as_ref() {
+                loop {
+                    match listener.accept() {
+                        Ok((mut stream, peer_addr)) => {
+                            let peer_ip_key = peer_addr.ip().to_string();
+                            let peer_node_id = peer_node_by_addr.get(&peer_ip_key).cloned();
+                            if let Err(err) = run_gossip_tcp_encounter_on_stream(
+                                &mut stream,
+                                peer_node_id,
+                                runtime,
+                                "inbound",
+                            ) {
+                                log_verbose(&format!(
+                                    "gossip_tcp_inbound_encounter_failed: peer={} error={}",
+                                    peer_addr, err
+                                ));
+                            }
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(err) => {
+                            log_verbose(&format!("gossip_tcp_accept_failed: {err}"));
+                            break;
+                        }
+                    }
+                }
+            }
+
             let mut buf = [0u8; 65_535];
             match socket.recv_from(&mut buf) {
                 Ok((len, source)) => {
@@ -1193,7 +1223,6 @@ fn start_gossip_worker_if_needed(initial_enabled: bool) {
                         &buf[..len],
                         source,
                         &mut peer_node_by_addr,
-                        &mut recent_request_fingerprint_by_peer,
                         runtime,
                     ) {
                         log_info(&format!("gossip_frame_handle_error from {source}: {err}"));
@@ -1255,7 +1284,6 @@ fn handle_gossip_frame(
     raw: &[u8],
     source: std::net::SocketAddr,
     peer_node_by_addr: &mut std::collections::HashMap<String, String>,
-    recent_request_fingerprint_by_peer: &mut HashMap<String, (u64, Instant)>,
     runtime: &GossipRuntime,
 ) -> Result<(), String> {
     let frame = parse_gossip_frame(raw)?;
@@ -1289,7 +1317,7 @@ fn handle_gossip_frame(
                 summary.item_count,
                 summary.preview_item_ids.as_ref().map(|v| v.len()).unwrap_or(0)
             ));
-            let request = build_request_from_summary(&summary, LAN_REQUEST_MAX_WANT_ITEMS)?;
+            let request = build_request_from_summary(&summary, 256)?;
             if let GossipSyncFrame::Request(request_frame) = &request {
                 log_verbose(&format!(
                     "gossip_send_request_from_summary: to={} want_items={}",
@@ -1311,7 +1339,7 @@ fn handle_gossip_frame(
                 .filter(|item_id| gossip_has_item(item_id).map(|have| !have).unwrap_or(false))
                 .collect::<Vec<_>>();
             missing_item_ids.sort();
-            let request = build_gossip_request_frame(missing_item_ids, LAN_REQUEST_MAX_WANT_ITEMS)?;
+            let request = build_gossip_request_frame(missing_item_ids, 256)?;
             if let GossipSyncFrame::Request(request_frame) = &request {
                 log_verbose(&format!(
                     "gossip_send_request_from_relay_ingest: to={} want_items={}",
@@ -1321,86 +1349,17 @@ fn handle_gossip_frame(
             }
             let _ = send_gossip_frame(socket, &source.ip().to_string(), source.port(), &request);
         }
-        GossipSyncFrame::Request(req) => {
-            let peer_key = source.to_string();
-            let fingerprint = request_fingerprint(&req.want);
-            if let Some((previous_fingerprint, seen_at)) =
-                recent_request_fingerprint_by_peer.get(&peer_key)
-            {
-                if *previous_fingerprint == fingerprint
-                    && seen_at.elapsed() < Duration::from_millis(LAN_DUP_REQUEST_COOLDOWN_MS)
-                {
-                    log_verbose(&format!(
-                        "gossip_request_duplicate_ignored: from={} want_items={} cooldown_ms={}",
-                        source,
-                        req.want.len(),
-                        LAN_DUP_REQUEST_COOLDOWN_MS
-                    ));
-                    return Ok(());
-                }
-            }
-            recent_request_fingerprint_by_peer.insert(peer_key, (fingerprint, Instant::now()));
-
-            let mut pending = req.want;
-            let mut chunk_idx = 0usize;
-            while !pending.is_empty() {
-                chunk_idx = chunk_idx.saturating_add(1);
-                let objects = gossip_transfer_items(
-                    &pending,
-                    LAN_TRANSFER_MAX_ITEMS_PER_FRAME as u32,
-                    LAN_TRANSFER_MAX_OBJECT_BYTES,
-                    now_unix_ms(),
-                )
-                .unwrap_or_default();
-
-                if objects.is_empty() {
-                    log_verbose(&format!(
-                        "gossip_transfer_chunk_empty: to={} pending={} chunk={} max_items={} max_object_bytes={}",
-                        source,
-                        pending.len(),
-                        chunk_idx,
-                        LAN_TRANSFER_MAX_ITEMS_PER_FRAME,
-                        LAN_TRANSFER_MAX_OBJECT_BYTES
-                    ));
-                    break;
-                }
-
-                let sent_ids = objects
-                    .iter()
-                    .map(|object| object.item_id.clone())
-                    .collect::<std::collections::HashSet<_>>();
-                let sent_count = sent_ids.len();
-                let before = pending.len();
-                pending.retain(|item_id| !sent_ids.contains(item_id));
-                let removed = before.saturating_sub(pending.len());
-
-                log_verbose(&format!(
-                    "gossip_transfer_chunk_send: to={} chunk={} sent_items={} removed_from_pending={} pending_after={} max_items={} max_object_bytes={}",
-                    source,
-                    chunk_idx,
-                    sent_count,
-                    removed,
-                    pending.len(),
-                    LAN_TRANSFER_MAX_ITEMS_PER_FRAME,
-                    LAN_TRANSFER_MAX_OBJECT_BYTES
-                ));
-
-                let transfer =
-                    GossipSyncFrame::Transfer(crate::aethos_core::gossip_sync::TransferFrame {
-                        objects,
-                    });
-                let _ = send_gossip_frame(socket, &source.ip().to_string(), source.port(), &transfer);
-                std::thread::sleep(Duration::from_millis(2));
-
-                if removed == 0 {
-                    log_verbose(&format!(
-                        "gossip_transfer_chunk_no_progress: to={} chunk={} pending={} aborting",
-                        source,
-                        chunk_idx,
-                        pending.len()
-                    ));
-                    break;
-                }
+        GossipSyncFrame::Request(_req) => {
+            let peer_node_id = peer_node_by_addr
+                .get(&source.to_string())
+                .or_else(|| peer_node_by_addr.get(&source.ip().to_string()))
+                .cloned();
+            match run_gossip_tcp_encounter_with_peer(source.ip(), peer_node_id, runtime, "udp_request") {
+                Ok(_) => {}
+                Err(err) => log_verbose(&format!(
+                    "gossip_tcp_encounter_from_udp_request_failed: peer={} error={}",
+                    source, err
+                )),
             }
         }
         GossipSyncFrame::Transfer(transfer) => {
@@ -1467,15 +1426,6 @@ fn handle_gossip_frame(
     Ok(())
 }
 
-fn request_fingerprint(item_ids: &[String]) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    item_ids.len().hash(&mut hasher);
-    for item_id in item_ids {
-        item_id.hash(&mut hasher);
-    }
-    hasher.finish()
-}
-
 fn send_gossip_frame(socket: &UdpSocket, host: &str, port: u16, frame: &GossipSyncFrame) -> Result<(), String> {
     let raw = serialize_gossip_frame(frame)?;
     let addr = format!("{host}:{port}");
@@ -1494,6 +1444,190 @@ fn send_gossip_frame(socket: &UdpSocket, host: &str, port: u16, frame: &GossipSy
         ));
     }
     result
+}
+
+fn bind_gossip_tcp_listener() -> Result<TcpListener, String> {
+    let listener = TcpListener::bind(("0.0.0.0", LAN_TRANSFER_TCP_PORT))
+        .map_err(|err| format!("tcp bind failed on {}: {err}", LAN_TRANSFER_TCP_PORT))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|err| format!("tcp listener set_nonblocking failed: {err}"))?;
+    log_info(&format!("gossip_tcp_listener_started on tcp/{LAN_TRANSFER_TCP_PORT}"));
+    Ok(listener)
+}
+
+fn run_gossip_tcp_encounter_with_peer(
+    peer_ip: std::net::IpAddr,
+    peer_node_id: Option<String>,
+    runtime: &GossipRuntime,
+    trigger: &str,
+) -> Result<(), String> {
+    let addr = format!("{}:{}", peer_ip, LAN_TRANSFER_TCP_PORT);
+    let mut stream = TcpStream::connect(&addr)
+        .map_err(|err| format!("tcp connect failed ({addr}): {err}"))?;
+    stream
+        .set_nodelay(true)
+        .map_err(|err| format!("tcp set_nodelay failed ({addr}): {err}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(700)))
+        .map_err(|err| format!("tcp set_read_timeout failed ({addr}): {err}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_millis(700)))
+        .map_err(|err| format!("tcp set_write_timeout failed ({addr}): {err}"))?;
+
+    run_gossip_tcp_encounter_on_stream(&mut stream, peer_node_id, runtime, trigger)
+}
+
+fn run_gossip_tcp_encounter_on_stream(
+    stream: &mut TcpStream,
+    peer_node_id: Option<String>,
+    runtime: &GossipRuntime,
+    trigger: &str,
+) -> Result<(), String> {
+    let identity = ensure_local_identity()?;
+    let local_wayfarer = identity.wayfarer_id;
+
+    let node_pubkey_raw = base64::engine::general_purpose::STANDARD
+        .decode(&identity.verifying_key_b64)
+        .map_err(|err| format!("gossip pubkey decode failed: {err}"))?;
+    let node_pubkey = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(node_pubkey_raw);
+
+    if let Ok(hello) = build_gossip_hello_frame(&local_wayfarer, &node_pubkey) {
+        send_gossip_frame_tcp(stream, &hello)?;
+    }
+    if let Ok(summary) = build_gossip_summary_frame(now_unix_ms()) {
+        send_gossip_frame_tcp(stream, &summary)?;
+    }
+    if let Ok(ingest) = build_gossip_relay_ingest_frame(now_unix_ms()) {
+        send_gossip_frame_tcp(stream, &ingest)?;
+    }
+
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_millis(700) {
+        let frame = match read_gossip_frame_tcp(stream) {
+            Ok(frame) => frame,
+            Err(err)
+                if err.contains("timeout")
+                    || err.contains("WouldBlock")
+                    || err.contains("UnexpectedEof") =>
+            {
+                break;
+            }
+            Err(err) => return Err(err),
+        };
+
+        match frame {
+            GossipSyncFrame::Summary(summary) => {
+                let request = build_request_from_summary(&summary, 256)?;
+                send_gossip_frame_tcp(stream, &request)?;
+            }
+            GossipSyncFrame::RelayIngest(ingest) => {
+                let mut missing_item_ids = ingest
+                    .item_ids
+                    .into_iter()
+                    .filter(|item_id| gossip_has_item(item_id).map(|have| !have).unwrap_or(false))
+                    .collect::<Vec<_>>();
+                missing_item_ids.sort();
+                let request = build_gossip_request_frame(missing_item_ids, 256)?;
+                send_gossip_frame_tcp(stream, &request)?;
+            }
+            GossipSyncFrame::Request(req) => {
+                let objects = gossip_transfer_items(
+                    &req.want,
+                    MAX_TRANSFER_ITEMS as u32,
+                    MAX_TRANSFER_BYTES,
+                    now_unix_ms(),
+                )
+                .unwrap_or_default();
+                let transfer = GossipSyncFrame::Transfer(crate::aethos_core::gossip_sync::TransferFrame {
+                    objects,
+                });
+                send_gossip_frame_tcp(stream, &transfer)?;
+            }
+            GossipSyncFrame::Transfer(transfer) => {
+                let peer_label = peer_node_id
+                    .as_deref()
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "unknown-peer".to_string());
+                let transport_peer = stream
+                    .peer_addr()
+                    .map(|addr| addr.to_string())
+                    .unwrap_or_else(|_| "tcp-peer".to_string());
+                let result = import_transfer_items(
+                    &local_wayfarer,
+                    Some(&transport_peer),
+                    Some(&peer_label),
+                    &transfer.objects,
+                    now_unix_ms(),
+                )?;
+
+                if !result.new_messages.is_empty() {
+                    let mut chat = load_chat_state()?;
+                    let mut contacts = load_contact_aliases()?;
+                    let pulled = result
+                        .new_messages
+                        .into_iter()
+                        .map(|item| crate::relay::client::EncounterMessagePreview {
+                            author_wayfarer_id: item.author_wayfarer_id,
+                            session_peer: item.session_peer,
+                            transport_peer: item.transport_peer,
+                            item_id: item.item_id,
+                            text: item.text,
+                            received_at_unix: item.received_at_unix,
+                            manifest_id_hex: item.manifest_id_hex,
+                        })
+                        .collect::<Vec<_>>();
+                    merge_pulled_messages(&mut chat, &mut contacts, pulled);
+                    save_chat_state(&chat)?;
+                    save_contact_aliases(&contacts)?;
+                    emit_chat_snapshot_event_best_effort("gossip_tcp_transfer_import");
+                    emit_sound_event_best_effort("sync", "gossip_tcp_transfer_import");
+                    runtime.last_activity_ms.store(now_unix_ms(), Ordering::SeqCst);
+                    set_gossip_event("received messages");
+                }
+
+                let receipt = GossipSyncFrame::Receipt(ReceiptFrame {
+                    received: result.accepted_item_ids,
+                });
+                send_gossip_frame_tcp(stream, &receipt)?;
+            }
+            GossipSyncFrame::Receipt(_) | GossipSyncFrame::Hello(_) => {}
+        }
+    }
+
+    log_verbose(&format!("gossip_tcp_encounter_done: trigger={trigger}"));
+    Ok(())
+}
+
+fn send_gossip_frame_tcp(stream: &mut TcpStream, frame: &GossipSyncFrame) -> Result<(), String> {
+    let payload = serialize_gossip_frame(frame)?;
+    if payload.len() > MAX_FRAME_BYTES {
+        return Err(format!("tcp frame exceeds max bytes: {}", payload.len()));
+    }
+    let len = u32::try_from(payload.len()).map_err(|_| "tcp frame too large".to_string())?;
+    stream
+        .write_all(&len.to_be_bytes())
+        .map_err(|err| format!("tcp write length failed: {err}"))?;
+    stream
+        .write_all(&payload)
+        .map_err(|err| format!("tcp write payload failed: {err}"))?;
+    Ok(())
+}
+
+fn read_gossip_frame_tcp(stream: &mut TcpStream) -> Result<GossipSyncFrame, String> {
+    let mut len_buf = [0u8; 4];
+    stream
+        .read_exact(&mut len_buf)
+        .map_err(|err| format!("tcp read length failed: {err}"))?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_FRAME_BYTES {
+        return Err(format!("tcp frame length exceeds max: {len}"));
+    }
+    let mut payload = vec![0u8; len];
+    stream
+        .read_exact(&mut payload)
+        .map_err(|err| format!("tcp read payload failed: {err}"))?;
+    parse_gossip_frame(&payload)
 }
 
 fn build_request_from_summary(
