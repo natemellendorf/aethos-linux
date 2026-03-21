@@ -1,0 +1,26 @@
+{
+  "id": "slow-relay",
+  "description": "Inject relay latency via Toxiproxy",
+  "relay": {
+    "toxiproxy": {
+      "enabled": true,
+      "toxics": [
+        {
+          "name": "latency_downstream",
+          "type": "latency",
+          "stream": "downstream",
+          "attributes": {
+            "latency": 1200,
+            "jitter": 200
+          }
+        }
+      ]
+    }
+  },
+  "peer": {
+    "netem": {
+      "enabled": false,
+      "commands": []
+    }
+  }
+}

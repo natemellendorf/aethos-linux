@@ -280,6 +280,39 @@ Relay terminals and startup details should follow the `aethos-relay` README setu
 - The client emits single-page `inventory_summary` frames (MVP0 profile), responds to `missing_request`, and imports `transfer` frames into local chats.
 - Use LAN/private network segments only for this mode. Inventory metadata is visible to peers that can receive local gossip traffic.
 
+## GUI + network E2E harness (agent-operable)
+
+We now maintain a Linux-first GUI+network E2E harness that is designed for autonomous debugging workflows:
+
+- Real desktop app automation via `tauri-driver` + WebDriver
+- Multi-instance orchestration
+- Named fault scenarios (relay and peer path)
+- Deterministic run metadata and artifact bundles for machine triage
+
+Primary docs:
+
+- `docs/testing/gui-network-e2e.md`
+
+Quick start:
+
+```bash
+# Run default clean scenario in compose harness
+docker compose -f docker-compose.e2e.yml up --abort-on-container-exit --exit-code-from e2e-runner
+
+# Run explicit scenario/mode
+AETHOS_E2E_SCENARIO=slow-relay AETHOS_E2E_MODE=relay \
+docker compose -f docker-compose.e2e.yml up --abort-on-container-exit --exit-code-from e2e-runner
+```
+
+Artifacts are written under:
+
+- `tests/e2e-harness/artifacts/<run-id>/`
+
+Pre-merge expectation:
+
+- See `scripts/hooks/pre-merge-commit` and `scripts/e2e/pre-merge-gate.sh`.
+- Merge validation now includes both a baseline pass-mode scenario and an impaired/failure-mode scenario with artifact generation.
+
 ## Design reference
 
 Art direction notes are tracked in:

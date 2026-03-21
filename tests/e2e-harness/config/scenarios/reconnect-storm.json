@@ -1,0 +1,25 @@
+{
+  "id": "reconnect-storm",
+  "description": "Frequent relay resets during active messaging",
+  "relay": {
+    "toxiproxy": {
+      "enabled": true,
+      "toxics": [
+        {
+          "name": "reset_downstream",
+          "type": "reset_peer",
+          "stream": "downstream",
+          "attributes": {
+            "timeout": 1500
+          }
+        }
+      ]
+    }
+  },
+  "peer": {
+    "netem": {
+      "enabled": false,
+      "commands": []
+    }
+  }
+}

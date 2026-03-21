@@ -67,7 +67,6 @@ const SHARE_QR_FILE_NAME: &str = "share-wayfarer-qr.png";
 const CHAT_SNAPSHOT_EVENT: &str = "chat_snapshot";
 const SOUND_EVENT: &str = "sound_event";
 const MAX_ATTACHMENT_BYTES: u64 = 2 * 1024 * 1024;
-const LAN_TRANSFER_TCP_PORT: u16 = GOSSIP_LAN_PORT;
 const LAN_TCP_CAPABILITY: &str = "lan_tcp_transfer_v1";
 const LAN_TCP_FAILURE_COOLDOWN_SECS: u64 = 45;
 const LAN_FALLBACK_TRANSFER_MAX_ITEMS: u32 = 2;
@@ -75,6 +74,54 @@ const LAN_FALLBACK_TRANSFER_MAX_BYTES: u64 = 1024;
 const LAN_DUP_REQUEST_COOLDOWN_MS: u64 = 700;
 const LAN_FALLBACK_CHUNK_PACING_MS: u64 = 3;
 const LAN_OUTBOUND_REQUEST_DEBOUNCE_MS: u64 = 700;
+
+fn gossip_lan_port() -> u16 {
+    std::env::var("AETHOS_GOSSIP_LAN_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(GOSSIP_LAN_PORT)
+}
+
+fn gossip_peer_ports() -> Vec<u16> {
+    let mut ports = vec![gossip_lan_port()];
+    if let Ok(raw) = std::env::var("AETHOS_GOSSIP_PEER_PORTS") {
+        for part in raw.split(',') {
+            if let Ok(port) = part.trim().parse::<u16>() {
+                if port > 0 {
+                    ports.push(port);
+                }
+            }
+        }
+    }
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
+fn lan_tcp_disabled() -> bool {
+    std::env::var("AETHOS_DISABLE_LAN_TCP")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn gossip_localhost_fanout_enabled() -> bool {
+    std::env::var("AETHOS_GOSSIP_LOCALHOST_FANOUT")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn gossip_eager_unicast_enabled() -> bool {
+    std::env::var("AETHOS_GOSSIP_EAGER_UNICAST")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn gossip_loopback_only_enabled() -> bool {
+    std::env::var("AETHOS_GOSSIP_LOOPBACK_ONLY")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
 
 struct GossipRuntime {
     enabled: AtomicBool,
@@ -1146,7 +1193,8 @@ fn start_gossip_worker_if_needed(initial_enabled: bool) {
             Err(err) => {
                 set_gossip_event(&format!("udp bind failed: {err}"));
                 log_info(&format!(
-                    "gossip_sync_disabled: failed binding udp/{GOSSIP_LAN_PORT}: {err}"
+                    "gossip_sync_disabled: failed binding udp/{}: {err}",
+                    gossip_lan_port()
                 ));
                 runtime.running.store(false, Ordering::SeqCst);
                 return;
@@ -1168,7 +1216,8 @@ fn start_gossip_worker_if_needed(initial_enabled: bool) {
 
         set_gossip_event("listening");
         log_info(&format!(
-            "gossip_sync_started on udp/{GOSSIP_LAN_PORT} (reuseaddr enabled)"
+            "gossip_sync_started on udp/{} (reuseaddr enabled)",
+            gossip_lan_port()
         ));
         let mut peer_node_by_addr: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
@@ -1268,10 +1317,12 @@ fn bind_gossip_socket() -> Result<UdpSocket, String> {
     socket
         .set_reuse_address(true)
         .map_err(|err| format!("set_reuse_address failed: {err}"))?;
-    let addr = std::net::SocketAddrV4::new(
-        std::net::Ipv4Addr::UNSPECIFIED,
-        GOSSIP_LAN_PORT,
-    );
+    let bind_ip = if gossip_loopback_only_enabled() {
+        std::net::Ipv4Addr::LOCALHOST
+    } else {
+        std::net::Ipv4Addr::UNSPECIFIED
+    };
+    let addr = std::net::SocketAddrV4::new(bind_ip, gossip_lan_port());
     socket
         .bind(&addr.into())
         .map_err(|err| format!("socket bind failed: {err}"))?;
@@ -1285,8 +1336,20 @@ fn gossip_broadcast_inventory(socket: &UdpSocket) -> Result<(), String> {
         .map_err(|err| format!("gossip pubkey decode failed: {err}"))?;
     let node_pubkey = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(node_pubkey_raw);
 
+    let peer_ports = gossip_peer_ports();
+    let local_port = gossip_lan_port();
     if let Ok(hello) = build_lan_hello_frame(&identity.wayfarer_id, &node_pubkey) {
-        let _ = send_gossip_frame(socket, "255.255.255.255", GOSSIP_LAN_PORT, &hello);
+        for peer_port in &peer_ports {
+            if *peer_port == local_port {
+                continue;
+            }
+            if !gossip_loopback_only_enabled() {
+                let _ = send_gossip_frame(socket, "255.255.255.255", *peer_port, &hello);
+            }
+            if gossip_localhost_fanout_enabled() || gossip_loopback_only_enabled() {
+                let _ = send_gossip_frame(socket, "127.0.0.1", *peer_port, &hello);
+            }
+        }
     }
     if let Ok(ingest) = build_gossip_relay_ingest_frame(now_unix_ms()) {
         if let GossipSyncFrame::RelayIngest(frame) = &ingest {
@@ -1294,6 +1357,24 @@ fn gossip_broadcast_inventory(socket: &UdpSocket) -> Result<(), String> {
                 "gossip_inventory_snapshot: relay_ingest_items={}",
                 frame.item_ids.len()
             ));
+        }
+    }
+    if gossip_eager_unicast_enabled() {
+        if let Ok(summary) = build_gossip_summary_frame(now_unix_ms()) {
+            for peer_port in &peer_ports {
+                if *peer_port == local_port {
+                    continue;
+                }
+                let _ = send_gossip_frame(socket, "127.0.0.1", *peer_port, &summary);
+            }
+        }
+        if let Ok(ingest) = build_gossip_relay_ingest_frame(now_unix_ms()) {
+            for peer_port in &peer_ports {
+                if *peer_port == local_port {
+                    continue;
+                }
+                let _ = send_gossip_frame(socket, "127.0.0.1", *peer_port, &ingest);
+            }
         }
     }
     log_verbose("gossip_broadcast_mode: hello-only (summary/ingest sent via unicast on HELLO)");
@@ -1311,6 +1392,9 @@ fn handle_gossip_frame(
     recent_outbound_request_by_peer: &mut HashMap<String, (u64, Instant)>,
     runtime: &GossipRuntime,
 ) -> Result<(), String> {
+    if gossip_loopback_only_enabled() && !source.ip().is_loopback() {
+        return Ok(());
+    }
     let frame = parse_gossip_frame(raw)?;
     let identity = ensure_local_identity()?;
     let local_wayfarer = identity.wayfarer_id;
@@ -1568,12 +1652,16 @@ fn send_gossip_frame(socket: &UdpSocket, host: &str, port: u16, frame: &GossipSy
 }
 
 fn bind_gossip_tcp_listener() -> Result<TcpListener, String> {
-    let listener = TcpListener::bind(("0.0.0.0", LAN_TRANSFER_TCP_PORT))
-        .map_err(|err| format!("tcp bind failed on {}: {err}", LAN_TRANSFER_TCP_PORT))?;
+    if lan_tcp_disabled() {
+        return Err("lan tcp disabled by env".to_string());
+    }
+    let tcp_port = gossip_lan_port();
+    let listener = TcpListener::bind(("0.0.0.0", tcp_port))
+        .map_err(|err| format!("tcp bind failed on {}: {err}", tcp_port))?;
     listener
         .set_nonblocking(true)
         .map_err(|err| format!("tcp listener set_nonblocking failed: {err}"))?;
-    log_info(&format!("gossip_tcp_listener_started on tcp/{LAN_TRANSFER_TCP_PORT}"));
+    log_info(&format!("gossip_tcp_listener_started on tcp/{tcp_port}"));
     Ok(listener)
 }
 
@@ -1583,7 +1671,7 @@ fn run_gossip_tcp_encounter_with_peer(
     runtime: &GossipRuntime,
     trigger: &str,
 ) -> Result<(), String> {
-    let addr = format!("{}:{}", peer_ip, LAN_TRANSFER_TCP_PORT);
+    let addr = format!("{}:{}", peer_ip, gossip_lan_port());
     let mut stream = TcpStream::connect(&addr)
         .map_err(|err| format!("tcp connect failed ({addr}): {err}"))?;
     stream
@@ -1784,7 +1872,8 @@ fn request_fingerprint(item_ids: &[String]) -> u64 {
 fn build_lan_hello_frame(wayfarer_id: &str, node_pubkey: &str) -> Result<GossipSyncFrame, String> {
     let mut frame = build_gossip_hello_frame(wayfarer_id, node_pubkey)?;
     if let GossipSyncFrame::Hello(hello) = &mut frame {
-        if !hello
+        if !lan_tcp_disabled()
+            && !hello
             .capabilities
             .iter()
             .any(|capability| capability == LAN_TCP_CAPABILITY)
@@ -2484,7 +2573,45 @@ pub fn run() {
 }
 
 fn main() {
+    apply_cli_state_overrides();
     run();
+}
+
+fn apply_cli_state_overrides() {
+    let args = std::env::args().collect::<Vec<_>>();
+    for arg in args.into_iter().skip(1) {
+        if let Some(path) = arg.strip_prefix("--aethos-state-dir=") {
+            if !path.trim().is_empty() {
+                std::env::set_var("AETHOS_STATE_DIR", path);
+                std::env::set_var("XDG_DATA_HOME", path);
+                std::env::set_var("XDG_STATE_HOME", path);
+            }
+        } else if let Some(port) = arg.strip_prefix("--aethos-gossip-lan-port=") {
+            if !port.trim().is_empty() {
+                std::env::set_var("AETHOS_GOSSIP_LAN_PORT", port.trim());
+            }
+        } else if let Some(peer_ports) = arg.strip_prefix("--aethos-gossip-peer-ports=") {
+            if !peer_ports.trim().is_empty() {
+                std::env::set_var("AETHOS_GOSSIP_PEER_PORTS", peer_ports.trim());
+            }
+        } else if let Some(value) = arg.strip_prefix("--aethos-disable-lan-tcp=") {
+            if !value.trim().is_empty() {
+                std::env::set_var("AETHOS_DISABLE_LAN_TCP", value.trim());
+            }
+        } else if let Some(value) = arg.strip_prefix("--aethos-gossip-localhost-fanout=") {
+            if !value.trim().is_empty() {
+                std::env::set_var("AETHOS_GOSSIP_LOCALHOST_FANOUT", value.trim());
+            }
+        } else if let Some(value) = arg.strip_prefix("--aethos-gossip-eager-unicast=") {
+            if !value.trim().is_empty() {
+                std::env::set_var("AETHOS_GOSSIP_EAGER_UNICAST", value.trim());
+            }
+        } else if let Some(value) = arg.strip_prefix("--aethos-gossip-loopback-only=") {
+            if !value.trim().is_empty() {
+                std::env::set_var("AETHOS_GOSSIP_LOOPBACK_ONLY", value.trim());
+            }
+        }
+    }
 }
 
 #[cfg(test)]

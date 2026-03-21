@@ -1,0 +1,8 @@
+[
+  {
+    "name": "relay",
+    "listen": "0.0.0.0:19082",
+    "upstream": "relay-1:8082",
+    "enabled": true
+  }
+]

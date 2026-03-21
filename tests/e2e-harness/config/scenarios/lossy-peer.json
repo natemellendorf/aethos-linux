@@ -1,0 +1,18 @@
+{
+  "id": "lossy-peer",
+  "description": "Peer LAN path impairment with packet loss and delay",
+  "relay": {
+    "toxiproxy": {
+      "enabled": false,
+      "toxics": []
+    }
+  },
+  "peer": {
+    "netem": {
+      "enabled": true,
+      "commands": [
+        "tc qdisc replace dev eth0 root netem delay 300ms 50ms loss 12%"
+      ]
+    }
+  }
+}

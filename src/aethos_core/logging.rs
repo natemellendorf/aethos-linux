@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde_json::json;
+
 const APP_LOG_FILE_NAME: &str = "aethos-linux.log";
 
 static VERBOSE_LOGGING_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -67,6 +69,47 @@ fn append_local_log_inner(message: &str) -> Result<(), String> {
         Err(_) => 0,
     };
 
-    writeln!(file, "[{now}] {message}")
-        .map_err(|err| format!("failed writing app log file at {}: {err}", path.display()))
+    if structured_logs_enabled() {
+        let event = json!({
+            "ts_unix": now,
+            "run_id": std::env::var("AETHOS_E2E_RUN_ID").ok(),
+            "test_case_id": std::env::var("AETHOS_E2E_TEST_CASE_ID").ok(),
+            "scenario": std::env::var("AETHOS_E2E_SCENARIO").ok(),
+            "node_label": std::env::var("AETHOS_E2E_NODE_LABEL").ok(),
+            "message": message,
+            "event": infer_event_name(message),
+            "fields": extract_kv_fields(message),
+        });
+        writeln!(file, "{}", event)
+            .map_err(|err| format!("failed writing app log file at {}: {err}", path.display()))
+    } else {
+        writeln!(file, "[{now}] {message}")
+            .map_err(|err| format!("failed writing app log file at {}: {err}", path.display()))
+    }
+}
+
+fn structured_logs_enabled() -> bool {
+    std::env::var("AETHOS_STRUCTURED_LOGS")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn infer_event_name(message: &str) -> String {
+    let token = message.split_whitespace().next().unwrap_or("log");
+    token.trim_end_matches(':').to_string()
+}
+
+fn extract_kv_fields(message: &str) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for token in message.split_whitespace() {
+        if let Some((key, value)) = token.split_once('=') {
+            let clean_key = key.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_');
+            let clean_value = value
+                .trim_matches(|ch: char| matches!(ch, ',' | ';' | ')' | '(' | '[' | ']' | '"'));
+            if !clean_key.is_empty() && !clean_value.is_empty() {
+                map.insert(clean_key.to_string(), json!(clean_value));
+            }
+        }
+    }
+    serde_json::Value::Object(map)
 }

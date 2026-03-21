@@ -8,7 +8,8 @@
     "build": "vite build",
     "preview": "vite preview --host 127.0.0.1 --port 1420",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri:build": "tauri build",
+    "e2e": "npm --prefix e2e test"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",

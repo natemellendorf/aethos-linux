@@ -26,3 +26,6 @@ fi
 
 printf '[git-hook:pre-merge-commit] merging main tip, running tests\n'
 cargo test
+
+printf '[git-hook:pre-merge-commit] running GUI+network e2e gate\n'
+scripts/e2e/pre-merge-gate.sh

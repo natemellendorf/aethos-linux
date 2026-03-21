@@ -1,0 +1,48 @@
+name: E2E GUI Network
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'spikes/tauri-desktop/**'
+      - 'tests/e2e-harness/**'
+      - 'scripts/e2e/**'
+      - 'docker-compose.e2e.yml'
+      - '.github/workflows/e2e-gui-network.yml'
+
+jobs:
+  e2e-matrix:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - scenario: clean
+            mode: relay
+          - scenario: slow-relay
+            mode: relay
+          - scenario: relay-partition
+            mode: relay
+          - scenario: lossy-peer
+            mode: peer
+          - scenario: clean
+            mode: mixed
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run e2e scenario
+        run: |
+          AETHOS_E2E_SCENARIO=${{ matrix.scenario }} AETHOS_E2E_MODE=${{ matrix.mode }} \
+          docker compose -f docker-compose.e2e.yml up --abort-on-container-exit --exit-code-from e2e-runner
+
+      - name: Collect artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-${{ matrix.mode }}-${{ matrix.scenario }}
+          path: tests/e2e-harness/artifacts/
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f docker-compose.e2e.yml down -v --remove-orphans

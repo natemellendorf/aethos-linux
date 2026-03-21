@@ -1,0 +1,16 @@
+{
+  "id": "clean",
+  "description": "No fault injection; baseline relay and peer conditions",
+  "relay": {
+    "toxiproxy": {
+      "enabled": false,
+      "toxics": []
+    }
+  },
+  "peer": {
+    "netem": {
+      "enabled": false,
+      "commands": []
+    }
+  }
+}

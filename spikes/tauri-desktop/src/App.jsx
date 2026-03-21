@@ -1000,7 +1000,7 @@ export default function App() {
             {TABS.map((t) => {
               const Icon = t.icon;
               return (
-                <Button key={t.id} variant={tab === t.id ? "default" : "ghost"} className="h-9 gap-1.5 px-3" onClick={() => setTab(t.id)}>
+                <Button key={t.id} data-testid={`tab-${t.id}`} variant={tab === t.id ? "default" : "ghost"} className="h-9 gap-1.5 px-3" onClick={() => setTab(t.id)}>
                   <Icon className="h-4 w-4" />
                   {t.label}
                 </Button>
@@ -1068,7 +1068,7 @@ export default function App() {
                   const unread = (chat.threads[id] || []).filter((m) => m.direction === "Incoming" && !m.seen).length;
                   const isNew = (chat.newContacts || []).includes(id);
                   return (
-                    <button key={id} className={cn("w-full rounded-lg border p-2.5 text-left", id === selectedContactId ? "border-blue-300 bg-blue-500/20" : "border-border/60 bg-background/50")} onClick={() => selectContact(id)}>
+                    <button data-testid={`chat-contact-${id}`} key={id} className={cn("w-full rounded-lg border p-2.5 text-left", id === selectedContactId ? "border-blue-300 bg-blue-500/20" : "border-border/60 bg-background/50")} onClick={() => selectContact(id)}>
                       <div className="flex items-center justify-between gap-2"><span className="truncate font-semibold">{alias || tinyId(id)}</span>{isNew ? <Badge className="bg-violet-500/20">NEW</Badge> : unread > 0 ? <Badge>{unread}</Badge> : null}</div>
                       <p className="mt-1 truncate text-xs text-muted-foreground">{tinyId(id)}</p>
                     </button>
@@ -1081,7 +1081,7 @@ export default function App() {
               <CardContent className="flex min-h-0 flex-1 flex-col p-3 pt-1">
                 <div ref={threadContainerRef} className="mb-1.5 min-h-0 flex-1 space-y-2 overflow-auto rounded-lg border border-border/60 bg-background/40 p-2.5">
                   {selectedThread.length === 0 ? <p className="text-sm text-muted-foreground">No messages in this thread yet.</p> : selectedThread.map((m) => (
-                    <div key={m.msgId} className={cn("message-bubble max-w-[85%] rounded-xl px-3 py-2 text-sm", m.direction === "Incoming" ? "message-bubble-incoming" : "message-bubble-outgoing ml-auto", arrivingMessageIds[m.msgId] ? "message-arrive" : "") }>
+                    <div data-testid={`message-${m.msgId}`} key={m.msgId} className={cn("message-bubble max-w-[85%] rounded-xl px-3 py-2 text-sm", m.direction === "Incoming" ? "message-bubble-incoming" : "message-bubble-outgoing ml-auto", arrivingMessageIds[m.msgId] ? "message-arrive" : "") }>
                       {m.text ? <p>{m.text}</p> : null}
                       {m.attachment ? (
                         <div className="mt-1.5 rounded-md border border-cyan-300/30 bg-slate-900/35 p-2 text-xs">
@@ -1116,6 +1116,7 @@ export default function App() {
                         <span>{formatMessageTimestamp(m)}</span>
                         {formatOutgoingStatus(m) ? <span className="text-cyan-200/90">{formatOutgoingStatus(m)}</span> : null}
                         <Button
+                          data-testid={`message-delete-${m.msgId}`}
                           variant="ghost"
                           size="sm"
                           className="h-6 px-2 text-[10px]"
@@ -1130,6 +1131,7 @@ export default function App() {
                 <div className="mb-1 flex items-center gap-2">
                   <input ref={attachmentInputRef} type="file" className="hidden" onChange={onAttachmentPick} />
                   <Button
+                    data-testid="chat-attach-file"
                     variant="ghost"
                     className="h-8"
                     disabled={!canSendToSelectedContact}
@@ -1145,6 +1147,7 @@ export default function App() {
                     </div>
                   ) : null}
                   <Button
+                    data-testid="chat-clear-thread"
                     className="ml-auto h-8"
                     disabled={!selectedContactId || selectedThread.length === 0}
                     onClick={clearThreadMessages}
@@ -1153,6 +1156,7 @@ export default function App() {
                   </Button>
                 </div>
                 <Textarea
+                  data-testid="chat-composer"
                   value={composer}
                   disabled={!canSendToSelectedContact}
                   onChange={(e) => setComposer(e.target.value)}
@@ -1167,6 +1171,7 @@ export default function App() {
                   placeholder={!canSendToSelectedContact ? "Cannot reply to unresolved peer. Select a saved contact." : (settings?.enterToSend === false ? "Write a message or drop in an emoji/file..." : "Write a message... (Enter to send, Shift+Enter newline)")}
                 />
                 <Button
+                  data-testid="chat-send"
                   className="mt-1 h-9 w-full"
                   disabled={!canSendToSelectedContact || (!composer.trim() && !composerAttachment)}
                   onClick={sendMessage}
@@ -1200,10 +1205,10 @@ export default function App() {
               <CardContent className="p-3 pt-1">
                 <p className="mb-2 text-sm text-muted-foreground">Editing: <strong>{selectedName}</strong> {selectedContactId ? `(${tinyId(selectedContactId)})` : ""}</p>
                 <form className="space-y-2" onSubmit={submitContact}>
-                  <Input name="wayfarer_id" value={contactDraft.wayfarerId} onChange={(e) => setContactDraft((d) => ({ ...d, wayfarerId: e.target.value }))} placeholder="64 lowercase hex chars" />
-                  <Input name="alias" value={contactDraft.alias} onChange={(e) => setContactDraft((d) => ({ ...d, alias: e.target.value }))} placeholder="Display name" />
+                  <Input data-testid="contact-wayfarer-id" name="wayfarer_id" value={contactDraft.wayfarerId} onChange={(e) => setContactDraft((d) => ({ ...d, wayfarerId: e.target.value }))} placeholder="64 lowercase hex chars" />
+                  <Input data-testid="contact-alias" name="alias" value={contactDraft.alias} onChange={(e) => setContactDraft((d) => ({ ...d, alias: e.target.value }))} placeholder="Display name" />
                   <div className="flex flex-wrap gap-2">
-                    <Button type="submit">Save Contact</Button>
+                    <Button data-testid="contact-save" type="submit">Save Contact</Button>
                     <Button type="button" variant="destructive" onClick={removeSelected}>Remove Selected</Button>
                     <Button type="button" variant="ghost" onClick={clearSelection}>Clear Selection</Button>
                     <label className="inline-flex cursor-pointer items-center">
@@ -1232,7 +1237,7 @@ export default function App() {
           <Card>
             <CardHeader className="p-3 pb-1"><CardTitle className="text-base">Share Your Wayfarer ID</CardTitle></CardHeader>
             <CardContent className="space-y-2 p-3 pt-1">
-              <pre className="overflow-auto rounded-lg border border-border/60 bg-background/60 p-3 text-xs">{identity?.wayfarerId || "Unavailable"}</pre>
+              <pre data-testid="share-wayfarer-id" className="overflow-auto rounded-lg border border-border/60 bg-background/60 p-3 text-xs">{identity?.wayfarerId || "Unavailable"}</pre>
               <div className="flex flex-wrap gap-2">
                 <Button variant="secondary" onClick={generateShareQr}><QrCode className="mr-2 h-4 w-4" />Generate QR</Button>
                 {shareQr?.pngBase64 ? (
@@ -1265,21 +1270,22 @@ export default function App() {
               <CardHeader className="p-3 pb-1"><CardTitle className="text-base">Sync Settings</CardTitle></CardHeader>
               <CardContent className="p-3 pt-1">
                 <form className="space-y-2" onSubmit={saveSettings}>
-                  <label className="flex items-center gap-2 text-sm"><input type="checkbox" name="relay_sync_enabled" defaultChecked={settings.relaySyncEnabled} /> Enable relay sync</label>
-                  <label className="flex items-center gap-2 text-sm"><input type="checkbox" name="gossip_sync_enabled" defaultChecked={settings.gossipSyncEnabled} /> Enable LAN gossip sync</label>
-                  <label className="flex items-center gap-2 text-sm"><input type="checkbox" name="verbose_logging_enabled" defaultChecked={settings.verboseLoggingEnabled} /> Enable verbose logging</label>
-                  <label className="flex items-center gap-2 text-sm"><input type="checkbox" name="enter_to_send" defaultChecked={settings.enterToSend !== false} /> Enter sends message (Shift+Enter newline)</label>
+                  <label className="flex items-center gap-2 text-sm"><input data-testid="settings-relay-sync" type="checkbox" name="relay_sync_enabled" defaultChecked={settings.relaySyncEnabled} /> Enable relay sync</label>
+                  <label className="flex items-center gap-2 text-sm"><input data-testid="settings-gossip-sync" type="checkbox" name="gossip_sync_enabled" defaultChecked={settings.gossipSyncEnabled} /> Enable LAN gossip sync</label>
+                  <label className="flex items-center gap-2 text-sm"><input data-testid="settings-verbose-logging" type="checkbox" name="verbose_logging_enabled" defaultChecked={settings.verboseLoggingEnabled} /> Enable verbose logging</label>
+                  <label className="flex items-center gap-2 text-sm"><input data-testid="settings-enter-to-send" type="checkbox" name="enter_to_send" defaultChecked={settings.enterToSend !== false} /> Enter sends message (Shift+Enter newline)</label>
                   <Input name="message_ttl_seconds" type="number" defaultValue={settings.messageTtlSeconds} />
                   <Textarea
+                    data-testid="settings-relay-endpoints"
                     name="relay_endpoints"
                     rows={4}
                     value={relayEndpointsDraft}
                     onChange={(event) => setRelayEndpointsDraft(event.target.value)}
                   />
                   <div className="flex flex-wrap gap-2">
-                    <Button type="submit"><CheckCircle2 className="mr-2 h-4 w-4" />Save Settings</Button>
+                    <Button data-testid="settings-save" type="submit"><CheckCircle2 className="mr-2 h-4 w-4" />Save Settings</Button>
                     <Button type="button" variant="secondary" onClick={resetRelayEndpoints}>Reset Relay Default</Button>
-                    <Button type="button" variant="ghost" onClick={announceGossip}>Announce LAN Gossip</Button>
+                    <Button data-testid="settings-announce-gossip" type="button" variant="ghost" onClick={announceGossip}>Announce LAN Gossip</Button>
                     <Button type="button" variant="destructive" onClick={clearAllMessages}>Delete ALL Messages</Button>
                   </div>
                 </form>
@@ -1313,7 +1319,7 @@ export default function App() {
             <Card>
               <CardHeader className="p-3 pb-1">
                 <CardTitle className="text-base">Live Client Logs</CardTitle>
-                <p className="text-xs text-muted-foreground">{logTail.logFilePath || "Log path unavailable"}</p>
+                <p data-testid="settings-log-path" className="text-xs text-muted-foreground">{logTail.logFilePath || "Log path unavailable"}</p>
               </CardHeader>
               <CardContent className="p-3 pt-1">
                 <div className="mb-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
@@ -1387,7 +1393,7 @@ export default function App() {
         <Card className="mt-2.5">
           <CardContent className="flex items-center gap-2 py-2 text-sm text-cyan-100">
             <Badge className="bg-cyan-500/20 border-cyan-400/40">Status</Badge>
-            <span>{status}</span>
+            <span data-testid="status-text">{status}</span>
           </CardContent>
         </Card>
 

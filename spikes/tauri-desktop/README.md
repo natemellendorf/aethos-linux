@@ -55,6 +55,26 @@ Optional relay target E2E tests (ignored by default):
 AETHOS_RELAY_TEST_HTTP=http://your-relay:8082 cargo test --manifest-path src-tauri/Cargo.toml -- --ignored
 ```
 
+Desktop two-instance WebDriver E2E (no human loop):
+
+```bash
+# Linux only for now (tauri-driver + WebKitWebDriver)
+cargo install tauri-driver --locked
+# Debian/Ubuntu example:
+sudo apt install webkit2gtk-driver
+
+cd spikes/tauri-desktop/e2e && npm install
+cd .. && npm run e2e
+```
+
+What this validates:
+- launches two isolated desktop app instances (separate `AETHOS_STATE_DIR`)
+- exchanges contacts through UI automation
+- sends message from instance A to instance B
+- drives LAN gossip announce loop until convergence or timeout
+- asserts each instance writes to its own local app log file
+- includes log tails in test failure output for fast diagnosis
+
 ## macOS signing/notarization (CI)
 
 Unsigned macOS artifacts can show "app is damaged" on first launch.

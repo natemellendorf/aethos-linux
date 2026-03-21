@@ -1,0 +1,20 @@
+{
+  "id": "split-brain-window",
+  "description": "Short peer partition then heal and verify convergence",
+  "relay": {
+    "toxiproxy": {
+      "enabled": false,
+      "toxics": []
+    }
+  },
+  "peer": {
+    "netem": {
+      "enabled": true,
+      "commands": [
+        "iptables -A OUTPUT -p udp --dport 58655:58670 -j DROP",
+        "sleep 12",
+        "iptables -D OUTPUT -p udp --dport 58655:58670 -j DROP"
+      ]
+    }
+  }
+}

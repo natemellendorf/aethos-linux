@@ -1,0 +1,38 @@
+services:
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    ports:
+      - "8474:8474"
+      - "19082:19082"
+    command: ["-host", "0.0.0.0", "-config", "/config/toxiproxy.json"]
+    volumes:
+      - ./tests/e2e-harness/config/toxiproxy.json:/config/toxiproxy.json:ro
+
+  relay-1:
+    image: python:3.12-alpine
+    command: ["python", "/app/mock_relay.py", "--host", "0.0.0.0", "--port", "8082"]
+    volumes:
+      - ./tests/e2e-harness/relay/mock_relay.py:/app/mock_relay.py:ro
+      - ./tests/e2e-harness/artifacts/relay-1:/artifacts
+    environment:
+      AETHOS_RELAY_LOG_PATH: /artifacts/relay.log.jsonl
+
+  e2e-runner:
+    image: mcr.microsoft.com/playwright:v1.58.2-noble
+    working_dir: /workspace
+    depends_on:
+      - toxiproxy
+      - relay-1
+    environment:
+      DISPLAY: :99
+      AETHOS_E2E_RELAY_ENDPOINT: http://toxiproxy:19082
+      AETHOS_E2E_SCENARIO: ${AETHOS_E2E_SCENARIO:-clean}
+      AETHOS_E2E_MODE: ${AETHOS_E2E_MODE:-peer}
+    command:
+      [
+        "bash",
+        "-lc",
+        "apt-get update >/dev/null && apt-get install -y webkit2gtk-driver xvfb >/dev/null && cd spikes/tauri-desktop/e2e && npm install >/dev/null && Xvfb :99 -screen 0 1280x800x24 >/tmp/xvfb.log 2>&1 & cd /workspace && ./scripts/e2e/run-scenario.sh --scenario ${AETHOS_E2E_SCENARIO} --mode ${AETHOS_E2E_MODE}"
+      ]
+    volumes:
+      - ./:/workspace

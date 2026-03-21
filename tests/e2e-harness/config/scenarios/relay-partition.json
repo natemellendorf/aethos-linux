@@ -1,0 +1,25 @@
+{
+  "id": "relay-partition",
+  "description": "Temporarily blackhole relay traffic to validate recovery",
+  "relay": {
+    "toxiproxy": {
+      "enabled": true,
+      "toxics": [
+        {
+          "name": "timeout_downstream",
+          "type": "timeout",
+          "stream": "downstream",
+          "attributes": {
+            "timeout": 60000
+          }
+        }
+      ]
+    }
+  },
+  "peer": {
+    "netem": {
+      "enabled": false,
+      "commands": []
+    }
+  }
+}
