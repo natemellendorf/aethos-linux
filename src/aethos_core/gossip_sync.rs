@@ -480,15 +480,6 @@ pub fn import_transfer_items(
             }
         };
 
-        if parsed.to_wayfarer_id_hex != local_wayfarer_id {
-            rejected_items.push(RejectedItem {
-                item_id: object.item_id.clone(),
-                code: "NOT_FOR_LOCAL_NODE".to_string(),
-                message: "decoded envelope destination does not match local node".to_string(),
-            });
-            continue;
-        }
-
         if now_ms + CLOCK_SKEW_TOLERANCE_MS >= object.expiry_unix_ms {
             rejected_items.push(RejectedItem {
                 item_id: object.item_id.clone(),
@@ -527,26 +518,34 @@ pub fn import_transfer_items(
             None => {
                 store.items.insert(object.item_id.clone(), incoming);
                 accepted_item_ids.push(object.item_id.clone());
-                match decode_envelope_payload_utf8_preview(&object.envelope_b64) {
-                    Ok(text) => {
-                        new_messages.push(ImportedEnvelope {
-                            item_id: object.item_id.clone(),
-                            author_wayfarer_id: Some(parsed.author_wayfarer_id_hex.clone()),
-                            transport_peer: transport_peer.map(|value| value.to_string()),
-                            session_peer: session_peer_wayfarer_id.map(|value| value.to_string()),
-                            text,
-                            received_at_unix: (now_ms / 1000) as i64,
-                            manifest_id_hex: Some(parsed.manifest_id_hex),
-                        });
+                if parsed.to_wayfarer_id_hex == local_wayfarer_id {
+                    match decode_envelope_payload_utf8_preview(&object.envelope_b64) {
+                        Ok(text) => {
+                            new_messages.push(ImportedEnvelope {
+                                item_id: object.item_id.clone(),
+                                author_wayfarer_id: Some(parsed.author_wayfarer_id_hex.clone()),
+                                transport_peer: transport_peer.map(|value| value.to_string()),
+                                session_peer: session_peer_wayfarer_id
+                                    .map(|value| value.to_string()),
+                                text,
+                                received_at_unix: (now_ms / 1000) as i64,
+                                manifest_id_hex: Some(parsed.manifest_id_hex),
+                            });
+                        }
+                        Err(_) => {
+                            log_verbose(&format!(
+                                "transfer_import_skip_non_utf8_payload: item_id={} transport_peer={} session_peer={}",
+                                object.item_id,
+                                transport_peer.unwrap_or("none"),
+                                session_peer_wayfarer_id.unwrap_or("none")
+                            ));
+                        }
                     }
-                    Err(_) => {
-                        log_verbose(&format!(
-                            "transfer_import_skip_non_utf8_payload: item_id={} transport_peer={} session_peer={}",
-                            object.item_id,
-                            transport_peer.unwrap_or("none"),
-                            session_peer_wayfarer_id.unwrap_or("none")
-                        ));
-                    }
+                } else {
+                    log_verbose(&format!(
+                        "transfer_import_stored_nonlocal: item_id={} to={} local={}",
+                        object.item_id, parsed.to_wayfarer_id_hex, local_wayfarer_id
+                    ));
                 }
             }
         }
