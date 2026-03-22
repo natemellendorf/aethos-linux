@@ -1,6 +1,10 @@
-#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
 
 mod app_state;
+mod media_v1;
 
 #[allow(dead_code)]
 #[path = "../../../../src/aethos_core/mod.rs"]
@@ -16,25 +20,25 @@ use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use app_state::{
     load_app_settings, load_chat_state, normalize_chat_state, now_unix_ms, now_unix_secs,
-    save_app_settings, save_chat_state, AppSettings, ChatAttachment, ChatDirection, ChatMessage,
-    OutboundState, PersistedChatState,
+    save_app_settings, save_chat_state, AppSettings, ChatAttachment, ChatDirection,
+    ChatMediaTransfer, ChatMessage, MediaTransferStatus, OutboundState, PersistedChatState,
 };
 use base64::Engine;
 use image::{imageops::FilterType, ImageBuffer, Luma, Rgba, RgbaImage};
 use qrcode::QrCode;
 use serde::{Deserialize, Serialize};
-#[cfg(test)]
 use sha2::Digest;
 use socket2::{Domain, Protocol, Socket, Type};
 use tauri::Emitter;
+use url::Url;
 
 use crate::aethos_core::gossip_sync::record_local_payload as gossip_record_local_payload;
 use crate::aethos_core::gossip_sync::{
@@ -56,17 +60,25 @@ use crate::aethos_core::logging::{
     app_log_file_path, log_info, log_verbose, set_verbose_logging_enabled, verbose_logging_enabled,
 };
 use crate::aethos_core::protocol::{
-    build_envelope_payload_b64_from_utf8, decode_envelope_payload_b64, is_valid_wayfarer_id,
+    build_envelope_payload_b64_from_utf8, bytes_to_hex_lower, decode_envelope_payload_b64,
+    is_valid_wayfarer_id,
 };
 use crate::relay::client::{
     connect_to_relay_gossipv1_with_auth, normalize_http_endpoint, relay_session_snapshot,
     run_relay_encounter_gossipv1, run_relay_encounter_gossipv1_for_duration, to_ws_endpoint,
 };
+use media_v1::{
+    get_completed_media_path as media_get_completed_media_path, is_media_candidate_attachment,
+    is_media_wire_message, load_completed_media as media_load_completed_media,
+    max_object_bytes as media_max_object_bytes, maybe_queue_capabilities_for_peer,
+    process_incoming_media_message, run_housekeeping_tick as media_run_housekeeping_tick,
+    send_media_manifest_and_chunks, MediaMessageProcess,
+};
 
 const SHARE_QR_FILE_NAME: &str = "share-wayfarer-qr.png";
 const CHAT_SNAPSHOT_EVENT: &str = "chat_snapshot";
 const SOUND_EVENT: &str = "sound_event";
-const MAX_ATTACHMENT_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_INLINE_ATTACHMENT_BYTES: u64 = 2 * 1024 * 1024;
 const LAN_TCP_CAPABILITY: &str = "lan_tcp_transfer_v1";
 const LAN_TCP_FAILURE_COOLDOWN_SECS: u64 = 45;
 const LAN_FALLBACK_TRANSFER_MAX_ITEMS: u32 = 2;
@@ -189,7 +201,9 @@ fn set_relay_worker_status(status: &str) {
     if let Ok(mut slot) = runtime.last_status.lock() {
         *slot = status.to_string();
     }
-    runtime.last_activity_ms.store(now_unix_ms(), Ordering::SeqCst);
+    runtime
+        .last_activity_ms
+        .store(now_unix_ms(), Ordering::SeqCst);
 }
 
 fn request_relay_sync(reason: &str) {
@@ -319,7 +333,32 @@ struct SendAttachmentRequest {
     file_name: String,
     mime_type: String,
     size_bytes: u64,
-    content_b64: String,
+    #[serde(default)]
+    content_b64: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LoadCompletedMediaRequest {
+    object_sha256_hex: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GenerateE2ELargeImageRequest {
+    seed: String,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GenerateE2ELargeImageResponse {
+    file_path: String,
+    size_bytes: u64,
+    sha256_hex: String,
+    width: u32,
+    height: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -435,8 +474,12 @@ fn read_app_log(max_lines: Option<usize>) -> Result<AppLogTail, String> {
 fn clear_app_log() -> Result<AppLogTail, String> {
     let path = app_log_file_path();
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|err| format!("failed creating app log directory {}: {err}", parent.display()))?;
+        fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "failed creating app log directory {}: {err}",
+                parent.display()
+            )
+        })?;
     }
     fs::write(&path, "")
         .map_err(|err| format!("failed clearing app log at {}: {err}", path.display()))?;
@@ -485,8 +528,16 @@ fn bootstrap_state() -> Result<BootstrapState, String> {
     if settings.relay_sync_enabled {
         request_relay_sync("bootstrap_state");
     }
+    run_media_housekeeping_best_effort("bootstrap_state", settings.message_ttl_seconds);
     let identity = ensure_local_identity()?;
     let contacts = load_contact_aliases()?;
+    let author_signing_seed = load_local_signing_key_seed().ok();
+    if let Some(seed) = author_signing_seed.as_ref() {
+        for wayfarer_id in contacts.keys() {
+            let _ =
+                maybe_queue_capabilities_for_peer(wayfarer_id, seed, settings.message_ttl_seconds);
+        }
+    }
     let chat = load_chat_state()?;
 
     Ok(BootstrapState {
@@ -531,6 +582,10 @@ fn update_settings(settings: AppSettings) -> Result<AppSettings, String> {
 
 #[tauri::command]
 fn gossip_status() -> GossipStatus {
+    let ttl_seconds = load_app_settings()
+        .map(|settings| settings.message_ttl_seconds)
+        .unwrap_or(3600);
+    run_media_housekeeping_best_effort("gossip_status", ttl_seconds);
     current_gossip_status()
 }
 
@@ -609,15 +664,13 @@ fn relay_health_status_blocking() -> Result<RelayHealthStatus, String> {
         })
         .unwrap_or_else(|| "idle".to_string());
 
-    let primary_ok =
-        primary_status.contains("connected + HELLO") || primary_status.contains("active relay session");
-    let secondary_ok =
-        secondary_status.contains("connected + HELLO") || secondary_status.contains("active relay session");
+    let primary_ok = primary_status.contains("connected + HELLO")
+        || primary_status.contains("active relay session");
+    let secondary_ok = secondary_status.contains("connected + HELLO")
+        || secondary_status.contains("active relay session");
     let (chip_text, chip_state) = match (primary_ok, secondary_ok) {
         (true, true) => ("Relays: healthy (2/2)".to_string(), "ok".to_string()),
-        (true, false) | (false, true) => {
-            ("Relays: degraded (1/2)".to_string(), "warn".to_string())
-        }
+        (true, false) | (false, true) => ("Relays: degraded (1/2)".to_string(), "warn".to_string()),
         (false, false) => {
             let has_any_result = primary_status != "idle" || secondary_status != "idle";
             if has_any_result {
@@ -642,14 +695,21 @@ fn upsert_contact(request: UpsertContactRequest) -> Result<BTreeMap<String, Stri
         return Err("invalid wayfarer_id; expected 64 lowercase hex chars".to_string());
     }
 
+    let wayfarer_id = request.wayfarer_id.trim().to_string();
     let alias = request.alias.trim();
     if alias.is_empty() {
         return Err("alias cannot be empty".to_string());
     }
 
     let mut contacts = load_contact_aliases()?;
-    contacts.insert(request.wayfarer_id, alias.to_string());
+    contacts.insert(wayfarer_id.clone(), alias.to_string());
     save_contact_aliases(&contacts)?;
+    if let Ok(seed) = load_local_signing_key_seed() {
+        let ttl_seconds = load_app_settings()
+            .map(|settings| settings.message_ttl_seconds)
+            .unwrap_or(3600);
+        let _ = maybe_queue_capabilities_for_peer(&wayfarer_id, &seed, ttl_seconds);
+    }
     emit_chat_snapshot_event_best_effort("upsert_contact");
     Ok(contacts)
 }
@@ -665,6 +725,11 @@ fn remove_contact(wayfarer_id: String) -> Result<BTreeMap<String, String>, Strin
 
 #[tauri::command]
 fn save_chat(chat: PersistedChatState) -> Result<PersistedChatState, String> {
+    let ttl_seconds = load_app_settings()
+        .map(|settings| settings.message_ttl_seconds)
+        .unwrap_or(3600);
+    run_media_housekeeping_best_effort("save_chat", ttl_seconds);
+
     let mut normalized = chat;
     normalize_chat_state(&mut normalized);
     save_chat_state(&normalized)?;
@@ -674,9 +739,88 @@ fn save_chat(chat: PersistedChatState) -> Result<PersistedChatState, String> {
 
 #[tauri::command]
 fn chat_snapshot() -> Result<ChatSnapshot, String> {
+    let ttl_seconds = load_app_settings()
+        .map(|settings| settings.message_ttl_seconds)
+        .unwrap_or(3600);
+    run_media_housekeeping_best_effort("chat_snapshot", ttl_seconds);
+
     Ok(ChatSnapshot {
         contacts: load_contact_aliases()?,
         chat: load_chat_state()?,
+    })
+}
+
+#[tauri::command]
+fn load_completed_media(
+    request: LoadCompletedMediaRequest,
+) -> Result<media_v1::CompletedMediaPayload, String> {
+    media_load_completed_media(request.object_sha256_hex.trim())
+}
+
+#[tauri::command]
+fn get_completed_media_path(
+    request: LoadCompletedMediaRequest,
+) -> Result<media_v1::CompletedMediaPathPayload, String> {
+    media_get_completed_media_path(request.object_sha256_hex.trim())
+}
+
+#[tauri::command]
+fn open_completed_media_in_system_viewer(request: LoadCompletedMediaRequest) -> Result<(), String> {
+    let payload = media_get_completed_media_path(request.object_sha256_hex.trim())?;
+    let file_url = Url::from_file_path(Path::new(&payload.path))
+        .map_err(|_| "failed building file URL for completed media path".to_string())?;
+    webbrowser::open(file_url.as_str())
+        .map_err(|err| format!("failed opening completed media in system viewer: {err}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn generate_e2e_large_image(
+    request: GenerateE2ELargeImageRequest,
+) -> Result<GenerateE2ELargeImageResponse, String> {
+    let width = request.width.clamp(256, 4096);
+    let height = request.height.clamp(256, 4096);
+    let seed = request.seed.trim();
+    if seed.is_empty() {
+        return Err("seed cannot be empty".to_string());
+    }
+
+    let output_dir = if let Ok(artifact_dir) = std::env::var("AETHOS_E2E_ARTIFACT_DIR") {
+        if artifact_dir.trim().is_empty() {
+            std::env::temp_dir().join("aethos-e2e")
+        } else {
+            PathBuf::from(artifact_dir)
+        }
+    } else {
+        std::env::temp_dir().join("aethos-e2e")
+    };
+    fs::create_dir_all(&output_dir).map_err(|err| {
+        format!(
+            "failed creating e2e image output dir {}: {err}",
+            output_dir.display()
+        )
+    })?;
+    let file_name = format!(
+        "aethos-large-{}-{}x{}.png",
+        sanitize_seed_for_file(seed),
+        width,
+        height
+    );
+    let file_path = output_dir.join(file_name);
+
+    let png_bytes = generate_aethos_e2e_png(seed, width, height)?;
+    if png_bytes.len() as u64 > media_max_object_bytes() {
+        return Err("generated e2e image exceeds media maxObjectBytes".to_string());
+    }
+    fs::write(&file_path, &png_bytes)
+        .map_err(|err| format!("failed writing e2e image {}: {err}", file_path.display()))?;
+
+    Ok(GenerateE2ELargeImageResponse {
+        file_path: file_path.display().to_string(),
+        size_bytes: png_bytes.len() as u64,
+        sha256_hex: bytes_to_hex_lower(&sha2::Sha256::digest(&png_bytes)),
+        width,
+        height,
     })
 }
 
@@ -719,9 +863,102 @@ fn send_message_blocking(request: SendMessageRequest) -> Result<SendMessageRespo
     let identity = ensure_local_identity()?;
     let author_signing_seed = load_local_signing_key_seed()?;
     let contacts = load_contact_aliases()?;
+    let _ = maybe_queue_capabilities_for_peer(
+        wayfarer_id,
+        &author_signing_seed,
+        settings.message_ttl_seconds,
+    );
+
+    if let Some(media_attachment) = attachment
+        .as_ref()
+        .filter(|value| is_media_candidate_attachment(value))
+    {
+        let send_result = send_media_manifest_and_chunks(
+            wayfarer_id,
+            body,
+            media_attachment,
+            &author_signing_seed,
+            settings.message_ttl_seconds,
+        )?;
+
+        if let Some(runtime) = GOSSIP_RUNTIME.get() {
+            runtime.force_announce.store(true, Ordering::SeqCst);
+            set_gossip_event("announce queued");
+        }
+
+        let mut chat = load_chat_state()?;
+        chat.selected_contact = Some(wayfarer_id.to_string());
+        mark_contact_seen(&mut chat, wayfarer_id);
+
+        let thread = chat.threads.entry(wayfarer_id.to_string()).or_default();
+        let local_id = format!("local-media-{now_ms}-{:08x}", rand::random::<u32>());
+        thread.push(ChatMessage {
+            msg_id: local_id.clone(),
+            text: if body.is_empty() {
+                format!("[Image] {}", send_result.file_name)
+            } else {
+                body.to_string()
+            },
+            timestamp: format_timestamp_from_unix(now_secs),
+            created_at_unix: now_secs,
+            created_at_unix_ms: now_ms,
+            direction: ChatDirection::Outgoing,
+            seen: true,
+            manifest_id_hex: None,
+            delivered_at: None,
+            outbound_state: Some(OutboundState::Sending),
+            expires_at_unix_ms: Some(send_result.expires_at_unix_ms),
+            last_sync_attempt_unix_ms: Some(now_ms),
+            last_sync_error: None,
+            attachment: Some(ChatAttachment {
+                file_name: send_result.file_name.clone(),
+                mime_type: send_result.mime_type.clone(),
+                size_bytes: send_result.total_bytes,
+                content_b64: None,
+            }),
+            media: Some(ChatMediaTransfer {
+                transfer_id: send_result.transfer_id.clone(),
+                object_sha256_hex: send_result.object_sha256_hex.clone(),
+                file_name: send_result.file_name.clone(),
+                mime_type: send_result.mime_type.clone(),
+                total_bytes: send_result.total_bytes,
+                chunk_count: send_result.chunk_count,
+                received_chunks: 0,
+                received_bytes: 0,
+                status: MediaTransferStatus::Pending,
+                error: None,
+                expires_at_unix_ms: Some(send_result.expires_at_unix_ms),
+            }),
+        });
+
+        mark_outgoing_message(
+            &mut chat,
+            wayfarer_id,
+            &local_id,
+            &send_result.item_id,
+            None,
+        );
+        save_chat_state(&chat)?;
+        save_contact_aliases(&contacts)?;
+        emit_chat_snapshot_event_best_effort("send_message_blocking_media");
+
+        let message =
+            latest_message_for_contact(&chat, wayfarer_id, &send_result.item_id, &local_id)
+                .ok_or_else(|| "failed to load stored outbound media message".to_string())?;
+
+        return Ok(SendMessageResponse {
+            message,
+            chat,
+            contacts,
+            encounter_status: "media manifest + chunks queued locally".to_string(),
+            pulled_messages: 0,
+        });
+    }
+
     let expiry_ms = now_ms.saturating_add(settings.message_ttl_seconds.saturating_mul(1000));
     let local_id = format!("local-{now_ms}-{:08x}", rand::random::<u32>());
-    let outbound_payload = build_outbound_chat_payload(body, &local_id, now_ms, attachment.as_ref());
+    let outbound_payload =
+        build_outbound_chat_payload(body, &local_id, now_ms, attachment.as_ref());
     let payload =
         build_envelope_payload_b64_from_utf8(wayfarer_id, &outbound_payload, &author_signing_seed)?;
     let decoded = decode_envelope_payload_b64(&payload)?;
@@ -758,7 +995,8 @@ fn send_message_blocking(request: SendMessageRequest) -> Result<SendMessageRespo
         expires_at_unix_ms: Some(expiry_ms),
         last_sync_attempt_unix_ms: Some(now_ms),
         last_sync_error: None,
-        attachment,
+        attachment: attachment.clone().map(sanitize_attachment_for_chat_history),
+        media: None,
     });
 
     let relay_http = settings
@@ -774,14 +1012,15 @@ fn send_message_blocking(request: SendMessageRequest) -> Result<SendMessageRespo
     if relay_enabled {
         let relay_ws = to_ws_endpoint(relay_http.as_deref().unwrap_or_default());
         request_relay_sync("send_message");
-        encounter_status = if let Some(active) = relay_session_snapshot(&relay_ws, &identity.wayfarer_id) {
-            format!(
-                "message queued locally; relay sync active (attempt_id={} state={} trigger={})",
-                active.attempt_id, active.state, active.trigger
-            )
-        } else {
-            "message queued locally; relay worker scheduled".to_string()
-        };
+        encounter_status =
+            if let Some(active) = relay_session_snapshot(&relay_ws, &identity.wayfarer_id) {
+                format!(
+                    "message queued locally; relay sync active (attempt_id={} state={} trigger={})",
+                    active.attempt_id, active.state, active.trigger
+                )
+            } else {
+                "message queued locally; relay worker scheduled".to_string()
+            };
         mark_outgoing_message(&mut chat, wayfarer_id, &local_id, &item_id, None);
     } else {
         mark_outgoing_message(&mut chat, wayfarer_id, &local_id, &item_id, None);
@@ -806,6 +1045,20 @@ fn send_message_blocking(request: SendMessageRequest) -> Result<SendMessageRespo
         encounter_status,
         pulled_messages: pulled_messages_count,
     })
+}
+
+fn run_media_housekeeping_best_effort(context: &str, ttl_seconds_max: u64) {
+    match media_run_housekeeping_tick(ttl_seconds_max) {
+        Ok(true) => {
+            emit_chat_snapshot_event_best_effort(context);
+        }
+        Ok(false) => {}
+        Err(err) => {
+            log_verbose(&format!(
+                "media_housekeeping_failed context={context}: {err}"
+            ));
+        }
+    }
 }
 
 #[tauri::command]
@@ -1086,7 +1339,10 @@ fn start_relay_worker_if_needed() {
 
             if endpoints != relay_http_endpoints {
                 relay_http_endpoints = endpoints.clone();
-                relay_ws_endpoints = endpoints.into_iter().map(|endpoint| to_ws_endpoint(&endpoint)).collect();
+                relay_ws_endpoints = endpoints
+                    .into_iter()
+                    .map(|endpoint| to_ws_endpoint(&endpoint))
+                    .collect();
                 relay_failures = vec![0; relay_ws_endpoints.len()];
                 relay_next_attempt_at = vec![Instant::now(); relay_ws_endpoints.len()];
                 rr_cursor = 0;
@@ -1180,8 +1436,8 @@ fn start_relay_worker_if_needed() {
                 }
                 Err(err) => {
                     relay_failures[relay_slot] = relay_failures[relay_slot].saturating_add(1);
-                    let backoff_secs = 2_u64
-                        .saturating_pow(relay_failures[relay_slot].saturating_sub(1).min(6));
+                    let backoff_secs =
+                        2_u64.saturating_pow(relay_failures[relay_slot].saturating_sub(1).min(6));
                     relay_next_attempt_at[relay_slot] =
                         Instant::now() + Duration::from_secs(backoff_secs.min(60));
                     set_relay_worker_status(&format!(
@@ -1205,6 +1461,11 @@ fn apply_relay_pulled_messages(
     pulled_messages: Vec<crate::relay::client::EncounterMessagePreview>,
     context: &str,
 ) -> Result<usize, String> {
+    let ttl_seconds = load_app_settings()
+        .map(|settings| settings.message_ttl_seconds)
+        .unwrap_or(3600);
+    run_media_housekeeping_best_effort("apply_relay_pulled_messages_pre", ttl_seconds);
+
     if pulled_messages.is_empty() {
         return Ok(0);
     }
@@ -1243,13 +1504,17 @@ fn start_gossip_worker_if_needed(initial_enabled: bool) {
 
         if let Err(err) = socket.set_nonblocking(true) {
             set_gossip_event(&format!("set_nonblocking failed: {err}"));
-            log_info(&format!("gossip_sync_disabled: set_nonblocking failed: {err}"));
+            log_info(&format!(
+                "gossip_sync_disabled: set_nonblocking failed: {err}"
+            ));
             runtime.running.store(false, Ordering::SeqCst);
             return;
         }
         if let Err(err) = socket.set_broadcast(true) {
             set_gossip_event(&format!("set_broadcast failed: {err}"));
-            log_info(&format!("gossip_sync_disabled: set_broadcast failed: {err}"));
+            log_info(&format!(
+                "gossip_sync_disabled: set_broadcast failed: {err}"
+            ));
             runtime.running.store(false, Ordering::SeqCst);
             return;
         }
@@ -1283,7 +1548,9 @@ fn start_gossip_worker_if_needed(initial_enabled: bool) {
             let force_announce = runtime.force_announce.swap(false, Ordering::SeqCst);
             if force_announce || last_inventory_broadcast.elapsed() >= Duration::from_secs(3) {
                 if gossip_broadcast_inventory(&socket).is_ok() {
-                    runtime.last_activity_ms.store(now_unix_ms(), Ordering::SeqCst);
+                    runtime
+                        .last_activity_ms
+                        .store(now_unix_ms(), Ordering::SeqCst);
                     set_gossip_event("active");
                     log_verbose("gossip_inventory_broadcasted");
                 }
@@ -1321,7 +1588,9 @@ fn start_gossip_worker_if_needed(initial_enabled: bool) {
             let mut buf = [0u8; 65_535];
             match socket.recv_from(&mut buf) {
                 Ok((len, source)) => {
-                    runtime.last_activity_ms.store(now_unix_ms(), Ordering::SeqCst);
+                    runtime
+                        .last_activity_ms
+                        .store(now_unix_ms(), Ordering::SeqCst);
                     set_gossip_event("active");
                     log_verbose(&format!("gossip_recv bytes={} from={source}", len));
                     if let Err(err) = handle_gossip_frame(
@@ -1432,6 +1701,11 @@ fn handle_gossip_frame(
     recent_outbound_request_by_peer: &mut HashMap<String, (u64, Instant)>,
     runtime: &GossipRuntime,
 ) -> Result<(), String> {
+    let ttl_seconds = load_app_settings()
+        .map(|settings| settings.message_ttl_seconds)
+        .unwrap_or(3600);
+    run_media_housekeeping_best_effort("handle_gossip_frame", ttl_seconds);
+
     if gossip_loopback_only_enabled() && !source.ip().is_loopback() {
         return Ok(());
     }
@@ -1459,7 +1733,8 @@ fn handle_gossip_frame(
                 tcp_capable
             ));
             if let Ok(summary) = build_gossip_summary_frame(now_unix_ms()) {
-                let _ = send_gossip_frame(socket, &source.ip().to_string(), source.port(), &summary);
+                let _ =
+                    send_gossip_frame(socket, &source.ip().to_string(), source.port(), &summary);
             }
             if let Ok(ingest) = build_gossip_relay_ingest_frame(now_unix_ms()) {
                 let _ = send_gossip_frame(socket, &source.ip().to_string(), source.port(), &ingest);
@@ -1470,7 +1745,11 @@ fn handle_gossip_frame(
                 "gossip_recv_summary: from={} item_count={} preview_items={}",
                 source,
                 summary.item_count,
-                summary.preview_item_ids.as_ref().map(|v| v.len()).unwrap_or(0)
+                summary
+                    .preview_item_ids
+                    .as_ref()
+                    .map(|v| v.len())
+                    .unwrap_or(0)
             ));
             log_verbose(&format!(
                 "gossip_request_from_summary_skipped: to={} reason=prefer_relay_ingest_candidates",
@@ -1497,7 +1776,8 @@ fn handle_gossip_frame(
                     recent_outbound_request_by_peer.get(&peer_key)
                 {
                     if *previous_fingerprint == fingerprint
-                        && seen_at.elapsed() < Duration::from_millis(LAN_OUTBOUND_REQUEST_DEBOUNCE_MS)
+                        && seen_at.elapsed()
+                            < Duration::from_millis(LAN_OUTBOUND_REQUEST_DEBOUNCE_MS)
                     {
                         log_verbose(&format!(
                             "gossip_outbound_request_debounced: to={} want_items={} debounce_ms={}",
@@ -1623,7 +1903,6 @@ fn handle_gossip_frame(
                     result.rejected_items.len(),
                     reason_parts.join(",")
                 ));
-
             }
 
             if !result.new_messages.is_empty() {
@@ -1633,16 +1912,14 @@ fn handle_gossip_frame(
                 let pulled = result
                     .new_messages
                     .into_iter()
-                    .map(|item| {
-                        crate::relay::client::EncounterMessagePreview {
-                            author_wayfarer_id: item.author_wayfarer_id,
-                            session_peer: item.session_peer,
-                            transport_peer: item.transport_peer,
-                            item_id: item.item_id,
-                            text: item.text,
-                            received_at_unix: item.received_at_unix,
-                            manifest_id_hex: item.manifest_id_hex,
-                        }
+                    .map(|item| crate::relay::client::EncounterMessagePreview {
+                        author_wayfarer_id: item.author_wayfarer_id,
+                        session_peer: item.session_peer,
+                        transport_peer: item.transport_peer,
+                        item_id: item.item_id,
+                        text: item.text,
+                        received_at_unix: item.received_at_unix,
+                        manifest_id_hex: item.manifest_id_hex,
                     })
                     .collect::<Vec<_>>();
                 merge_pulled_messages(&mut chat, &mut contacts, pulled);
@@ -1650,12 +1927,13 @@ fn handle_gossip_frame(
                 save_contact_aliases(&contacts)?;
                 emit_chat_snapshot_event_best_effort("gossip_transfer_import");
                 emit_sound_event_best_effort("sync", "gossip_transfer_import");
-                runtime.last_activity_ms.store(now_unix_ms(), Ordering::SeqCst);
+                runtime
+                    .last_activity_ms
+                    .store(now_unix_ms(), Ordering::SeqCst);
                 set_gossip_event("received messages");
                 log_verbose(&format!(
                     "gossip_transfer_imported_messages={} from={}",
-                    imported_count,
-                    source
+                    imported_count, source
                 ));
             }
 
@@ -1671,7 +1949,12 @@ fn handle_gossip_frame(
     Ok(())
 }
 
-fn send_gossip_frame(socket: &UdpSocket, host: &str, port: u16, frame: &GossipSyncFrame) -> Result<(), String> {
+fn send_gossip_frame(
+    socket: &UdpSocket,
+    host: &str,
+    port: u16,
+    frame: &GossipSyncFrame,
+) -> Result<(), String> {
     let raw = serialize_gossip_frame(frame)?;
     let addr = format!("{host}:{port}");
     let result = socket
@@ -1712,8 +1995,8 @@ fn run_gossip_tcp_encounter_with_peer(
     trigger: &str,
 ) -> Result<(), String> {
     let addr = format!("{}:{}", peer_ip, gossip_lan_port());
-    let mut stream = TcpStream::connect(&addr)
-        .map_err(|err| format!("tcp connect failed ({addr}): {err}"))?;
+    let mut stream =
+        TcpStream::connect(&addr).map_err(|err| format!("tcp connect failed ({addr}): {err}"))?;
     stream
         .set_nodelay(true)
         .map_err(|err| format!("tcp set_nodelay failed ({addr}): {err}"))?;
@@ -1799,9 +2082,10 @@ fn run_gossip_tcp_encounter_on_stream(
                     now_unix_ms(),
                 )
                 .unwrap_or_default();
-                let transfer = GossipSyncFrame::Transfer(crate::aethos_core::gossip_sync::TransferFrame {
-                    objects,
-                });
+                let transfer =
+                    GossipSyncFrame::Transfer(crate::aethos_core::gossip_sync::TransferFrame {
+                        objects,
+                    });
                 send_gossip_frame_tcp(stream, &transfer)?;
             }
             GossipSyncFrame::Transfer(transfer) => {
@@ -1842,7 +2126,9 @@ fn run_gossip_tcp_encounter_on_stream(
                     save_contact_aliases(&contacts)?;
                     emit_chat_snapshot_event_best_effort("gossip_tcp_transfer_import");
                     emit_sound_event_best_effort("sync", "gossip_tcp_transfer_import");
-                    runtime.last_activity_ms.store(now_unix_ms(), Ordering::SeqCst);
+                    runtime
+                        .last_activity_ms
+                        .store(now_unix_ms(), Ordering::SeqCst);
                     set_gossip_event("received messages");
                 }
 
@@ -1891,9 +2177,8 @@ fn serve_udp_transfer_for_request(
             break;
         }
 
-        let transfer = GossipSyncFrame::Transfer(crate::aethos_core::gossip_sync::TransferFrame {
-            objects,
-        });
+        let transfer =
+            GossipSyncFrame::Transfer(crate::aethos_core::gossip_sync::TransferFrame { objects });
         send_gossip_frame(socket, &source.ip().to_string(), source.port(), &transfer)?;
         std::thread::sleep(Duration::from_millis(LAN_FALLBACK_CHUNK_PACING_MS));
     }
@@ -1914,9 +2199,9 @@ fn build_lan_hello_frame(wayfarer_id: &str, node_pubkey: &str) -> Result<GossipS
     if let GossipSyncFrame::Hello(hello) = &mut frame {
         if !lan_tcp_disabled()
             && !hello
-            .capabilities
-            .iter()
-            .any(|capability| capability == LAN_TCP_CAPABILITY)
+                .capabilities
+                .iter()
+                .any(|capability| capability == LAN_TCP_CAPABILITY)
         {
             hello.capabilities.push(LAN_TCP_CAPABILITY.to_string());
         }
@@ -2019,11 +2304,50 @@ fn merge_pulled_messages(
     contacts: &mut BTreeMap<String, String>,
     pulled_messages: Vec<crate::relay::client::EncounterMessagePreview>,
 ) {
+    let settings = load_app_settings().ok();
+    let ttl_seconds_max = settings
+        .as_ref()
+        .map(|value| value.message_ttl_seconds)
+        .unwrap_or(3600);
+    let identity = ensure_local_identity().ok();
+    let author_signing_seed = load_local_signing_key_seed().ok();
+
     for pulled in pulled_messages {
+        if let (Some(identity), Some(seed)) = (identity.as_ref(), author_signing_seed.as_ref()) {
+            match process_incoming_media_message(
+                &pulled,
+                chat,
+                contacts,
+                ttl_seconds_max,
+                &identity.wayfarer_id,
+                seed,
+            ) {
+                Ok(MediaMessageProcess::NotMedia) => {}
+                Ok(MediaMessageProcess::HandledSuppressed) => {
+                    continue;
+                }
+                Ok(MediaMessageProcess::HandledManifest) => {
+                    continue;
+                }
+                Err(err) => {
+                    log_verbose(&format!(
+                        "media_message_process_failed: item_id={} error={}",
+                        pulled.item_id, err
+                    ));
+                    continue;
+                }
+            }
+        }
+
         let sender_label = resolve_contact_id_for_preview(&pulled);
         let sender_alias = resolve_contact_alias_for_preview(&pulled);
         if let Some(receipt_manifest) = extract_receipt_manifest_id(&pulled.text) {
-            apply_delivery_receipt(chat, &sender_label, &receipt_manifest, pulled.received_at_unix);
+            apply_delivery_receipt(
+                chat,
+                &sender_label,
+                &receipt_manifest,
+                pulled.received_at_unix,
+            );
             continue;
         }
 
@@ -2047,14 +2371,13 @@ fn merge_pulled_messages(
             continue;
         }
 
-        let message_unix_ms =
-            extract_sent_at_unix_ms_if_json(&pulled.text).unwrap_or_else(|| {
-                if pulled.received_at_unix > 1_000_000_000_000 {
-                    pulled.received_at_unix as u64
-                } else {
-                    (pulled.received_at_unix.max(0) as u64).saturating_mul(1000)
-                }
-            });
+        let message_unix_ms = extract_sent_at_unix_ms_if_json(&pulled.text).unwrap_or_else(|| {
+            if pulled.received_at_unix > 1_000_000_000_000 {
+                pulled.received_at_unix as u64
+            } else {
+                (pulled.received_at_unix.max(0) as u64).saturating_mul(1000)
+            }
+        });
         let message_unix = (message_unix_ms / 1000) as i64;
         thread.push(ChatMessage {
             msg_id: pulled.item_id,
@@ -2070,7 +2393,9 @@ fn merge_pulled_messages(
             expires_at_unix_ms: None,
             last_sync_attempt_unix_ms: None,
             last_sync_error: None,
-            attachment: extract_attachment_if_json(&pulled.text),
+            attachment: extract_attachment_if_json(&pulled.text)
+                .map(sanitize_attachment_for_chat_history),
+            media: None,
         });
         sort_thread_messages(thread);
 
@@ -2083,7 +2408,9 @@ fn merge_pulled_messages(
     normalize_chat_state(chat);
 }
 
-fn resolve_contact_id_for_preview(pulled: &crate::relay::client::EncounterMessagePreview) -> String {
+fn resolve_contact_id_for_preview(
+    pulled: &crate::relay::client::EncounterMessagePreview,
+) -> String {
     if let Some(author) = pulled.author_wayfarer_id.as_ref() {
         if is_valid_wayfarer_id(author) {
             return author.clone();
@@ -2093,7 +2420,9 @@ fn resolve_contact_id_for_preview(pulled: &crate::relay::client::EncounterMessag
     "unknown-peer".to_string()
 }
 
-fn resolve_contact_alias_for_preview(pulled: &crate::relay::client::EncounterMessagePreview) -> String {
+fn resolve_contact_alias_for_preview(
+    pulled: &crate::relay::client::EncounterMessagePreview,
+) -> String {
     if let Some(author) = pulled.author_wayfarer_id.as_ref() {
         if is_valid_wayfarer_id(author) {
             return author.clone();
@@ -2156,14 +2485,15 @@ fn latest_message_for_contact(
 }
 
 fn extract_chat_text_if_json(input: &str) -> String {
+    if is_media_wire_message(input) {
+        return String::new();
+    }
+
     let Ok(value) = serde_json::from_str::<serde_json::Value>(input) else {
         return input.to_string();
     };
 
-    if let Some(text) = value
-        .get("text")
-        .and_then(|v| v.as_str())
-    {
+    if let Some(text) = value.get("text").and_then(|v| v.as_str()) {
         if !text.is_empty() {
             return text.to_string();
         }
@@ -2228,6 +2558,33 @@ fn extract_attachment_if_json(input: &str) -> Option<ChatAttachment> {
     })
 }
 
+fn sanitize_attachment_for_chat_history(mut attachment: ChatAttachment) -> ChatAttachment {
+    attachment.file_name = sanitize_download_file_name(&attachment.file_name, "aethos-attachment");
+    attachment.content_b64 = None;
+    attachment
+}
+
+fn sanitize_download_file_name(input: &str, fallback: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return fallback.to_string();
+    }
+    let mut out = String::with_capacity(trimmed.len());
+    for ch in trimmed.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    let collapsed = out.trim_matches('.').trim_matches('_').trim();
+    if collapsed.is_empty() {
+        fallback.to_string()
+    } else {
+        collapsed.chars().take(180).collect()
+    }
+}
+
 fn build_outbound_chat_payload(
     text: &str,
     client_msg_id: &str,
@@ -2262,16 +2619,24 @@ fn validate_send_attachment(attachment: &SendAttachmentRequest) -> Result<ChatAt
         return Err("attachment cannot be empty".to_string());
     }
 
-    if attachment.size_bytes > MAX_ATTACHMENT_BYTES {
+    let is_media_candidate = attachment
+        .mime_type
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("image/");
+    let max_allowed_bytes = if is_media_candidate {
+        media_max_object_bytes()
+    } else {
+        MAX_INLINE_ATTACHMENT_BYTES
+    };
+    if attachment.size_bytes > max_allowed_bytes {
         return Err(format!(
             "attachment too large; max {} bytes",
-            MAX_ATTACHMENT_BYTES
+            max_allowed_bytes
         ));
     }
 
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(attachment.content_b64.trim())
-        .map_err(|_| "attachment base64 content is invalid".to_string())?;
+    let decoded = read_attachment_bytes(attachment)?;
     if decoded.len() as u64 != attachment.size_bytes {
         return Err("attachment size mismatch".to_string());
     }
@@ -2280,8 +2645,18 @@ fn validate_send_attachment(attachment: &SendAttachmentRequest) -> Result<ChatAt
         file_name: file_name.to_string(),
         mime_type: attachment.mime_type.trim().to_string(),
         size_bytes: attachment.size_bytes,
-        content_b64: Some(attachment.content_b64.trim().to_string()),
+        content_b64: Some(base64::engine::general_purpose::STANDARD.encode(decoded)),
     })
+}
+
+fn read_attachment_bytes(attachment: &SendAttachmentRequest) -> Result<Vec<u8>, String> {
+    if let Some(content_b64) = attachment.content_b64.as_ref() {
+        return base64::engine::general_purpose::STANDARD
+            .decode(content_b64.trim())
+            .map_err(|_| "attachment base64 content is invalid".to_string());
+    }
+
+    Err("attachment must include contentB64".to_string())
 }
 
 fn emit_chat_snapshot_event() -> Result<(), String> {
@@ -2301,7 +2676,9 @@ fn emit_chat_snapshot_event() -> Result<(), String> {
 
 fn emit_chat_snapshot_event_best_effort(context: &str) {
     if let Err(err) = emit_chat_snapshot_event() {
-        log_verbose(&format!("chat_snapshot_emit_failed context={context}: {err}"));
+        log_verbose(&format!(
+            "chat_snapshot_emit_failed context={context}: {err}"
+        ));
     }
 }
 
@@ -2323,7 +2700,9 @@ fn emit_sound_event(kind: &str) -> Result<(), String> {
 fn emit_sound_event_best_effort(kind: &str, context: &str) {
     match emit_sound_event(kind) {
         Ok(()) => log_verbose(&format!("sound_played: {kind}")),
-        Err(err) => log_verbose(&format!("sound_emit_failed context={context} kind={kind}: {err}")),
+        Err(err) => log_verbose(&format!(
+            "sound_emit_failed context={context} kind={kind}: {err}"
+        )),
     }
 }
 
@@ -2332,7 +2711,11 @@ fn extract_receipt_manifest_id(input: &str) -> Option<String> {
     let candidate = value
         .get("receipt_manifest_id")
         .and_then(|item| item.as_str())
-        .or_else(|| value.get("receiptManifestId").and_then(|item| item.as_str()))
+        .or_else(|| {
+            value
+                .get("receiptManifestId")
+                .and_then(|item| item.as_str())
+        })
         .or_else(|| value.get("manifest_id_hex").and_then(|item| item.as_str()))
         .or_else(|| value.get("manifestIdHex").and_then(|item| item.as_str()))?;
 
@@ -2578,6 +2961,178 @@ fn draw_line(img: &mut RgbaImage, mut x0: i32, mut y0: i32, x1: i32, y1: i32, co
     }
 }
 
+fn sanitize_seed_for_file(seed: &str) -> String {
+    let mut out = String::with_capacity(seed.len());
+    for ch in seed.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if ch == '-' || ch == '_' {
+            out.push(ch);
+        }
+    }
+    if out.is_empty() {
+        "seed".to_string()
+    } else {
+        out.chars().take(48).collect()
+    }
+}
+
+fn deterministic_byte(seed: &[u8], x: u32, y: u32, channel: u8) -> u8 {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(seed);
+    hasher.update(x.to_le_bytes());
+    hasher.update(y.to_le_bytes());
+    hasher.update([channel]);
+    let digest = hasher.finalize();
+    digest[0]
+}
+
+fn generate_aethos_e2e_png(seed: &str, width: u32, height: u32) -> Result<Vec<u8>, String> {
+    let seed_bytes = sha2::Sha256::digest(seed.as_bytes());
+    let mut image = RgbaImage::new(width, height);
+
+    let palette = [
+        [12u8, 21u8, 48u8],
+        [34u8, 77u8, 180u8],
+        [18u8, 139u8, 188u8],
+        [137u8, 88u8, 212u8],
+        [222u8, 241u8, 255u8],
+    ];
+
+    for y in 0..height {
+        for x in 0..width {
+            let t = deterministic_byte(&seed_bytes, x, y, 0) as usize;
+            let base = palette[t % palette.len()];
+            let noise = deterministic_byte(&seed_bytes, x, y, 1);
+            let glow = ((x as f32 / width as f32) * 255.0) as u8;
+            let r = base[0].saturating_add(noise / 3).saturating_add(glow / 6);
+            let g = base[1].saturating_add(noise / 4).saturating_add(glow / 8);
+            let b = base[2].saturating_add(noise / 5).saturating_add(glow / 10);
+            image.put_pixel(x, y, Rgba([r, g, b, 255]));
+        }
+    }
+
+    let title = format!(
+        "AETHOS {}",
+        sanitize_seed_for_file(seed).to_ascii_uppercase()
+    );
+    draw_seeded_caption(&mut image, &seed_bytes, &title);
+
+    let mut encoded = Vec::new();
+    {
+        let dyn_image = image::DynamicImage::ImageRgba8(image);
+        let mut cursor = std::io::Cursor::new(&mut encoded);
+        dyn_image
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .map_err(|err| format!("failed encoding e2e png: {err}"))?;
+    }
+    Ok(encoded)
+}
+
+fn draw_seeded_caption(image: &mut RgbaImage, seed: &[u8], caption: &str) {
+    let scale = (image.width().min(image.height()) / 256).max(2);
+    let mut cursor_x = (image.width() / 12).max(6);
+    let base_y = image.height().saturating_sub((12 * scale).max(16));
+
+    for (idx, ch) in caption.chars().enumerate() {
+        let glyph = glyph_5x7(ch);
+        let jitter = (seed[idx % seed.len()] % 5) as i32 - 2;
+        for row in 0..7u32 {
+            for col in 0..5u32 {
+                if (glyph[row as usize] >> (4 - col)) & 1 == 0 {
+                    continue;
+                }
+                for oy in 0..scale {
+                    for ox in 0..scale {
+                        let px = cursor_x as i32 + (col * scale + ox) as i32 + jitter;
+                        let py = base_y as i32 + (row * scale + oy) as i32;
+                        if px < 0
+                            || py < 0
+                            || px as u32 >= image.width()
+                            || py as u32 >= image.height()
+                        {
+                            continue;
+                        }
+                        image.put_pixel(px as u32, py as u32, Rgba([233, 246, 255, 255]));
+                    }
+                }
+            }
+        }
+        cursor_x = cursor_x.saturating_add(6 * scale);
+        if cursor_x >= image.width().saturating_sub(6 * scale) {
+            break;
+        }
+    }
+}
+
+fn glyph_5x7(ch: char) -> [u8; 7] {
+    match ch {
+        'A' => [
+            0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+        ],
+        'B' => [
+            0b11110, 0b10001, 0b11110, 0b10001, 0b10001, 0b10001, 0b11110,
+        ],
+        'C' => [
+            0b01111, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b01111,
+        ],
+        'D' => [
+            0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110,
+        ],
+        'E' => [
+            0b11111, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000, 0b11111,
+        ],
+        'H' => [
+            0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+        ],
+        'O' => [
+            0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+        ],
+        'S' => [
+            0b01111, 0b10000, 0b01110, 0b00001, 0b00001, 0b10001, 0b01110,
+        ],
+        'T' => [
+            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
+        ],
+        '0' => [
+            0b01110, 0b10011, 0b10101, 0b11001, 0b10001, 0b10001, 0b01110,
+        ],
+        '1' => [
+            0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+        ],
+        '2' => [
+            0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111,
+        ],
+        '3' => [
+            0b11110, 0b00001, 0b00110, 0b00001, 0b00001, 0b10001, 0b01110,
+        ],
+        '4' => [
+            0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010,
+        ],
+        '5' => [
+            0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110,
+        ],
+        '6' => [
+            0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110,
+        ],
+        '7' => [
+            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000,
+        ],
+        '8' => [
+            0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110,
+        ],
+        '9' => [
+            0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b11100,
+        ],
+        '-' => [0, 0, 0, 0b11111, 0, 0, 0],
+        '_' => [0, 0, 0, 0, 0, 0, 0b11111],
+        ' ' => [0, 0, 0, 0, 0, 0, 0],
+        _ => [
+            0b11111, 0b00001, 0b00110, 0b00100, 0b00000, 0b00100, 0b00100,
+        ],
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -2592,6 +3147,10 @@ pub fn run() {
             clear_app_log,
             bootstrap_state,
             chat_snapshot,
+            load_completed_media,
+            get_completed_media_path,
+            open_completed_media_in_system_viewer,
+            generate_e2e_large_image,
             rotate_wayfarer_id,
             reset_wayfarer_id,
             update_settings,
@@ -2669,11 +3228,32 @@ fn apply_cli_state_overrides() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app_state::shared_test_env_lock;
     use std::collections::BTreeMap;
     use std::net::{SocketAddr, TcpListener};
-    use std::sync::Mutex;
 
-    static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(original) = self.original.take() {
+                std::env::set_var(self.key, original);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     fn maybe_relay_target() -> Option<String> {
         std::env::var("AETHOS_RELAY_TEST_HTTP")
@@ -2753,7 +3333,8 @@ mod tests {
             preview_cursor: None,
         };
 
-        let request = build_request_from_summary(&summary, 256).expect("build request from summary");
+        let request =
+            build_request_from_summary(&summary, 256).expect("build request from summary");
         match request {
             GossipSyncFrame::Request(request) => {
                 assert!(request.want.is_empty());
@@ -2764,9 +3345,12 @@ mod tests {
 
     #[test]
     fn populated_summary_produces_request_with_want_items() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("aethos-tauri-test-summary-{}", rand::random::<u64>()));
-        std::env::set_var("AETHOS_STATE_DIR", &temp_dir);
+        let _lock = shared_test_env_lock().lock().expect("lock");
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aethos-tauri-test-summary-{}",
+            rand::random::<u64>()
+        ));
+        let _guard = EnvVarGuard::set("AETHOS_STATE_DIR", &temp_dir.display().to_string());
 
         let wanted_item =
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
@@ -2779,7 +3363,8 @@ mod tests {
             preview_cursor: None,
         };
 
-        let request = build_request_from_summary(&summary, 256).expect("build request from summary");
+        let request =
+            build_request_from_summary(&summary, 256).expect("build request from summary");
         match request {
             GossipSyncFrame::Request(request) => {
                 assert!(request.want.iter().any(|item| item == &wanted_item));
@@ -2796,8 +3381,7 @@ mod tests {
             author_wayfarer_id: None,
             session_peer: None,
             transport_peer: None,
-            item_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                .to_string(),
+            item_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
             text: "hello from unresolved sender".to_string(),
             received_at_unix: 1,
             manifest_id_hex: None,
@@ -2842,7 +3426,10 @@ mod tests {
     #[test]
     fn outbound_chat_payload_exposes_sent_at_for_thread_sorting() {
         let payload = build_outbound_chat_payload("hello", "local-123", 1700000000123, None);
-        assert_eq!(extract_sent_at_unix_ms_if_json(&payload), Some(1_700_000_000_123));
+        assert_eq!(
+            extract_sent_at_unix_ms_if_json(&payload),
+            Some(1_700_000_000_123)
+        );
     }
 
     #[test]
@@ -2944,7 +3531,10 @@ mod tests {
         match decoded {
             GossipSyncFrame::Summary(summary) => {
                 assert_eq!(summary.item_count, 0);
-                assert_eq!(summary.bloom_filter.len(), crate::aethos_core::gossip_sync::BLOOM_FILTER_BYTES);
+                assert_eq!(
+                    summary.bloom_filter.len(),
+                    crate::aethos_core::gossip_sync::BLOOM_FILTER_BYTES
+                );
             }
             other => panic!("expected SUMMARY, got {other:?}"),
         }
@@ -2964,7 +3554,9 @@ mod tests {
 
     #[test]
     fn udp_fallback_serves_transfer_for_requested_item() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _lock = shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let temp_dir = std::env::temp_dir().join(format!(
             "aethos-tauri-test-udp-fallback-{}",
             rand::random::<u64>()
@@ -2995,11 +3587,16 @@ mod tests {
         });
 
         let mut buf = [0u8; 65_535];
-        let (len, _) = receiver.recv_from(&mut buf).expect("receive transfer datagram");
+        let (len, _) = receiver
+            .recv_from(&mut buf)
+            .expect("receive transfer datagram");
         let frame = parse_gossip_frame(&buf[..len]).expect("parse transfer frame");
         match frame {
             GossipSyncFrame::Transfer(transfer) => {
-                assert!(transfer.objects.iter().any(|object| object.item_id == item_id));
+                assert!(transfer
+                    .objects
+                    .iter()
+                    .any(|object| object.item_id == item_id));
             }
             other => panic!("expected TRANSFER, got {other:?}"),
         }
@@ -3012,11 +3609,15 @@ mod tests {
             .decode(&identity.verifying_key_b64)
             .expect("decode pubkey");
         let node_pubkey = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(node_pubkey_raw);
-        let frame = build_lan_hello_frame(&identity.wayfarer_id, &node_pubkey).expect("build hello");
+        let frame =
+            build_lan_hello_frame(&identity.wayfarer_id, &node_pubkey).expect("build hello");
 
         match frame {
             GossipSyncFrame::Hello(hello) => {
-                assert!(hello.capabilities.iter().any(|capability| capability == LAN_TCP_CAPABILITY));
+                assert!(hello
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == LAN_TCP_CAPABILITY));
             }
             other => panic!("expected HELLO, got {other:?}"),
         }
@@ -3024,7 +3625,9 @@ mod tests {
 
     #[test]
     fn local_dual_state_dirs_have_distinct_wayfarer_ids() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _lock = shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let base = std::env::temp_dir();
         let dir_a = base.join(format!("aethos-local-suite-a-{}", rand::random::<u64>()));
         let dir_b = base.join(format!("aethos-local-suite-b-{}", rand::random::<u64>()));
@@ -3041,7 +3644,9 @@ mod tests {
 
     #[test]
     fn local_dual_state_dirs_can_exchange_messages_via_reconciliation_suite() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _lock = shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let base = std::env::temp_dir();
         let dir_a = base.join(format!("aethos-local-suite-a-{}", rand::random::<u64>()));
         let dir_b = base.join(format!("aethos-local-suite-b-{}", rand::random::<u64>()));
@@ -3065,10 +3670,9 @@ mod tests {
                     &seed,
                 )
                 .expect("build payload a->b");
-                let envelope_bytes =
-                    base64::engine::general_purpose::URL_SAFE_NO_PAD
-                        .decode(&payload)
-                        .expect("decode envelope bytes");
+                let envelope_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(&payload)
+                    .expect("decode envelope bytes");
                 let digest = sha2::Sha256::digest(&envelope_bytes);
                 let item_id = digest
                     .iter()

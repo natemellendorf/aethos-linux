@@ -1,0 +1,16 @@
+{
+  "id": "large-media-withhold-chunk",
+  "description": "Deterministic large media transfer with one withheld sender chunk",
+  "relay": {
+    "toxiproxy": {
+      "enabled": false,
+      "toxics": []
+    }
+  },
+  "peer": {
+    "netem": {
+      "enabled": false,
+      "commands": []
+    }
+  }
+}

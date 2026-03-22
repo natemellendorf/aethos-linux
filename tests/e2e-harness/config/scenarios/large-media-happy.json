@@ -1,0 +1,16 @@
+{
+  "id": "large-media-happy",
+  "description": "Deterministic large media transfer baseline without fault injection",
+  "relay": {
+    "toxiproxy": {
+      "enabled": false,
+      "toxics": []
+    }
+  },
+  "peer": {
+    "netem": {
+      "enabled": false,
+      "commands": []
+    }
+  }
+}

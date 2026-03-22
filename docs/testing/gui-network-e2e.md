@@ -12,6 +12,8 @@ This harness extends the Tauri desktop E2E flow into an agent-operable multi-nod
   - launches two isolated desktop app instances
   - drives real UI interactions via WebDriver + `tauri-driver`
   - writes machine-readable artifacts on pass/fail
+- `spikes/tauri-desktop/e2e/scripts/generate-aethos-large-png.mjs`
+  - canonical deterministic large-media generator used by harness scenarios
 - `tests/e2e-harness/config/scenarios/*.json`
   - named fault scenarios (`clean`, `slow-relay`, `relay-partition`, `lossy-peer`, `split-brain-window`, `reconnect-storm`)
 - `scripts/e2e/*`
@@ -49,6 +51,24 @@ AETHOS_E2E_TOXIPROXY_URL=http://127.0.0.1:8474 \
 AETHOS_E2E_RELAY_ENDPOINT=http://127.0.0.1:19082 \
 bash scripts/e2e/run-scenario.sh --scenario relay-partition --mode relay
 ```
+
+Direct desktop E2E run (without compose):
+
+```bash
+# one-time
+cargo install tauri-driver --locked
+npm --prefix spikes/tauri-desktop/e2e install
+
+# each run (auto-preflight for WebKitWebDriver on Linux apt-based systems)
+npm --prefix spikes/tauri-desktop run e2e
+```
+
+Preflight behavior for `npm --prefix spikes/tauri-desktop run e2e`:
+- sets `AETHOS_E2E=1` and runs an E2E-only preflight before tests
+- ensures `tauri-driver` is installed (via `cargo install tauri-driver --locked` when missing)
+- if `WebKitWebDriver` is missing on Linux + apt-get systems, installs `webkit2gtk-driver`
+- opt out of tauri-driver auto-install with `AETHOS_E2E_AUTO_INSTALL_TAURI_DRIVER=0`
+- opt out of auto-install with `AETHOS_E2E_AUTO_INSTALL_WEBKIT_DRIVER=0`
 
 Mode behavior (deterministic env mapping):
 - `peer`: relay disabled, loopback-only LAN gossip enabled
@@ -109,5 +129,7 @@ Fields:
 ## Notes
 
 - This bead is Linux-first and optimized for deterministic automation + artifacts.
+- The current desktop E2E lane does **not** use Playwright test APIs; it uses Selenium WebDriver + `tauri-driver` against Tauri `wry` (WebKit on Linux), which is why `WebKitWebDriver` is required.
 - WebDriver lane uses `tauri-driver` and `WebKitWebDriver`.
 - Current relay container is mock relay scaffolding to keep local execution deterministic.
+- `generate_e2e_large_image` (Rust Tauri command) remains available as a backend-side alternative utility; harness automation uses the Node generator above as source-of-truth.

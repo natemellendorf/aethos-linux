@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -46,6 +48,33 @@ pub struct ChatAttachment {
     pub content_b64: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaTransferStatus {
+    Pending,
+    Receiving,
+    Complete,
+    Failed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatMediaTransfer {
+    pub transfer_id: String,
+    pub object_sha256_hex: String,
+    pub file_name: String,
+    pub mime_type: String,
+    pub total_bytes: u64,
+    pub chunk_count: u32,
+    pub received_chunks: u32,
+    pub received_bytes: u64,
+    pub status: MediaTransferStatus,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub expires_at_unix_ms: Option<u64>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatMessage {
@@ -82,6 +111,8 @@ pub struct ChatMessage {
     pub last_sync_error: Option<String>,
     #[serde(default)]
     pub attachment: Option<ChatAttachment>,
+    #[serde(default)]
+    pub media: Option<ChatMediaTransfer>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -241,7 +272,11 @@ pub fn save_app_settings(settings: &AppSettings) -> Result<AppSettings, String> 
 
 fn atomic_write_string(path: &Path, serialized: &str) -> Result<(), String> {
     ensure_parent_dir(path)?;
-    let temp_path = path.with_extension(format!("tmp-{}", now_unix_ms()));
+    let temp_path = path.with_extension(format!(
+        "tmp-{}-{:016x}",
+        now_unix_ms(),
+        rand::random::<u64>()
+    ));
     fs::write(&temp_path, serialized)
         .map_err(|err| format!("failed writing temp file at {}: {err}", temp_path.display()))?;
     fs::rename(&temp_path, path).map_err(|err| {
@@ -349,11 +384,14 @@ pub fn now_unix_secs() -> i64 {
 }
 
 #[cfg(test)]
+pub fn shared_test_env_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct EnvVarGuard {
         key: &'static str,
@@ -384,7 +422,7 @@ mod tests {
 
     #[test]
     fn load_app_settings_recovers_from_empty_file() {
-        let _lock = TEST_ENV_LOCK.lock().expect("lock");
+        let _lock = shared_test_env_lock().lock().expect("lock");
         let state_dir = unique_state_dir("aethos-settings-empty");
         let _guard = EnvVarGuard::set("AETHOS_STATE_DIR", &state_dir);
         fs::create_dir_all(&state_dir).expect("mkdir");
@@ -403,7 +441,7 @@ mod tests {
 
     #[test]
     fn load_chat_state_recovers_from_empty_file() {
-        let _lock = TEST_ENV_LOCK.lock().expect("lock");
+        let _lock = shared_test_env_lock().lock().expect("lock");
         let state_dir = unique_state_dir("aethos-chat-empty");
         let _guard = EnvVarGuard::set("AETHOS_STATE_DIR", &state_dir);
         fs::create_dir_all(&state_dir).expect("mkdir");

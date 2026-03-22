@@ -3,12 +3,14 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "preflight": "node scripts/preflight.mjs",
     "doctor": "node scripts/doctor.mjs",
-    "test": "npm run doctor && mocha --timeout 1200000 \"test/**/*.mjs\""
+    "test": "npm run preflight && npm run doctor && mocha --timeout 1200000 \"test/**/*.mjs\""
   },
   "dependencies": {
     "chai": "^5.2.1",
     "mocha": "^11.7.4",
+    "pngjs": "^7.0.0",
     "selenium-webdriver": "^4.34.0"
   }
 }

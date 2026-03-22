@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
@@ -48,6 +48,7 @@ const RELEASES_LATEST_URL = "https://api.github.com/repos/natemellendorf/aethos-
 const DEFAULT_RELAY_ENDPOINT = "wss://aethos-relay.network";
 const DONATE_CRYPTO_ADDRESS = "0x114227a8B460E462f408F138a929660531790ee3";
 const DONATE_PAYPAL_URL = "https://www.paypal.com/donate/?hosted_button_id=TPTTR6TRKBYKS";
+const MEDIA_PREVIEW_GATE_BYTES = 5 * 1024 * 1024;
 
 function tinyId(id = "") {
   if (!id) return "-";
@@ -125,12 +126,12 @@ function createOptimisticOutgoingMessage(localId, text) {
 function createOptimisticOutgoingMessageWithAttachment(localId, text, attachment) {
   return {
     ...createOptimisticOutgoingMessage(localId, text),
-    attachment: attachment
+            attachment: attachment
       ? {
           fileName: attachment.fileName,
           mimeType: attachment.mimeType,
           sizeBytes: attachment.sizeBytes,
-          contentB64: attachment.contentB64
+          contentB64: null
         }
       : null
   };
@@ -162,6 +163,37 @@ async function readFileAsBase64(file) {
     binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
   }
   return btoa(binary);
+}
+
+function sanitizeDownloadFileName(input, fallback = "aethos-file") {
+  const raw = String(input || "").trim();
+  if (!raw) return fallback;
+  const cleaned = raw
+    .replace(/[\\/]/g, "_")
+    .replace(/[^a-zA-Z0-9._-]/g, "_")
+    .replace(/^[_\.]+|[_\.]+$/g, "")
+    .slice(0, 180);
+  return cleaned || fallback;
+}
+
+function mediaStateKey(message) {
+  const transferId = message?.media?.transferId;
+  const objectSha = message?.media?.objectSha256Hex;
+  if (transferId) return `transfer:${transferId}`;
+  if (objectSha) return `object:${objectSha}`;
+  return null;
+}
+
+function mediaStatus(media) {
+  return String(media?.status || "").trim().toLowerCase();
+}
+
+function mediaProgressPercent(media) {
+  const total = Number(media?.totalBytes || 0);
+  const got = Number(media?.receivedBytes || 0);
+  if (!Number.isFinite(total) || total <= 0) return 0;
+  if (!Number.isFinite(got) || got <= 0) return 0;
+  return Math.max(0, Math.min(100, Math.round((got / total) * 100)));
 }
 
 function parseSemverLike(value = "") {
@@ -228,6 +260,9 @@ export default function App() {
   const [diagnostics, setDiagnostics] = useState(null);
   const [composer, setComposer] = useState("");
   const [composerAttachment, setComposerAttachment] = useState(null);
+  const [loadingMediaByKey, setLoadingMediaByKey] = useState({});
+  const [resolvedMediaByKey, setResolvedMediaByKey] = useState({});
+  const [previewImageByKey, setPreviewImageByKey] = useState({});
   const [contactDraft, setContactDraft] = useState({ wayfarerId: "", alias: "" });
   const [showSplash, setShowSplash] = useState(true);
   const [splashFade, setSplashFade] = useState(false);
@@ -494,6 +529,34 @@ export default function App() {
   }, [tab, selectedContactId, selectedThread.length]);
 
   useEffect(() => {
+    const existingKeys = new Set(selectedThread.map((message) => mediaStateKey(message)).filter(Boolean));
+    setPreviewImageByKey((prev) => {
+      let changed = false;
+      const next = {};
+      Object.entries(prev).forEach(([key, value]) => {
+        if (existingKeys.has(key)) {
+          next[key] = value;
+        } else {
+          changed = true;
+        }
+      });
+      return changed ? next : prev;
+    });
+    setResolvedMediaByKey((prev) => {
+      let changed = false;
+      const next = {};
+      Object.entries(prev).forEach(([key, value]) => {
+        if (existingKeys.has(key)) {
+          next[key] = value;
+        } else {
+          changed = true;
+        }
+      });
+      return changed ? next : prev;
+    });
+  }, [selectedThread]);
+
+  useEffect(() => {
     const timer = setInterval(async () => {
       try {
         const [gossip, relay] = await Promise.all([invoke("gossip_status"), invoke("relay_health_status")]);
@@ -678,8 +741,10 @@ export default function App() {
     event.target.value = "";
     if (!file) return;
 
-    if (file.size > 2 * 1024 * 1024) {
-      setStatus("Attachment too large (max 2 MB)");
+    const isImage = String(file.type || "").toLowerCase().startsWith("image/");
+    const maxBytes = isImage ? 128 * 1024 * 1024 : 2 * 1024 * 1024;
+    if (file.size > maxBytes) {
+      setStatus(`Attachment too large (max ${isImage ? "128 MB" : "2 MB"})`);
       soundManager.play("error");
       return;
     }
@@ -702,6 +767,75 @@ export default function App() {
   const clearAttachment = () => {
     setComposerAttachment(null);
   };
+
+  const resolveMediaForMessage = useCallback(async (message) => {
+    const key = mediaStateKey(message);
+    const objectSha = String(message?.media?.objectSha256Hex || "").trim();
+    if (!key || !objectSha) return null;
+    if (resolvedMediaByKey[key]) return resolvedMediaByKey[key];
+    if (loadingMediaByKey[key]) return null;
+
+    setLoadingMediaByKey((prev) => ({ ...prev, [key]: true }));
+    try {
+      const payload = await invoke("get_completed_media_path", { request: { objectSha256Hex: objectSha } });
+      const resolved = {
+        objectSha256Hex: objectSha,
+        fileName: String(message?.media?.fileName || message?.attachment?.fileName || "aethos-media"),
+        mimeType: String(payload?.mime || message?.media?.mimeType || "application/octet-stream"),
+        sizeBytes: Number(payload?.sizeBytes || message?.media?.totalBytes || 0),
+        path: String(payload?.path || "").trim()
+      };
+      if (!resolved.path) {
+        throw new Error("completed media path missing");
+      }
+      setResolvedMediaByKey((prev) => ({ ...prev, [key]: resolved }));
+      return resolved;
+    } catch (error) {
+      setStatus(`Failed to load media: ${String(error)}`);
+      soundManager.play("error");
+      return null;
+    } finally {
+      setLoadingMediaByKey((prev) => {
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      });
+    }
+  }, [loadingMediaByKey, resolvedMediaByKey]);
+
+  const loadMediaForMessage = useCallback(async (message) => {
+    const key = mediaStateKey(message);
+    if (!key) return;
+    const resolved = await resolveMediaForMessage(message);
+    if (!resolved) return;
+    const mime = String(resolved.mimeType || "").toLowerCase();
+    if (!mime.startsWith("image/")) return;
+    const src = convertFileSrc(resolved.path);
+    setPreviewImageByKey((prev) => ({ ...prev, [key]: src }));
+  }, [resolveMediaForMessage]);
+
+  const downloadResolvedMedia = useCallback(async (message) => {
+    const resolved = await resolveMediaForMessage(message);
+    if (!resolved) return;
+    const href = convertFileSrc(resolved.path);
+    const link = document.createElement("a");
+    link.href = href;
+    link.download = sanitizeDownloadFileName(resolved.fileName || message?.attachment?.fileName || "", "aethos-media");
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  }, [resolveMediaForMessage]);
+
+  const openMediaInSystemViewer = useCallback(async (message) => {
+    const objectSha = String(message?.media?.objectSha256Hex || "").trim();
+    if (!objectSha) return;
+    try {
+      await invoke("open_completed_media_in_system_viewer", { request: { objectSha256Hex: objectSha } });
+    } catch (error) {
+      setStatus(`Failed to open media: ${String(error)}`);
+      soundManager.play("error");
+    }
+  }, []);
 
   const copyDonateAddress = async () => {
     try {
@@ -1081,9 +1215,106 @@ export default function App() {
               <CardContent className="flex min-h-0 flex-1 flex-col p-3 pt-1">
                 <div ref={threadContainerRef} className="mb-1.5 min-h-0 flex-1 space-y-2 overflow-auto rounded-lg border border-border/60 bg-background/40 p-2.5">
                   {selectedThread.length === 0 ? <p className="text-sm text-muted-foreground">No messages in this thread yet.</p> : selectedThread.map((m) => (
-                    <div data-testid={`message-${m.msgId}`} key={m.msgId} className={cn("message-bubble max-w-[85%] rounded-xl px-3 py-2 text-sm", m.direction === "Incoming" ? "message-bubble-incoming" : "message-bubble-outgoing ml-auto", arrivingMessageIds[m.msgId] ? "message-arrive" : "") }>
+                    <div
+                      data-testid={`message-${m.msgId}`}
+                      key={m.msgId}
+                      className={cn("message-bubble max-w-[85%] rounded-xl px-3 py-2 text-sm", m.direction === "Incoming" ? "message-bubble-incoming" : "message-bubble-outgoing ml-auto", arrivingMessageIds[m.msgId] ? "message-arrive" : "") }
+                    >
                       {m.text ? <p>{m.text}</p> : null}
-                      {m.attachment ? (
+                      {m.media ? (
+                        <div className="mt-1.5 rounded-md border border-blue-300/30 bg-slate-900/40 p-2 text-xs" data-testid={`media-manifest-${m.media.transferId || m.msgId}`}>
+                          <p className="truncate font-semibold">{m.media.fileName || m.attachment?.fileName || "image"}</p>
+                          <p className="text-cyan-100/80">{formatBytes(m.media.totalBytes || 0)} · {m.media.mimeType || "image"}</p>
+                          <p className="text-cyan-100/80" data-testid={`media-progress-${m.media.transferId || m.msgId}`}>
+                            {mediaStatus(m.media) === "complete"
+                              ? "Transfer complete"
+                              : mediaStatus(m.media) === "failed"
+                                ? `Transfer failed${m.media.error ? `: ${m.media.error}` : ""}`
+                                : `Receiving ${mediaProgressPercent(m.media)}% (${m.media.receivedChunks || 0}/${m.media.chunkCount || 0} chunks)`}
+                          </p>
+                          <div className="mt-1 h-1.5 w-full overflow-hidden rounded bg-slate-800/80">
+                            <div
+                              className={cn("h-full transition-all duration-300", mediaStatus(m.media) === "failed" ? "bg-red-500" : "bg-cyan-400")}
+                              style={{ width: `${mediaProgressPercent(m.media)}%` }}
+                            />
+                          </div>
+
+                          {(() => {
+                            const key = mediaStateKey(m);
+                            const status = mediaStatus(m.media);
+                            const resolved = key ? resolvedMediaByKey[key] : null;
+                            const preview = key ? previewImageByKey[key] : null;
+                            const loading = key ? loadingMediaByKey[key] : false;
+                            const mime = String(resolved?.mimeType || m.media?.mimeType || "").toLowerCase();
+                            const isImage = mime.startsWith("image/");
+                            const sizeBytes = Number(resolved?.sizeBytes || m.media?.totalBytes || 0);
+                            const requiresClickToPreview = isImage && sizeBytes > MEDIA_PREVIEW_GATE_BYTES;
+                            if (status !== "complete") {
+                              return (
+                                <p className="mt-1 text-cyan-100/70" data-testid={`media-placeholder-${m.media.transferId || m.msgId}`}>
+                                  Waiting for all chunks and hash verification before rendering image.
+                                </p>
+                              );
+                            }
+                            return (
+                              <div className="mt-1">
+                                {isImage ? (
+                                  <>
+                                    {!preview ? (
+                                      <Button
+                                        variant="ghost"
+                                        size="sm"
+                                        className="mt-1 h-7 px-2"
+                                        data-testid={`media-load-${m.media.transferId || m.msgId}`}
+                                        disabled={loading}
+                                        onClick={() => loadMediaForMessage(m)}
+                                      >
+                                        {loading
+                                          ? "Resolving preview..."
+                                          : requiresClickToPreview
+                                            ? "Click to load preview"
+                                            : "Load Image"}
+                                      </Button>
+                                    ) : null}
+                                    {requiresClickToPreview && !preview ? (
+                                      <p className="mt-1 text-cyan-100/70">
+                                        Large image preview is opt-in to keep memory usage low.
+                                      </p>
+                                    ) : null}
+                                  </>
+                                ) : null}
+                                {preview ? (
+                                  <img
+                                    src={preview}
+                                    alt={resolved?.fileName || "received image"}
+                                    className="max-h-52 w-auto rounded border border-cyan-300/30"
+                                    data-testid={`media-image-${m.media.transferId || m.msgId}`}
+                                  />
+                                ) : null}
+                                <div className="mt-1 flex flex-wrap gap-2">
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    className="h-7 px-2"
+                                    onClick={() => downloadResolvedMedia(m)}
+                                  >
+                                    <FileDown className="mr-1 h-3.5 w-3.5" />Save As
+                                  </Button>
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    className="h-7 px-2"
+                                    onClick={() => openMediaInSystemViewer(m)}
+                                  >
+                                    Open in System Viewer
+                                  </Button>
+                                </div>
+                              </div>
+                            );
+                          })()}
+                        </div>
+                      ) : null}
+                      {m.attachment && !m.media ? (
                         <div className="mt-1.5 rounded-md border border-cyan-300/30 bg-slate-900/35 p-2 text-xs">
                           <p className="truncate font-semibold">{m.attachment.fileName}</p>
                           <p className="text-cyan-100/75">{formatBytes(m.attachment.sizeBytes)} · {m.attachment.mimeType || "file"}</p>
@@ -1100,7 +1331,7 @@ export default function App() {
                                 const href = URL.createObjectURL(blob);
                                 const link = document.createElement("a");
                                 link.href = href;
-                                link.download = m.attachment.fileName || "aethos-attachment";
+                                link.download = sanitizeDownloadFileName(m.attachment.fileName || "", "aethos-attachment");
                                 document.body.appendChild(link);
                                 link.click();
                                 link.remove();
@@ -1129,7 +1360,7 @@ export default function App() {
                   ))}
                 </div>
                 <div className="mb-1 flex items-center gap-2">
-                  <input ref={attachmentInputRef} type="file" className="hidden" onChange={onAttachmentPick} />
+                  <input data-testid="chat-attachment-input" ref={attachmentInputRef} type="file" className="hidden" onChange={onAttachmentPick} />
                   <Button
                     data-testid="chat-attach-file"
                     variant="ghost"

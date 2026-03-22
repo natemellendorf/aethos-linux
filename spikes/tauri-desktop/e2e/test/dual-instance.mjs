@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
+import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { expect } from "chai";
 import { Builder, By, Capabilities, until } from "selenium-webdriver";
@@ -31,6 +32,7 @@ const ARTIFACT_ROOT = process.env.AETHOS_E2E_ARTIFACT_DIR
 const E2E_WORKDIR = process.env.AETHOS_E2E_WORKDIR
   ? path.resolve(process.env.AETHOS_E2E_WORKDIR)
   : path.resolve(DESKTOP_DIR, "e2e", "workdir", RUN_ID);
+const MEDIA_SEED_BASE = process.env.AETHOS_E2E_MEDIA_SEED || `aethos-media-${RUN_ID}`;
 
 const TAURI_DRIVER_A_PORT = 4444;
 const TAURI_DRIVER_B_PORT = 4454;
@@ -153,6 +155,119 @@ async function clickSyncInbox(driver) {
     }
   }, 5000, 250);
   return Boolean(clicked);
+}
+
+async function generateDeterministicLargeImage(filePath, seed, width = 2600, height = 1900) {
+  const scriptPath = path.resolve(E2E_DIR, "scripts", "generate-aethos-large-png.mjs");
+  const result = spawnSync(
+    "node",
+    [scriptPath, "--out", filePath, "--seed", seed, "--width", String(width), "--height", String(height)],
+    { cwd: DESKTOP_DIR, encoding: "utf8" }
+  );
+  if (result.status !== 0) {
+    throw new Error(`generateDeterministicLargeImage failed: ${result.stderr || result.stdout}`);
+  }
+  const parsed = JSON.parse(String(result.stdout || "{}").trim());
+  return parsed;
+}
+
+function sha256Hex(buffer) {
+  return crypto.createHash("sha256").update(buffer).digest("hex");
+}
+
+async function attachFileAndSend(driver, filePath, caption = "") {
+  await clickTab(driver, "chats");
+  if (caption) {
+    const composer = await driver.findElement(By.css("[data-testid='chat-composer']"));
+    await composer.clear();
+    await composer.sendKeys(caption);
+  }
+
+  const input = await driver.findElement(By.css("[data-testid='chat-attachment-input']"));
+  await input.sendKeys(filePath);
+  const sendBtn = await driver.findElement(By.css("[data-testid='chat-send']"));
+  await sendBtn.click();
+}
+
+async function waitForMediaManifest(driver, timeoutMs = 120000) {
+  const found = await waitFor(async () => {
+    try {
+      return await driver.executeScript(
+        "const el=document.querySelector('[data-testid^=\"media-manifest-\"]'); return el ? el.getAttribute('data-testid') : null;"
+      );
+    } catch {
+      return false;
+    }
+  }, timeoutMs, 300);
+  return found || null;
+}
+
+async function waitForMediaImageRendered(driver, timeoutMs = 240000) {
+  const found = await waitFor(async () => {
+    try {
+      return await driver.executeScript(
+        "const el=document.querySelector('[data-testid^=\"media-image-\"]'); return !!el && !!el.getAttribute('src');"
+      );
+    } catch {
+      return false;
+    }
+  }, timeoutMs, 500);
+  return Boolean(found);
+}
+
+async function clickMediaLoadButton(driver, timeoutMs = 30000) {
+  await clickElement(driver, "[data-testid^='media-load-']", timeoutMs);
+}
+
+async function mediaImagePresent(driver) {
+  try {
+    return await driver.executeScript(
+      "const el=document.querySelector('[data-testid^=\"media-image-\"]'); return !!el && !!el.getAttribute('src');"
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function transferStateFromChat(stateRoot) {
+  const chatPath = path.join(stateRoot, "chat-history.json");
+  const chat = await readJsonFile(chatPath);
+  const transfers = [];
+  for (const [threadKey, thread] of Object.entries(chat?.threads || {})) {
+    for (const message of thread || []) {
+      if (message?.media?.transferId) {
+        transfers.push({ threadKey, message });
+      }
+    }
+  }
+  return transfers;
+}
+
+async function waitForCompletedMediaTransfer(stateRoot, timeoutMs = 240000) {
+  const result = await waitFor(async () => {
+    try {
+      const transfers = await transferStateFromChat(stateRoot);
+      const complete = transfers.find((entry) => String(entry?.message?.media?.status || "").toLowerCase() === "complete");
+      return complete || false;
+    } catch {
+      return false;
+    }
+  }, timeoutMs, 700);
+  return result || null;
+}
+
+async function waitForPeerMediaCapability(stateRoot, peerWayfarerId, timeoutMs = 90000) {
+  const cachePath = path.join(stateRoot, "media", "capabilities-cache.json");
+  const found = await waitFor(async () => {
+    try {
+      const cache = await readJsonFile(cachePath);
+      const peer = cache?.peers?.[peerWayfarerId];
+      return peer?.mediaV1 === true;
+    } catch {
+      return false;
+    }
+  }, timeoutMs, 500);
+  return Boolean(found);
 }
 
 async function writeJsonArtifact(fileName, payload) {
@@ -317,7 +432,7 @@ async function getOwnWayfarerId(driver, fallbackStateRoot) {
   throw new Error("wayfarer id unavailable from share tab");
 }
 
-async function openTauriSession(sessionName, stateRoot, tauriPort = 4444) {
+async function openTauriSession(sessionName, stateRoot, tauriPort = 4444, extraEnv = {}) {
   await fs.mkdir(stateRoot, { recursive: true });
   const env = {
     ...process.env,
@@ -334,13 +449,15 @@ async function openTauriSession(sessionName, stateRoot, tauriPort = 4444) {
     AETHOS_GOSSIP_LOOPBACK_ONLY: E2E_LOOPBACK_ONLY ? "1" : "0",
     AETHOS_STRUCTURED_LOGS: process.env.AETHOS_STRUCTURED_LOGS || "1",
     AETHOS_E2E_RUN_ID: RUN_ID,
+    AETHOS_E2E: "1",
     AETHOS_E2E_TEST_CASE_ID: TEST_CASE_ID,
     AETHOS_E2E_SCENARIO: SCENARIO,
     AETHOS_E2E_NODE_LABEL: sessionName === "a" ? "wayfarer-1" : "wayfarer-2",
     AETHOS_E2E_DISABLE_RELAY: E2E_DISABLE_RELAY ? "1" : "0",
     AETHOS_E2E_FORCE_VERBOSE: process.env.AETHOS_E2E_FORCE_VERBOSE || "1",
     AETHOS_E2E_FORCE_GOSSIP: process.env.AETHOS_E2E_FORCE_GOSSIP || "1",
-    AETHOS_E2E_INSTANCE: sessionName
+    AETHOS_E2E_INSTANCE: sessionName,
+    ...extraEnv
   };
 
   const capabilities = new Capabilities();
@@ -422,6 +539,15 @@ async function captureScreenshot(driver, fileName) {
   }
 }
 
+async function closeSession(session) {
+  if (!session?.driver) return;
+  try {
+    await session.driver.quit();
+  } catch {
+    // ignore
+  }
+}
+
 before(async function () {
   this.timeout(TEST_TIMEOUT_MS);
 
@@ -470,8 +596,11 @@ describe("dual instance gossip e2e", function () {
   it("sends message between two isolated desktop instances and writes logs", async function () {
     this.timeout(TEST_TIMEOUT_MS);
 
-    const a = await openTauriSession("a", stateRootPath("a"), TAURI_DRIVER_A_PORT);
-    const b = await openTauriSession("b", stateRootPath("b"), TAURI_DRIVER_B_PORT);
+    let a;
+    let b;
+    try {
+      a = await openTauriSession("a", stateRootPath("a"), TAURI_DRIVER_A_PORT);
+      b = await openTauriSession("b", stateRootPath("b"), TAURI_DRIVER_B_PORT);
     await writeJsonArtifact("run-index.json", {
       run_id: RUN_ID,
       test_case_id: TEST_CASE_ID,
@@ -610,7 +739,7 @@ describe("dual instance gossip e2e", function () {
     expect(statusA.length).to.be.greaterThan(0);
     expect(statusB.length).to.be.greaterThan(0);
 
-    await writeJsonArtifact("run-result.json", {
+      await writeJsonArtifact("run-result.json", {
       run_id: RUN_ID,
       test_case_id: TEST_CASE_ID,
       scenario: SCENARIO,
@@ -633,6 +762,127 @@ describe("dual instance gossip e2e", function () {
         wayfarer_1: logPathTextA,
         wayfarer_2: logPathTextB
       }
+      });
+    } finally {
+      await closeSession(a);
+      await closeSession(b);
+    }
+  });
+
+  it("transfers large deterministic image and only renders after completion", async function () {
+    this.timeout(TEST_TIMEOUT_MS);
+
+    let a;
+    let b;
+    try {
+      a = await openTauriSession("a", stateRootPath("media-a"), TAURI_DRIVER_A_PORT, {
+      AETHOS_MEDIA_E2E_MAX_ITEM_PAYLOAD_B64_BYTES: "32768",
+      AETHOS_MEDIA_E2E_TTL_SECONDS: "180",
+      AETHOS_MEDIA_E2E_MISSING_MIN_INTERVAL_MS: "350"
     });
+      b = await openTauriSession("b", stateRootPath("media-b"), TAURI_DRIVER_B_PORT, {
+      AETHOS_MEDIA_E2E_MAX_ITEM_PAYLOAD_B64_BYTES: "32768",
+      AETHOS_MEDIA_E2E_TTL_SECONDS: "180",
+      AETHOS_MEDIA_E2E_MISSING_MIN_INTERVAL_MS: "350"
+    });
+
+    await waitForSplashToClear(a.driver);
+    await waitForSplashToClear(b.driver);
+
+    const idA = await readIdentityWayfarerId(a.stateRoot);
+    const idB = await readIdentityWayfarerId(b.stateRoot);
+    await openContactsAndAdd(a.driver, idB, "Peer B");
+    await openContactsAndAdd(b.driver, idA, "Peer A");
+    await clickContactInChats(a.driver, idB);
+    await clickContactInChats(b.driver, idA);
+    const capabilitiesReady = await waitForPeerMediaCapability(a.stateRoot, idB, 120000);
+    expect(capabilitiesReady).to.equal(true);
+
+    const seed = `${MEDIA_SEED_BASE}-happy`;
+    const largePath = path.join(ARTIFACT_ROOT, "fixture-large-happy.png");
+    const fixture = await generateDeterministicLargeImage(largePath, seed, 2600, 1900);
+    const fileBytes = await fs.readFile(fixture.filePath);
+    const expectedObjectDigest = sha256Hex(fileBytes);
+    expect(expectedObjectDigest).to.equal(fixture.sha256Hex);
+
+    await attachFileAndSend(a.driver, fixture.filePath, `media-happy-${Date.now()}`);
+
+    const manifestTestId = await waitForMediaManifest(b.driver, 120000);
+    expect(manifestTestId).to.be.a("string");
+    const imageShownEarly = await mediaImagePresent(b.driver);
+    expect(imageShownEarly).to.equal(false);
+
+    const completeTransfer = await waitForCompletedMediaTransfer(b.stateRoot, 240000);
+    expect(completeTransfer, "expected completed media transfer in receiver chat").to.exist;
+    const imageShownPreClick = await mediaImagePresent(b.driver);
+    expect(imageShownPreClick).to.equal(false);
+    await clickMediaLoadButton(b.driver, 40000);
+
+    const rendered = await waitForMediaImageRendered(b.driver, 240000);
+    expect(rendered).to.equal(true);
+
+      expect(String(completeTransfer.message.media.objectSha256Hex || "")).to.equal(expectedObjectDigest);
+      expect(Number(completeTransfer.message.media.totalBytes || 0)).to.equal(Number(fixture.sizeBytes));
+    } finally {
+      await closeSession(a);
+      await closeSession(b);
+    }
+  });
+
+  it("withheld chunk prevents render and transfer expires", async function () {
+    this.timeout(TEST_TIMEOUT_MS);
+
+    let a;
+    let b;
+    try {
+      a = await openTauriSession("a", stateRootPath("media-fail-a"), TAURI_DRIVER_A_PORT, {
+      AETHOS_MEDIA_E2E_MAX_ITEM_PAYLOAD_B64_BYTES: "32768",
+      AETHOS_MEDIA_E2E_TTL_SECONDS: "12",
+      AETHOS_MEDIA_E2E_MISSING_MIN_INTERVAL_MS: "300",
+      AETHOS_MEDIA_E2E_DROP_CHUNK_INDEX: "2"
+    });
+      b = await openTauriSession("b", stateRootPath("media-fail-b"), TAURI_DRIVER_B_PORT, {
+      AETHOS_MEDIA_E2E_MAX_ITEM_PAYLOAD_B64_BYTES: "32768",
+      AETHOS_MEDIA_E2E_TTL_SECONDS: "12",
+      AETHOS_MEDIA_E2E_MISSING_MIN_INTERVAL_MS: "300"
+    });
+
+    await waitForSplashToClear(a.driver);
+    await waitForSplashToClear(b.driver);
+
+    const idA = await readIdentityWayfarerId(a.stateRoot);
+    const idB = await readIdentityWayfarerId(b.stateRoot);
+    await openContactsAndAdd(a.driver, idB, "Peer B");
+    await openContactsAndAdd(b.driver, idA, "Peer A");
+    await clickContactInChats(a.driver, idB);
+    await clickContactInChats(b.driver, idA);
+    const capabilitiesReady = await waitForPeerMediaCapability(a.stateRoot, idB, 120000);
+    expect(capabilitiesReady).to.equal(true);
+
+    const seed = `${MEDIA_SEED_BASE}-withhold`;
+    const largePath = path.join(ARTIFACT_ROOT, "fixture-large-withhold.png");
+    const fixture = await generateDeterministicLargeImage(largePath, seed, 2600, 1900);
+    await attachFileAndSend(a.driver, fixture.filePath, `media-fail-${Date.now()}`);
+
+    const manifestTestId = await waitForMediaManifest(b.driver, 120000);
+    expect(manifestTestId).to.be.a("string");
+    const rendered = await waitForMediaImageRendered(b.driver, 35000);
+    expect(rendered).to.equal(false);
+
+    await new Promise((resolve) => setTimeout(resolve, 18000));
+
+    const transfers = await transferStateFromChat(b.stateRoot);
+    const failed = transfers.find((entry) => {
+      const status = String(entry?.message?.media?.status || "").toLowerCase();
+      const error = String(entry?.message?.media?.error || "").toLowerCase();
+      return status === "failed" || error.includes("expired");
+    });
+    expect(failed, "expected failed/expired transfer in receiver chat").to.exist;
+      const imagePresent = await mediaImagePresent(b.driver);
+      expect(imagePresent).to.equal(false);
+    } finally {
+      await closeSession(a);
+      await closeSession(b);
+    }
   });
 });
