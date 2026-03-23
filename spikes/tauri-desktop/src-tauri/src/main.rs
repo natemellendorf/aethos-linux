@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream, UdpSocket};
+use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -68,9 +68,11 @@ use crate::relay::client::{
     run_relay_encounter_gossipv1, run_relay_encounter_gossipv1_for_duration, to_ws_endpoint,
 };
 use media_v1::{
+    drain_pending_media_control_unicast as media_drain_pending_media_control_unicast,
     get_completed_media_path as media_get_completed_media_path, is_media_candidate_attachment,
     is_media_wire_message, load_completed_media as media_load_completed_media,
     max_object_bytes as media_max_object_bytes, maybe_queue_capabilities_for_peer,
+    pulse_missing_requests_for_receiving_transfers as media_pulse_missing_requests_for_receiving_transfers,
     process_incoming_media_message, run_housekeeping_tick as media_run_housekeeping_tick,
     send_media_manifest_and_chunks, MediaMessageProcess,
 };
@@ -86,6 +88,50 @@ const LAN_FALLBACK_TRANSFER_MAX_BYTES: u64 = 1024;
 const LAN_DUP_REQUEST_COOLDOWN_MS: u64 = 700;
 const LAN_FALLBACK_CHUNK_PACING_MS: u64 = 3;
 const LAN_OUTBOUND_REQUEST_DEBOUNCE_MS: u64 = 700;
+const LAN_MEDIA_CONTROL_FASTLANE_MAX_ITEMS: usize = 4;
+const LAN_FALLBACK_MAX_CHUNKS_PER_REQUEST: usize = 24;
+const GOSSIP_UDP_SOCKET_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+const E2E_UDP_TRANSFER_FRAME_MAX_BYTES_DEFAULT: usize = 32 * 1024;
+const E2E_MEDIA_HOUSEKEEPING_MIN_INTERVAL_MS_DEFAULT: u64 = 2_000;
+
+fn lan_fallback_transfer_max_bytes() -> u64 {
+    std::env::var("AETHOS_LAN_FALLBACK_TRANSFER_MAX_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(LAN_FALLBACK_TRANSFER_MAX_BYTES)
+}
+
+fn lan_fallback_transfer_max_items() -> u32 {
+    std::env::var("AETHOS_LAN_FALLBACK_TRANSFER_MAX_ITEMS")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(LAN_FALLBACK_TRANSFER_MAX_ITEMS)
+}
+
+fn lan_media_control_fastlane_max_items() -> usize {
+    std::env::var("AETHOS_LAN_MEDIA_CONTROL_FASTLANE_MAX_ITEMS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(LAN_MEDIA_CONTROL_FASTLANE_MAX_ITEMS)
+}
+
+fn lan_tcp_request_encounter_enabled() -> bool {
+    std::env::var("AETHOS_LAN_TCP_REQUEST_ENCOUNTER")
+        .ok()
+        .map(|value| value.trim() != "0")
+        .unwrap_or(true)
+}
+
+fn lan_fallback_max_chunks_per_request() -> usize {
+    std::env::var("AETHOS_LAN_FALLBACK_MAX_CHUNKS_PER_REQUEST")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(LAN_FALLBACK_MAX_CHUNKS_PER_REQUEST)
+}
 
 fn gossip_lan_port() -> u16 {
     std::env::var("AETHOS_GOSSIP_LAN_PORT")
@@ -93,6 +139,45 @@ fn gossip_lan_port() -> u16 {
         .and_then(|value| value.parse::<u16>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(GOSSIP_LAN_PORT)
+}
+
+fn gossip_udp_socket_buffer_bytes() -> usize {
+    std::env::var("AETHOS_GOSSIP_UDP_SOCKET_BUFFER_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|value| value.clamp(256 * 1024, 64 * 1024 * 1024))
+        .unwrap_or(GOSSIP_UDP_SOCKET_BUFFER_BYTES)
+}
+
+fn e2e_udp_transfer_frame_max_bytes() -> usize {
+    let e2e_enabled = std::env::var("AETHOS_E2E")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !e2e_enabled {
+        return MAX_FRAME_BYTES;
+    }
+    std::env::var("AETHOS_E2E_UDP_TRANSFER_FRAME_MAX_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|value| value.clamp(4 * 1024, MAX_FRAME_BYTES))
+        .unwrap_or(E2E_UDP_TRANSFER_FRAME_MAX_BYTES_DEFAULT)
+}
+
+fn media_housekeeping_min_interval_ms(context: &str) -> u64 {
+    if context != "handle_gossip_frame" {
+        return 0;
+    }
+    let e2e_enabled = std::env::var("AETHOS_E2E")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !e2e_enabled {
+        return 0;
+    }
+    std::env::var("AETHOS_MEDIA_E2E_HOUSEKEEPING_MIN_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|value| value.clamp(0, 30_000))
+        .unwrap_or(E2E_MEDIA_HOUSEKEEPING_MIN_INTERVAL_MS_DEFAULT)
 }
 
 fn gossip_peer_ports() -> Vec<u16> {
@@ -873,13 +958,25 @@ fn send_message_blocking(request: SendMessageRequest) -> Result<SendMessageRespo
         .as_ref()
         .filter(|value| is_media_candidate_attachment(value))
     {
-        let send_result = send_media_manifest_and_chunks(
+        let send_result = match send_media_manifest_and_chunks(
             wayfarer_id,
             body,
             media_attachment,
             &author_signing_seed,
             settings.message_ttl_seconds,
-        )?;
+        ) {
+            Ok(result) => result,
+            Err(err) => {
+                log_info(&format!(
+                    "media_send_failed: to={} file={} bytes={} error={}",
+                    wayfarer_id,
+                    media_attachment.file_name,
+                    media_attachment.size_bytes,
+                    err
+                ));
+                return Err(err);
+            }
+        };
 
         if let Some(runtime) = GOSSIP_RUNTIME.get() {
             runtime.force_announce.store(true, Ordering::SeqCst);
@@ -1048,6 +1145,29 @@ fn send_message_blocking(request: SendMessageRequest) -> Result<SendMessageRespo
 }
 
 fn run_media_housekeeping_best_effort(context: &str, ttl_seconds_max: u64) {
+    let min_interval_ms = media_housekeeping_min_interval_ms(context);
+    if min_interval_ms > 0 {
+        static LAST_RUN_BY_CONTEXT: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+        let now_ms = now_unix_ms();
+        let mut should_run = true;
+        if let Ok(mut tracker) = LAST_RUN_BY_CONTEXT
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+        {
+            if let Some(last_run) = tracker.get(context).copied() {
+                if now_ms.saturating_sub(last_run) < min_interval_ms {
+                    should_run = false;
+                }
+            }
+            if should_run {
+                tracker.insert(context.to_string(), now_ms);
+            }
+        }
+        if !should_run {
+            return;
+        }
+    }
+
     match media_run_housekeeping_tick(ttl_seconds_max) {
         Ok(true) => {
             emit_chat_snapshot_event_best_effort(context);
@@ -1057,6 +1177,116 @@ fn run_media_housekeeping_best_effort(context: &str, ttl_seconds_max: u64) {
             log_verbose(&format!(
                 "media_housekeeping_failed context={context}: {err}"
             ));
+        }
+    }
+}
+
+fn flush_media_control_fastlane(
+    socket: &UdpSocket,
+    peer_addr_by_node: &HashMap<String, SocketAddr>,
+) {
+    let pending = media_drain_pending_media_control_unicast(lan_media_control_fastlane_max_items());
+    let mut grouped: HashMap<String, Vec<_>> = HashMap::new();
+    for envelope in pending {
+        grouped
+            .entry(envelope.peer_wayfarer_id.clone())
+            .or_default()
+            .push(envelope);
+    }
+
+    for (peer_wayfarer_id, envelopes) in grouped {
+        let Some(peer_addr) = peer_addr_by_node.get(&peer_wayfarer_id) else {
+            for envelope in envelopes {
+                log_verbose(&format!(
+                    "media_control_fastlane_skipped_no_route: peer={} item_id={}",
+                    peer_wayfarer_id, envelope.item_id
+                ));
+            }
+            continue;
+        };
+
+        let mut batch_objects = Vec::new();
+        let mut batch_item_ids = Vec::new();
+        for envelope in envelopes {
+            let object = crate::aethos_core::gossip_sync::TransferObject {
+                item_id: envelope.item_id.clone(),
+                envelope_b64: envelope.payload_b64.clone(),
+                expiry_unix_ms: envelope.expiry_unix_ms,
+                hop_count: 1,
+            };
+
+            let mut candidate_objects = batch_objects.clone();
+            candidate_objects.push(object.clone());
+            let candidate_frame = GossipSyncFrame::Transfer(
+                crate::aethos_core::gossip_sync::TransferFrame {
+                    objects: candidate_objects.clone(),
+                },
+            );
+            let candidate_fits = serialize_gossip_frame(&candidate_frame)
+                .map(|raw| raw.len() <= e2e_udp_transfer_frame_max_bytes())
+                .unwrap_or(false);
+
+            if candidate_fits {
+                batch_objects = candidate_objects;
+                batch_item_ids.push(envelope.item_id);
+                continue;
+            }
+
+            if !batch_objects.is_empty() {
+                let transfer = GossipSyncFrame::Transfer(
+                    crate::aethos_core::gossip_sync::TransferFrame {
+                        objects: batch_objects.clone(),
+                    },
+                );
+                match send_gossip_frame(socket, &peer_addr.ip().to_string(), peer_addr.port(), &transfer)
+                {
+                    Ok(()) => {
+                        for item_id in &batch_item_ids {
+                            log_verbose(&format!(
+                                "media_control_fastlane_sent: peer={} addr={} item_id={}",
+                                peer_wayfarer_id, peer_addr, item_id
+                            ));
+                        }
+                    }
+                    Err(err) => {
+                        for item_id in &batch_item_ids {
+                            log_verbose(&format!(
+                                "media_control_fastlane_send_failed: peer={} addr={} item_id={} error={}",
+                                peer_wayfarer_id, peer_addr, item_id, err
+                            ));
+                        }
+                    }
+                }
+                batch_objects.clear();
+                batch_item_ids.clear();
+            }
+
+            batch_objects.push(object);
+            batch_item_ids.push(envelope.item_id);
+        }
+
+        if !batch_objects.is_empty() {
+            let transfer = GossipSyncFrame::Transfer(crate::aethos_core::gossip_sync::TransferFrame {
+                objects: batch_objects,
+            });
+            match send_gossip_frame(socket, &peer_addr.ip().to_string(), peer_addr.port(), &transfer) {
+                Ok(()) => {
+                    for item_id in &batch_item_ids {
+                        log_verbose(&format!(
+                            "media_control_fastlane_sent: peer={} addr={} item_id={}",
+                            peer_wayfarer_id, peer_addr, item_id
+                        ));
+                    }
+                }
+                Err(err) => {
+                    for item_id in &batch_item_ids {
+                        log_verbose(&format!(
+                            "media_control_fastlane_send_failed: peer={} addr={} item_id={} error={}",
+                            peer_wayfarer_id, peer_addr, item_id, err
+                        ));
+                    }
+                }
+            }
         }
     }
 }
@@ -1526,10 +1756,14 @@ fn start_gossip_worker_if_needed(initial_enabled: bool) {
         ));
         let mut peer_node_by_addr: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
+        let mut peer_addr_by_node: HashMap<String, SocketAddr> = HashMap::new();
         let mut peer_tcp_capable_by_ip: HashMap<String, bool> = HashMap::new();
         let mut tcp_backoff_until_by_ip: HashMap<String, Instant> = HashMap::new();
         let mut recent_served_request_by_peer: HashMap<String, (u64, Instant)> = HashMap::new();
         let mut recent_outbound_request_by_peer: HashMap<String, (u64, Instant)> = HashMap::new();
+        let local_wayfarer_id = ensure_local_identity().map(|identity| identity.wayfarer_id).ok();
+        let local_signing_seed = load_local_signing_key_seed().ok();
+        let mut last_missing_pulse = Instant::now() - Duration::from_millis(500);
         let tcp_listener = match bind_gossip_tcp_listener() {
             Ok(listener) => Some(listener),
             Err(err) => {
@@ -1585,6 +1819,36 @@ fn start_gossip_worker_if_needed(initial_enabled: bool) {
                 }
             }
 
+            flush_media_control_fastlane(&socket, &peer_addr_by_node);
+
+            if last_missing_pulse.elapsed() >= Duration::from_millis(250) {
+                if let (Some(local_id), Some(seed)) =
+                    (local_wayfarer_id.as_deref(), local_signing_seed.as_ref())
+                {
+                    let ttl_seconds = load_app_settings()
+                        .map(|settings| settings.message_ttl_seconds)
+                        .unwrap_or(3600);
+                    match media_pulse_missing_requests_for_receiving_transfers(
+                        local_id,
+                        seed,
+                        ttl_seconds,
+                    ) {
+                        Ok(requested) if requested > 0 => {
+                            log_verbose(&format!(
+                                "media_missing_pulse_requested: transfers={requested}"
+                            ));
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            log_verbose(&format!(
+                                "media_missing_pulse_failed: {err}"
+                            ));
+                        }
+                    }
+                }
+                last_missing_pulse = Instant::now();
+            }
+
             let mut buf = [0u8; 65_535];
             match socket.recv_from(&mut buf) {
                 Ok((len, source)) => {
@@ -1598,6 +1862,7 @@ fn start_gossip_worker_if_needed(initial_enabled: bool) {
                         &buf[..len],
                         source,
                         &mut peer_node_by_addr,
+                        &mut peer_addr_by_node,
                         &mut peer_tcp_capable_by_ip,
                         &mut tcp_backoff_until_by_ip,
                         &mut recent_served_request_by_peer,
@@ -1626,6 +1891,9 @@ fn bind_gossip_socket() -> Result<UdpSocket, String> {
     socket
         .set_reuse_address(true)
         .map_err(|err| format!("set_reuse_address failed: {err}"))?;
+    let buffer_bytes = gossip_udp_socket_buffer_bytes();
+    let _ = socket.set_recv_buffer_size(buffer_bytes);
+    let _ = socket.set_send_buffer_size(buffer_bytes);
     let bind_ip = if gossip_loopback_only_enabled() {
         std::net::Ipv4Addr::LOCALHOST
     } else {
@@ -1695,6 +1963,7 @@ fn handle_gossip_frame(
     raw: &[u8],
     source: std::net::SocketAddr,
     peer_node_by_addr: &mut std::collections::HashMap<String, String>,
+    peer_addr_by_node: &mut HashMap<String, SocketAddr>,
     peer_tcp_capable_by_ip: &mut HashMap<String, bool>,
     tcp_backoff_until_by_ip: &mut HashMap<String, Instant>,
     recent_served_request_by_peer: &mut HashMap<String, (u64, Instant)>,
@@ -1719,7 +1988,8 @@ fn handle_gossip_frame(
         GossipSyncFrame::Hello(hello) if hello.node_id != local_wayfarer => {
             let node_id = hello.node_id;
             peer_node_by_addr.insert(source_key.clone(), node_id.clone());
-            peer_node_by_addr.insert(source_ip_key.clone(), node_id);
+            peer_node_by_addr.insert(source_ip_key.clone(), node_id.clone());
+            peer_addr_by_node.insert(node_id, source);
             let tcp_capable = hello
                 .capabilities
                 .iter()
@@ -1832,7 +2102,7 @@ fn handle_gossip_frame(
                 .map(|until| *until > Instant::now())
                 .unwrap_or(false);
 
-            if tcp_capable && !tcp_backoff_active {
+            if tcp_capable && !tcp_backoff_active && lan_tcp_request_encounter_enabled() {
                 match run_gossip_tcp_encounter_with_peer(
                     source.ip(),
                     peer_node_id,
@@ -1841,8 +2111,6 @@ fn handle_gossip_frame(
                 ) {
                     Ok(_) => {
                         tcp_backoff_until_by_ip.remove(&peer_key);
-                        recent_served_request_by_peer
-                            .insert(peer_key, (fingerprint, Instant::now()));
                     }
                     Err(err) => {
                         tcp_backoff_until_by_ip.insert(
@@ -1853,16 +2121,20 @@ fn handle_gossip_frame(
                             "gossip_tcp_encounter_from_udp_request_failed: peer={} error={} cooldown_s={}",
                             source, err, LAN_TCP_FAILURE_COOLDOWN_SECS
                         ));
-                        serve_udp_transfer_for_request(socket, source, &_req.want)?;
-                        recent_served_request_by_peer
-                            .insert(peer_key, (fingerprint, Instant::now()));
                     }
                 }
+                serve_udp_transfer_for_request(socket, source, &_req.want)?;
+                recent_served_request_by_peer.insert(peer_key, (fingerprint, Instant::now()));
             } else {
                 if !tcp_capable {
                     log_verbose(&format!(
                         "gossip_tcp_skipped_not_capable: peer={} capability={}",
                         source, LAN_TCP_CAPABILITY
+                    ));
+                } else if !lan_tcp_request_encounter_enabled() {
+                    log_verbose(&format!(
+                        "gossip_tcp_request_encounter_disabled: peer={}",
+                        source
                     ));
                 }
                 serve_udp_transfer_for_request(socket, source, &_req.want)?;
@@ -1870,11 +2142,13 @@ fn handle_gossip_frame(
             }
         }
         GossipSyncFrame::Transfer(transfer) => {
+            let transfer_handle_started = Instant::now();
             let peer_node_id = peer_node_by_addr
                 .get(&source_key)
                 .or_else(|| peer_node_by_addr.get(&source_ip_key))
                 .cloned()
                 .unwrap_or_else(|| source.ip().to_string());
+            peer_addr_by_node.insert(peer_node_id.clone(), source);
             let transport_peer = source.to_string();
             log_verbose(&format!(
                 "gossip_transfer_from_resolved_sender: source={} resolved={}",
@@ -1887,6 +2161,8 @@ fn handle_gossip_frame(
                 &transfer.objects,
                 now_unix_ms(),
             )?;
+            let import_elapsed_ms = transfer_handle_started.elapsed().as_millis();
+            let imported_count = result.new_messages.len();
 
             if !result.rejected_items.is_empty() {
                 let mut reasons = std::collections::BTreeMap::<String, usize>::new();
@@ -1905,8 +2181,8 @@ fn handle_gossip_frame(
                 ));
             }
 
-            if !result.new_messages.is_empty() {
-                let imported_count = result.new_messages.len();
+            if imported_count > 0 {
+                let merge_started = Instant::now();
                 let mut chat = load_chat_state()?;
                 let mut contacts = load_contact_aliases()?;
                 let pulled = result
@@ -1935,6 +2211,30 @@ fn handle_gossip_frame(
                     "gossip_transfer_imported_messages={} from={}",
                     imported_count, source
                 ));
+                let merge_elapsed_ms = merge_started.elapsed().as_millis();
+                if import_elapsed_ms > 25 || merge_elapsed_ms > 25 {
+                    log_verbose(&format!(
+                        "gossip_transfer_handle_timing: from={} objects={} accepted={} rejected={} new_messages={} import_ms={} merge_ms={}",
+                        source,
+                        transfer.objects.len(),
+                        result.accepted_item_ids.len(),
+                        result.rejected_items.len(),
+                        imported_count,
+                        import_elapsed_ms,
+                        merge_elapsed_ms
+                    ));
+                }
+            }
+
+            if imported_count == 0 && import_elapsed_ms > 25 {
+                log_verbose(&format!(
+                    "gossip_transfer_handle_timing: from={} objects={} accepted={} rejected={} new_messages=0 import_ms={} merge_ms=0",
+                    source,
+                    transfer.objects.len(),
+                    result.accepted_item_ids.len(),
+                    result.rejected_items.len(),
+                    import_elapsed_ms
+                ));
             }
 
             let receipt = GossipSyncFrame::Receipt(ReceiptFrame {
@@ -1956,6 +2256,15 @@ fn send_gossip_frame(
     frame: &GossipSyncFrame,
 ) -> Result<(), String> {
     let raw = serialize_gossip_frame(frame)?;
+    if matches!(frame, GossipSyncFrame::Transfer(_)) {
+        let max_transfer_frame = e2e_udp_transfer_frame_max_bytes();
+        if raw.len() > max_transfer_frame {
+            return Err(format!(
+                "udp transfer frame exceeds max bytes: {} > {}",
+                raw.len(), max_transfer_frame
+            ));
+        }
+    }
     let addr = format!("{host}:{port}");
     let result = socket
         .send_to(&raw, &addr)
@@ -2006,7 +2315,6 @@ fn run_gossip_tcp_encounter_with_peer(
     stream
         .set_write_timeout(Some(Duration::from_millis(3000)))
         .map_err(|err| format!("tcp set_write_timeout failed ({addr}): {err}"))?;
-
     run_gossip_tcp_encounter_on_stream(&mut stream, peer_node_id, runtime, trigger, true)
 }
 
@@ -2017,6 +2325,19 @@ fn run_gossip_tcp_encounter_on_stream(
     trigger: &str,
     initiate: bool,
 ) -> Result<(), String> {
+    stream
+        .set_nonblocking(false)
+        .map_err(|err| format!("tcp set_nonblocking(false) failed: {err}"))?;
+    stream
+        .set_nodelay(true)
+        .map_err(|err| format!("tcp set_nodelay failed: {err}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(3000)))
+        .map_err(|err| format!("tcp set_read_timeout failed: {err}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_millis(3000)))
+        .map_err(|err| format!("tcp set_write_timeout failed: {err}"))?;
+
     let identity = ensure_local_identity()?;
     let local_wayfarer = identity.wayfarer_id;
 
@@ -2035,6 +2356,7 @@ fn run_gossip_tcp_encounter_on_stream(
         if let Ok(ingest) = build_gossip_relay_ingest_frame(now_unix_ms()) {
             send_gossip_frame_tcp(stream, &ingest)?;
         }
+
     }
 
     let started = Instant::now();
@@ -2135,7 +2457,12 @@ fn run_gossip_tcp_encounter_on_stream(
                 let receipt = GossipSyncFrame::Receipt(ReceiptFrame {
                     received: result.accepted_item_ids,
                 });
-                send_gossip_frame_tcp(stream, &receipt)?;
+                if let Err(err) = send_gossip_frame_tcp(stream, &receipt) {
+                    log_verbose(&format!(
+                        "gossip_tcp_receipt_send_failed: peer={} error={}",
+                        transport_peer, err
+                    ));
+                }
             }
             GossipSyncFrame::Receipt(_) => {}
         }
@@ -2154,32 +2481,88 @@ fn serve_udp_transfer_for_request(
         return Ok(());
     }
     let mut pending = want.to_vec();
+    let mut force_single_item = false;
+    let max_chunks_per_request = lan_fallback_max_chunks_per_request();
+    let mut sent_chunks_this_request = 0usize;
     while !pending.is_empty() {
+        if sent_chunks_this_request >= max_chunks_per_request {
+            log_verbose(&format!(
+                "gossip_udp_transfer_budget_reached: peer={} sent_chunks={} budget={} pending_items={}",
+                source,
+                sent_chunks_this_request,
+                max_chunks_per_request,
+                pending.len()
+            ));
+            break;
+        }
+        let max_items = lan_fallback_transfer_max_items();
+        let max_bytes = lan_fallback_transfer_max_bytes();
+        let effective_max_items = if force_single_item { 1 } else { max_items };
         let objects = gossip_transfer_items(
             &pending,
-            LAN_FALLBACK_TRANSFER_MAX_ITEMS,
-            LAN_FALLBACK_TRANSFER_MAX_BYTES,
+            effective_max_items,
+            max_bytes,
             now_unix_ms(),
         )
         .unwrap_or_default();
         if objects.is_empty() {
-            break;
-        }
-
-        let mut sent_ids = std::collections::HashSet::new();
-        for object in &objects {
-            sent_ids.insert(object.item_id.clone());
-        }
-        let before = pending.len();
-        pending.retain(|item_id| !sent_ids.contains(item_id));
-        let removed = before.saturating_sub(pending.len());
-        if removed == 0 {
+            log_verbose(&format!(
+                "gossip_udp_transfer_empty_selection: peer={} pending_items={} max_items={} max_bytes={}",
+                source,
+                pending.len(),
+                max_items,
+                max_bytes
+            ));
             break;
         }
 
         let transfer =
             GossipSyncFrame::Transfer(crate::aethos_core::gossip_sync::TransferFrame { objects });
-        send_gossip_frame(socket, &source.ip().to_string(), source.port(), &transfer)?;
+        if let GossipSyncFrame::Transfer(frame) = &transfer {
+            log_verbose(&format!(
+                "gossip_udp_transfer_chunk_sent: peer={} objects={} remaining={} max_items={} max_bytes={}",
+                source,
+                frame.objects.len(),
+                pending.len(),
+                effective_max_items,
+                max_bytes
+            ));
+        }
+        match send_gossip_frame(socket, &source.ip().to_string(), source.port(), &transfer) {
+            Ok(()) => {
+                let mut sent_ids = std::collections::HashSet::new();
+                if let GossipSyncFrame::Transfer(frame) = &transfer {
+                    for object in &frame.objects {
+                        sent_ids.insert(object.item_id.clone());
+                    }
+                    sent_chunks_this_request =
+                        sent_chunks_this_request.saturating_add(frame.objects.len());
+                }
+                let before = pending.len();
+                pending.retain(|item_id| !sent_ids.contains(item_id));
+                let removed = before.saturating_sub(pending.len());
+                if removed == 0 {
+                    break;
+                }
+                force_single_item = false;
+            }
+            Err(err)
+                if (err.contains("Message too long")
+                    || err.contains("udp transfer frame exceeds max bytes"))
+                    && !force_single_item
+                    && effective_max_items > 1 =>
+            {
+                log_verbose(&format!(
+                    "gossip_udp_transfer_chunk_retry_single: peer={} pending_items={} max_bytes={}",
+                    source,
+                    pending.len(),
+                    max_bytes
+                ));
+                force_single_item = true;
+                continue;
+            }
+            Err(err) => return Err(err),
+        }
         std::thread::sleep(Duration::from_millis(LAN_FALLBACK_CHUNK_PACING_MS));
     }
     Ok(())
@@ -2228,7 +2611,15 @@ fn read_gossip_frame_tcp(stream: &mut TcpStream) -> Result<GossipSyncFrame, Stri
     let mut len_buf = [0u8; 4];
     stream
         .read_exact(&mut len_buf)
-        .map_err(|err| format!("tcp read length failed: {err}"))?;
+        .map_err(|err| match err.kind() {
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+                format!("tcp read length timeout: {err}")
+            }
+            std::io::ErrorKind::UnexpectedEof => {
+                format!("tcp read length eof: {err}")
+            }
+            _ => format!("tcp read length failed: {err}"),
+        })?;
     let len = u32::from_be_bytes(len_buf) as usize;
     if len > MAX_FRAME_BYTES {
         return Err(format!("tcp frame length exceeds max: {len}"));
@@ -2236,7 +2627,15 @@ fn read_gossip_frame_tcp(stream: &mut TcpStream) -> Result<GossipSyncFrame, Stri
     let mut payload = vec![0u8; len];
     stream
         .read_exact(&mut payload)
-        .map_err(|err| format!("tcp read payload failed: {err}"))?;
+        .map_err(|err| match err.kind() {
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+                format!("tcp read payload timeout: {err}")
+            }
+            std::io::ErrorKind::UnexpectedEof => {
+                format!("tcp read payload eof: {err}")
+            }
+            _ => format!("tcp read payload failed: {err}"),
+        })?;
     parse_gossip_frame(&payload)
 }
 
@@ -2485,13 +2884,26 @@ fn latest_message_for_contact(
 }
 
 fn extract_chat_text_if_json(input: &str) -> String {
-    if is_media_wire_message(input) {
-        return String::new();
-    }
-
     let Ok(value) = serde_json::from_str::<serde_json::Value>(input) else {
         return input.to_string();
     };
+
+    if let Some(msg_type) = value.get("type").and_then(|v| v.as_str()) {
+        if msg_type == "aethos.media.manifest.v1" {
+            if let Some(caption) = value.get("caption").and_then(|v| v.as_str()) {
+                if !caption.trim().is_empty() {
+                    return caption.trim().to_string();
+                }
+            }
+            if let Some(file_name) = value.get("file_name").and_then(|v| v.as_str()) {
+                return format!("[Image] {file_name}");
+            }
+            return "[Image]".to_string();
+        }
+        if is_media_wire_message(input) {
+            return String::new();
+        }
+    }
 
     if let Some(text) = value.get("text").and_then(|v| v.as_str()) {
         if !text.is_empty() {
@@ -3221,6 +3633,99 @@ fn apply_cli_state_overrides() {
             if !value.trim().is_empty() {
                 std::env::set_var("AETHOS_E2E_FORCE_GOSSIP", value.trim());
             }
+        } else if let Some(value) = arg.strip_prefix("--aethos-lan-fallback-transfer-max-items=") {
+            if !value.trim().is_empty() {
+                std::env::set_var("AETHOS_LAN_FALLBACK_TRANSFER_MAX_ITEMS", value.trim());
+            }
+        } else if let Some(value) = arg.strip_prefix("--aethos-lan-fallback-transfer-max-bytes=") {
+            if !value.trim().is_empty() {
+                std::env::set_var("AETHOS_LAN_FALLBACK_TRANSFER_MAX_BYTES", value.trim());
+            }
+        } else if let Some(value) =
+            arg.strip_prefix("--aethos-media-e2e-max-item-payload-b64-bytes=")
+        {
+            if !value.trim().is_empty() {
+                std::env::set_var("AETHOS_MEDIA_E2E_MAX_ITEM_PAYLOAD_B64_BYTES", value.trim());
+            }
+        } else if let Some(value) = arg.strip_prefix("--aethos-media-e2e-ttl-seconds=") {
+            if !value.trim().is_empty() {
+                std::env::set_var("AETHOS_MEDIA_E2E_TTL_SECONDS", value.trim());
+            }
+        } else if let Some(value) = arg.strip_prefix("--aethos-media-e2e-missing-min-interval-ms=") {
+            if !value.trim().is_empty() {
+                std::env::set_var("AETHOS_MEDIA_E2E_MISSING_MIN_INTERVAL_MS", value.trim());
+            }
+        } else if let Some(value) = arg.strip_prefix("--aethos-media-e2e-drop-chunk-index=") {
+            if !value.trim().is_empty() {
+                std::env::set_var("AETHOS_MEDIA_E2E_DROP_CHUNK_INDEX", value.trim());
+            }
+        } else if let Some(value) =
+            arg.strip_prefix("--aethos-lan-fallback-max-chunks-per-request=")
+        {
+            if !value.trim().is_empty() {
+                std::env::set_var("AETHOS_LAN_FALLBACK_MAX_CHUNKS_PER_REQUEST", value.trim());
+            }
+        } else if let Some(value) = arg.strip_prefix("--aethos-lan-tcp-request-encounter=") {
+            if !value.trim().is_empty() {
+                std::env::set_var("AETHOS_LAN_TCP_REQUEST_ENCOUNTER", value.trim());
+            }
+        } else if let Some(value) =
+            arg.strip_prefix("--aethos-lan-media-control-fastlane-max-items=")
+        {
+            if !value.trim().is_empty() {
+                std::env::set_var("AETHOS_LAN_MEDIA_CONTROL_FASTLANE_MAX_ITEMS", value.trim());
+            }
+        } else if let Some(value) =
+            arg.strip_prefix("--aethos-media-missing-fastlane-redundancy=")
+        {
+            if !value.trim().is_empty() {
+                std::env::set_var("AETHOS_MEDIA_MISSING_FASTLANE_REDUNDANCY", value.trim());
+            }
+        } else if let Some(value) =
+            arg.strip_prefix("--aethos-media-e2e-wire-bucket-sustained-bytes-per-min=")
+        {
+            if !value.trim().is_empty() {
+                std::env::set_var(
+                    "AETHOS_MEDIA_E2E_WIRE_BUCKET_SUSTAINED_BYTES_PER_MIN",
+                    value.trim(),
+                );
+            }
+        } else if let Some(value) =
+            arg.strip_prefix("--aethos-media-e2e-wire-bucket-burst-bytes=")
+        {
+            if !value.trim().is_empty() {
+                std::env::set_var("AETHOS_MEDIA_E2E_WIRE_BUCKET_BURST_BYTES", value.trim());
+            }
+        } else if let Some(value) =
+            arg.strip_prefix("--aethos-media-e2e-missing-response-dedup-window-ms=")
+        {
+            if !value.trim().is_empty() {
+                std::env::set_var(
+                    "AETHOS_MEDIA_E2E_MISSING_RESPONSE_DEDUP_WINDOW_MS",
+                    value.trim(),
+                );
+            }
+        } else if let Some(value) =
+            arg.strip_prefix("--aethos-media-e2e-chunks-per-minute-limit=")
+        {
+            if !value.trim().is_empty() {
+                std::env::set_var("AETHOS_MEDIA_E2E_CHUNKS_PER_MINUTE_LIMIT", value.trim());
+            }
+        } else if let Some(value) =
+            arg.strip_prefix("--aethos-e2e-udp-transfer-frame-max-bytes=")
+        {
+            if !value.trim().is_empty() {
+                std::env::set_var("AETHOS_E2E_UDP_TRANSFER_FRAME_MAX_BYTES", value.trim());
+            }
+        } else if let Some(value) =
+            arg.strip_prefix("--aethos-media-e2e-housekeeping-min-interval-ms=")
+        {
+            if !value.trim().is_empty() {
+                std::env::set_var(
+                    "AETHOS_MEDIA_E2E_HOUSEKEEPING_MIN_INTERVAL_MS",
+                    value.trim(),
+                );
+            }
         }
     }
 }
@@ -3430,6 +3935,27 @@ mod tests {
             extract_sent_at_unix_ms_if_json(&payload),
             Some(1_700_000_000_123)
         );
+    }
+
+    #[test]
+    fn media_manifest_payload_preserves_caption_text() {
+        let payload = serde_json::json!({
+            "type": "aethos.media.manifest.v1",
+            "caption": "photo caption",
+            "file_name": "photo.png"
+        })
+        .to_string();
+        assert_eq!(extract_chat_text_if_json(&payload), "photo caption");
+    }
+
+    #[test]
+    fn media_manifest_payload_falls_back_to_image_label() {
+        let payload = serde_json::json!({
+            "type": "aethos.media.manifest.v1",
+            "file_name": "photo.png"
+        })
+        .to_string();
+        assert_eq!(extract_chat_text_if_json(&payload), "[Image] photo.png");
     }
 
     #[test]

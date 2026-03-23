@@ -27,6 +27,7 @@ pub const BLOOM_FILTER_BYTES: usize = 2048;
 pub const BLOOM_HASH_COUNT: u8 = 4;
 pub const CLOCK_SKEW_TOLERANCE_MS: u64 = 30_000;
 pub const MAX_SUMMARY_PREVIEW_ITEMS: usize = 64;
+const RELAY_INGEST_MAX_ITEMS_DEFAULT: usize = 96;
 
 const GOSSIP_STORE_FILE_NAME: &str = "gossip-object-store.json";
 
@@ -330,11 +331,24 @@ fn select_request_item_ids_from_summary_with_context(
 }
 
 pub fn build_relay_ingest_frame(now_ms: u64) -> Result<GossipSyncFrame, String> {
-    let frame = GossipSyncFrame::RelayIngest(RelayIngestFrame {
-        item_ids: eligible_item_ids(now_ms)?,
-    });
+    let relay_ingest_max_items = relay_ingest_max_items();
+    let item_ids = eligible_relay_ingest_item_ids(now_ms, relay_ingest_max_items)?;
+    log_verbose(&format!(
+        "relay_ingest_frame_built: item_ids={} cap={}",
+        item_ids.len(),
+        relay_ingest_max_items
+    ));
+    let frame = GossipSyncFrame::RelayIngest(RelayIngestFrame { item_ids });
     validate_frame(&frame)?;
     Ok(frame)
+}
+
+fn relay_ingest_max_items() -> usize {
+    std::env::var("AETHOS_RELAY_INGEST_MAX_ITEMS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .map(|value| value.clamp(16, MAX_WANT_ITEMS))
+        .unwrap_or(RELAY_INGEST_MAX_ITEMS_DEFAULT)
 }
 
 pub fn build_request_frame(
@@ -368,6 +382,32 @@ pub fn eligible_item_ids(now_ms: u64) -> Result<Vec<String>, String> {
     Ok(store.items.keys().cloned().collect())
 }
 
+fn eligible_relay_ingest_item_ids(now_ms: u64, max_items: usize) -> Result<Vec<String>, String> {
+    let _guard = store_mutex()
+        .lock()
+        .map_err(|_| "gossip store mutex poisoned".to_string())?;
+    let mut store = load_store()?;
+    prune_expired(&mut store, now_ms);
+    save_store(&store)?;
+
+    let mut items = store.items.values().collect::<Vec<_>>();
+    items.sort_by(|a, b| {
+        a.hop_count
+            .cmp(&b.hop_count)
+            .then_with(|| a.envelope_b64.len().cmp(&b.envelope_b64.len()))
+            .then_with(|| b.recorded_at_unix_ms.cmp(&a.recorded_at_unix_ms))
+            .then_with(|| a.item_id.cmp(&b.item_id))
+    });
+
+    let mut selected = items
+        .into_iter()
+        .take(max_items)
+        .map(|item| item.item_id.clone())
+        .collect::<Vec<_>>();
+    selected.sort_by_key(|item_id| decode_item_id(item_id).unwrap_or_default());
+    Ok(selected)
+}
+
 pub fn record_local_payload(payload_b64: &str, expiry_unix_ms: u64) -> Result<String, String> {
     if !is_valid_payload_b64(payload_b64) {
         return Err("invalid payload_b64 format for gossip storage".to_string());
@@ -391,6 +431,33 @@ pub fn record_local_payload(payload_b64: &str, expiry_unix_ms: u64) -> Result<St
         expiry_unix_ms,
         raw.len()
     ));
+
+    if let Some(existing) = store.items.get_mut(&item_id) {
+        if existing.envelope_b64 != payload_b64 {
+            return Err("existing item_id maps to different envelope bytes".to_string());
+        }
+        let mut changed = false;
+        if existing.expiry_unix_ms < expiry_unix_ms {
+            existing.expiry_unix_ms = expiry_unix_ms;
+            changed = true;
+        }
+        if existing.recorded_at_unix_ms < now {
+            existing.recorded_at_unix_ms = now;
+            changed = true;
+        }
+        let refreshed_expiry = existing.expiry_unix_ms;
+        if changed {
+            prune_expired(&mut store, now);
+            save_store(&store)?;
+            log_verbose(&format!(
+                "object_store_put_refresh: item_id={} expiry_unix_ms={}",
+                item_id, refreshed_expiry
+            ));
+        } else {
+            log_verbose(&format!("object_store_put_dedupe: item_id={item_id}"));
+        }
+        return Ok(item_id);
+    }
 
     let item = StoredItem {
         item_id: item_id.clone(),
@@ -424,25 +491,36 @@ pub fn transfer_items_for_request(
     let mut selected = Vec::new();
     let mut consumed_bytes = 0u64;
     let store = load_store()?;
+    let max_transfer_bytes = max_bytes.min(MAX_TRANSFER_BYTES);
 
-    for item_id in requested_item_ids {
+    let mut candidates = requested_item_ids
+        .iter()
+        .filter_map(|item_id| {
+            let stored = store.items.get(item_id)?;
+            if now_ms + CLOCK_SKEW_TOLERANCE_MS >= stored.expiry_unix_ms {
+                return None;
+            }
+            Some(stored)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|a, b| {
+        a.envelope_b64
+            .len()
+            .cmp(&b.envelope_b64.len())
+            .then_with(|| a.item_id.cmp(&b.item_id))
+    });
+
+    for stored in candidates {
         if selected.len() >= max_items as usize || selected.len() >= MAX_TRANSFER_ITEMS {
             break;
-        }
-
-        let Some(stored) = store.items.get(item_id) else {
-            continue;
-        };
-        if now_ms + CLOCK_SKEW_TOLERANCE_MS >= stored.expiry_unix_ms {
-            continue;
         }
 
         let envelope_raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(&stored.envelope_b64)
             .map_err(|err| format!("stored envelope decode failed: {err}"))?;
         let projected = consumed_bytes.saturating_add(envelope_raw.len() as u64);
-        if projected > max_bytes.min(MAX_TRANSFER_BYTES) {
-            break;
+        if projected > max_transfer_bytes {
+            continue;
         }
 
         consumed_bytes = projected;
@@ -699,8 +777,9 @@ fn build_summary_preview_item_ids(now_ms: u64) -> Result<Vec<String>, String> {
         .values()
         .map(|item| {
             (
-                item.expiry_unix_ms,
                 item.hop_count,
+                item.envelope_b64.len(),
+                item.recorded_at_unix_ms,
                 decode_item_id(&item.item_id).unwrap_or_default(),
                 item.item_id.clone(),
             )
@@ -710,13 +789,14 @@ fn build_summary_preview_item_ids(now_ms: u64) -> Result<Vec<String>, String> {
         left.0
             .cmp(&right.0)
             .then_with(|| left.1.cmp(&right.1))
-            .then_with(|| left.2.cmp(&right.2))
+            .then_with(|| right.2.cmp(&left.2))
+            .then_with(|| left.3.cmp(&right.3))
     });
 
     let mut preview_item_ids = ranked
         .into_iter()
         .take(MAX_SUMMARY_PREVIEW_ITEMS)
-        .map(|(_, _, _, item_id)| item_id)
+        .map(|(_, _, _, _, item_id)| item_id)
         .collect::<Vec<_>>();
     preview_item_ids.sort_by_key(|item_id| decode_item_id(item_id).unwrap_or_default());
     preview_item_ids.dedup();
