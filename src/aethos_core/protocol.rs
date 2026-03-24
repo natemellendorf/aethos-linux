@@ -336,6 +336,7 @@ mod tests {
     use base64::Engine;
     use ciborium::value::Value;
     use ed25519_dalek::SigningKey;
+    use serde::Deserialize;
     use sha2::{Digest, Sha256};
 
     const VECTOR_TO_WAYFARER_ID: &str =
@@ -462,5 +463,69 @@ mod tests {
         assert!(decode_envelope_payload_b64(&tampered_b64)
             .expect_err("tampered signature must fail")
             .contains("invalid envelope signature"));
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct EnvelopeVectorSet {
+        vectors: Vec<EnvelopeVector>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct EnvelopeVector {
+        payload_b64: String,
+        item_id_hex: String,
+        canonical_envelope_cbor_hex: String,
+        expected_decoded: ExpectedDecoded,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ExpectedDecoded {
+        to_wayfarer_id: String,
+        manifest_id: String,
+        body_utf8_preview: String,
+    }
+
+    #[test]
+    fn cross_client_vectors_decode_and_verify() {
+        let vectors_raw = std::fs::read_to_string(format!(
+            "{}/test-data/gossip-v1/envelope_vectors.json",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("read vector file");
+        let vector_set: EnvelopeVectorSet =
+            serde_json::from_str(&vectors_raw).expect("parse vector json");
+        assert!(!vector_set.vectors.is_empty());
+
+        for vector in vector_set.vectors {
+            let envelope_raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(&vector.payload_b64)
+                .expect("decode payload_b64");
+            assert_eq!(
+                bytes_to_hex_lower(&envelope_raw),
+                vector.canonical_envelope_cbor_hex
+            );
+            assert_eq!(
+                bytes_to_hex_lower(&Sha256::digest(&envelope_raw)),
+                vector.item_id_hex
+            );
+
+            let decoded =
+                decode_envelope_payload_b64(&vector.payload_b64).expect("decode envelope payload");
+            assert_eq!(
+                decoded.to_wayfarer_id_hex,
+                vector.expected_decoded.to_wayfarer_id
+            );
+            assert_eq!(decoded.manifest_id_hex, vector.expected_decoded.manifest_id);
+            assert_eq!(
+                String::from_utf8(decoded.body).expect("body is utf8"),
+                vector.expected_decoded.body_utf8_preview
+            );
+            assert_eq!(
+                vector.expected_decoded.manifest_id,
+                bytes_to_hex_lower(&Sha256::digest(
+                    vector.expected_decoded.body_utf8_preview.as_bytes()
+                ))
+            );
+        }
     }
 }

@@ -916,6 +916,7 @@ where
 mod tests {
     use super::*;
     use base64::Engine;
+    use serde::Deserialize;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Mutex, OnceLock};
 
@@ -1162,6 +1163,69 @@ mod tests {
 
         let parsed = parse_frame(&noncanonical_raw).expect("parse noncanonical frame");
         assert!(matches!(parsed, GossipSyncFrame::Hello(_)));
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct EnvelopeVectorSet {
+        vectors: Vec<EnvelopeVector>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct EnvelopeVector {
+        payload_b64: String,
+        item_id_hex: String,
+        expected_decoded: ExpectedDecoded,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ExpectedDecoded {
+        to_wayfarer_id: String,
+        body_utf8_preview: String,
+    }
+
+    #[test]
+    fn cross_client_vectors_import_into_rust_gossip_store() {
+        let _lock = test_env_lock().lock().expect("lock test env");
+        let temp_dir = unique_test_state_dir("aethos-gossip-import-cross-client-vectors");
+        let _env_guard = EnvVarGuard::set("XDG_STATE_HOME", &temp_dir);
+
+        let vectors_raw = std::fs::read_to_string(format!(
+            "{}/test-data/gossip-v1/envelope_vectors.json",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("read vector file");
+        let vector_set: EnvelopeVectorSet =
+            serde_json::from_str(&vectors_raw).expect("parse vector json");
+
+        for vector in vector_set.vectors {
+            let transfer = TransferObject {
+                item_id: vector.item_id_hex.clone(),
+                envelope_b64: vector.payload_b64,
+                expiry_unix_ms: now_unix_ms() + 60_000,
+                hop_count: 1,
+            };
+
+            let imported = import_transfer_items(
+                &vector.expected_decoded.to_wayfarer_id,
+                Some("127.0.0.1:47655"),
+                Some(&item(0x44)),
+                &[transfer],
+                now_unix_ms(),
+            )
+            .expect("import vector transfer");
+
+            assert_eq!(imported.accepted_item_ids, vec![vector.item_id_hex]);
+            assert!(imported.rejected_items.is_empty());
+            assert_eq!(imported.new_messages.len(), 1);
+            assert_eq!(
+                imported.new_messages[0].text,
+                vector.expected_decoded.body_utf8_preview
+            );
+            assert_eq!(
+                imported.new_messages[0].item_id,
+                imported.accepted_item_ids[0]
+            );
+        }
     }
 
     #[test]
