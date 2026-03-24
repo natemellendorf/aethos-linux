@@ -664,8 +664,11 @@ pub fn send_media_manifest_and_chunks(
 
     let drop_chunk_index = e2e_drop_chunk_index();
     let initial_ceiling = INITIAL_OUTBOUND_CHUNK_CEILING.min(chunk_count as usize);
+    let mut initial_chunks_queued = 0usize;
+    let mut initial_chunks_dropped = 0usize;
     for chunk_index in 0..initial_ceiling {
         if Some(chunk_index as u32) == drop_chunk_index {
+            initial_chunks_dropped = initial_chunks_dropped.saturating_add(1);
             log_verbose(&format!(
                 "media_e2e_drop_chunk: transfer_id={} chunk_index={}",
                 transfer_id, chunk_index
@@ -682,7 +685,19 @@ pub fn send_media_manifest_and_chunks(
             now_ms,
             max_item_payload_b64_bytes,
         )?;
+        initial_chunks_queued = initial_chunks_queued.saturating_add(1);
     }
+    log_verbose(&format!(
+        "media_outbound_publish_summary: transfer_id={} recipient={} object_bytes={} chunk_count={} initial_ceiling={} initial_chunks_queued={} initial_chunks_dropped={} expiry_ms={}",
+        transfer_id,
+        to_wayfarer_id,
+        object_bytes.len(),
+        chunk_count,
+        initial_ceiling,
+        initial_chunks_queued,
+        initial_chunks_dropped,
+        expires_at_unix_ms
+    ));
 
     Ok(OutboundMediaSendResult {
         item_id,
@@ -1081,8 +1096,14 @@ pub fn process_incoming_media_message(
                 let mut sent_chunks = 0usize;
                 let chunk_ceiling = missing_response_chunk_ceiling();
                 let dedup_key = format!("{}:{}", sender, msg.transfer_id);
+                let mut invalid_range_skips = 0usize;
+                let mut dedup_skips = 0usize;
+                let mut out_of_bounds_skips = 0usize;
+                let mut e2e_drop_skips = 0usize;
+                let mut first_queue_error = None::<String>;
                 for range in msg.ranges {
                     if range.start > range.end {
+                        invalid_range_skips = invalid_range_skips.saturating_add(1);
                         log_verbose(&format!(
                             "media_missing_range_ignored: requester={} transfer_id={} reason=invalid_range start={} end={}",
                             sender, msg.transfer_id, range.start, range.end
@@ -1095,21 +1116,24 @@ pub fn process_incoming_media_message(
                             break;
                         }
                         if index >= outbound.chunk_count {
+                            out_of_bounds_skips = out_of_bounds_skips.saturating_add(1);
                             break;
                         }
                         if Some(index) == e2e_drop_chunk_index() {
+                            e2e_drop_skips = e2e_drop_skips.saturating_add(1);
                             index = index.saturating_add(1);
                             continue;
                         }
                         let send_now_ms = now_unix_ms();
                         if missing_response_chunk_recently_sent(&dedup_key, index, send_now_ms) {
+                            dedup_skips = dedup_skips.saturating_add(1);
                             index = index.saturating_add(1);
                             continue;
                         }
 
                         let chunk_bytes =
                             read_chunk_bytes_from_file(&mut source_file, &manifest, index)?;
-                        let _ = queue_chunk_message_fastlane(
+                        if let Err(err) = queue_chunk_message_fastlane(
                             &manifest,
                             index,
                             &chunk_bytes,
@@ -1118,19 +1142,33 @@ pub fn process_incoming_media_message(
                             ttl_seconds_max,
                             send_now_ms,
                             max_payload,
-                        )?;
+                        ) {
+                            if first_queue_error.is_none() {
+                                first_queue_error = Some(err.clone());
+                            }
+                            log_verbose(&format!(
+                                "media_missing_chunk_queue_failed: requester={} transfer_id={} chunk_index={} error={}",
+                                sender, msg.transfer_id, index, err
+                            ));
+                            break;
+                        }
                         note_missing_response_chunk_sent(&dedup_key, index, send_now_ms);
                         sent_chunks = sent_chunks.saturating_add(1);
                         index = index.saturating_add(1);
                     }
                 }
                 log_verbose(&format!(
-                    "media_missing_served: requester={} transfer_id={} ranges={} sent_chunks={} chunk_ceiling={}",
+                    "media_missing_served: requester={} transfer_id={} ranges={} sent_chunks={} chunk_ceiling={} invalid_range_skips={} dedup_skips={} out_of_bounds_skips={} e2e_drop_skips={} queue_error={}",
                     sender,
                     msg.transfer_id,
                     requested_ranges,
                     sent_chunks,
-                    chunk_ceiling
+                    chunk_ceiling,
+                    invalid_range_skips,
+                    dedup_skips,
+                    out_of_bounds_skips,
+                    e2e_drop_skips,
+                    first_queue_error.unwrap_or_else(|| "none".to_string())
                 ));
             } else {
                 log_verbose(&format!(
@@ -1445,7 +1483,12 @@ fn record_chunk_message(
     )?;
     rate_limit_outbound(payload.len(), now_ms, false, true)?;
     let expiry = apply_expiry_authority(manifest.expires_at_unix_ms, now_ms, ttl_seconds_max);
-    gossip_record_local_payload(&payload, expiry)
+    let item_id = gossip_record_local_payload(&payload, expiry)?;
+    log_verbose(&format!(
+        "media_chunk_published: stage=initial transfer_id={} recipient={} chunk_index={} item_id={}",
+        manifest.transfer_id, to_wayfarer_id, chunk_index, item_id
+    ));
+    Ok(item_id)
 }
 
 #[allow(clippy::too_many_arguments)]

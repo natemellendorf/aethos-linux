@@ -321,6 +321,42 @@ export default function App() {
     });
   }, [chat.threads, selectedContactId]);
 
+  const mediaDebugRows = useMemo(() => {
+    const rows = [];
+    for (const [contactId, thread] of Object.entries(chat.threads || {})) {
+      for (const message of thread || []) {
+        if (!message?.media) continue;
+        const media = message.media;
+        const transferId = String(media.transferId || "");
+        const chunkCount = Number(media.chunkCount || 0);
+        const receivedChunks = Number(media.receivedChunks || 0);
+        const status = String(media.status || "").trim() || "unknown";
+        const contactAlias = contacts?.[contactId] || tinyId(contactId);
+        const syncError = String(message?.lastSyncError || "").trim();
+        const mediaError = String(media?.error || "").trim();
+        const failedError =
+          message?.outboundState && typeof message.outboundState === "object"
+            ? String(message.outboundState?.failed?.error || "").trim()
+            : "";
+        const lastError = mediaError || syncError || failedError || "-";
+        rows.push({
+          key: `${contactId}:${transferId || message.msgId}`,
+          direction: String(message.direction || "Unknown"),
+          contactId,
+          contactAlias,
+          transferId: transferId || String(message.msgId || ""),
+          chunkCount,
+          receivedChunks,
+          status,
+          lastError,
+          createdAtUnixMs: Number(messageUnixMs(message) || 0)
+        });
+      }
+    }
+    rows.sort((a, b) => b.createdAtUnixMs - a.createdAtUnixMs);
+    return rows;
+  }, [chat.threads, contacts]);
+
   useEffect(() => {
     const baseline = new Set(selectedThread.map((message) => message.msgId));
     seenThreadMessageIdsRef.current = baseline;
@@ -1563,6 +1599,26 @@ export default function App() {
                     <p>Encounter: {report.encounterStatus}</p>
                   </div>
                 )) : null}
+
+                <div className="mt-2 rounded border border-border/50 bg-background/30 p-2 text-xs">
+                  <p className="mb-1 font-semibold text-foreground">Media Transfer Debug</p>
+                  {mediaDebugRows.length === 0 ? (
+                    <p className="text-muted-foreground" data-testid="media-debug-empty">No media transfers tracked yet.</p>
+                  ) : (
+                    <div className="max-h-48 overflow-auto space-y-1" data-testid="media-debug-list">
+                      {mediaDebugRows.map((row) => (
+                        <div key={row.key} className="rounded border border-border/40 bg-background/50 p-1.5">
+                          <p className="text-foreground" data-testid={`media-debug-${row.transferId}`}>
+                            {row.direction} · {row.contactAlias}
+                          </p>
+                          <p>transfer={tinyId(row.transferId)} status={row.status}</p>
+                          <p>chunks={row.receivedChunks}/{row.chunkCount}</p>
+                          <p>lastError={row.lastError}</p>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
               </CardContent>
               </Card>
             </div>
