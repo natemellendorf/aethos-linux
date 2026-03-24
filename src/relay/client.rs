@@ -344,7 +344,7 @@ pub fn open_relay_persistent_session(
         lease,
         socket,
         peer_hello,
-        relay_ingest_trusted: auth_token.is_some(),
+        relay_ingest_trusted: should_trust_relay_ingest(relay_ws),
         last_heartbeat_at: Instant::now(),
     })
 }
@@ -425,10 +425,11 @@ pub fn run_relay_encounter_gossipv1_for_duration(
     let lease = RelaySessionLease::acquire(relay_ws, &identity.wayfarer_id, "encounter")
         .map_err(|err| format!("relay encounter skipped: {err}"))?;
     log_verbose(&format!(
-        "relay_encounter_open: relay_ws={} wayfarer={} auth={} trace_item_id={}",
+        "relay_encounter_open: relay_ws={} wayfarer={} auth={} relay_ingest_trusted={} trace_item_id={}",
         relay_ws,
         identity.wayfarer_id,
         auth_token.is_some(),
+        should_trust_relay_ingest(relay_ws),
         trace_item_id.unwrap_or("none")
     ));
     let mut socket = match open_relay_socket(relay_ws, auth_token) {
@@ -469,7 +470,7 @@ pub fn run_relay_encounter_gossipv1_for_duration(
         relay_ws,
         identity,
         &peer_hello,
-        auth_token.is_some(),
+        should_trust_relay_ingest(relay_ws),
         trace_item_id,
         encounter_window,
     ) {
@@ -789,6 +790,14 @@ fn should_stop_for_no_progress(streak: usize) -> bool {
     streak >= 2
 }
 
+fn should_trust_relay_ingest(relay_ws: &str) -> bool {
+    // TODO: replace this transport-level trust stub with explicit relay bearer-token
+    // validation once relay auth is implemented end-to-end.
+    Url::parse(relay_ws)
+        .map(|url| url.scheme() == "wss")
+        .unwrap_or(false)
+}
+
 fn is_nonfatal_read_timeout(err: &str) -> bool {
     let lower = err.to_ascii_lowercase();
     lower.contains("wouldblock")
@@ -1041,7 +1050,7 @@ fn relay_frame_type(frame: &GossipSyncFrame) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_nonfatal_remote_close, should_stop_for_no_progress};
+    use super::{is_nonfatal_remote_close, should_stop_for_no_progress, should_trust_relay_ingest};
 
     #[test]
     fn nonfatal_remote_close_patterns_match_expected_errors() {
@@ -1068,6 +1077,14 @@ mod tests {
         assert!(!should_stop_for_no_progress(1));
         assert!(should_stop_for_no_progress(2));
         assert!(should_stop_for_no_progress(3));
+    }
+
+    #[test]
+    fn relay_ingest_trust_stub_only_allows_secure_websocket_scheme() {
+        assert!(should_trust_relay_ingest("wss://relay.example/ws"));
+        assert!(!should_trust_relay_ingest("ws://relay.example/ws"));
+        assert!(!should_trust_relay_ingest("https://relay.example/ws"));
+        assert!(!should_trust_relay_ingest("not-a-url"));
     }
 }
 
