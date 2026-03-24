@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 #[path = "../aethos_core/mod.rs"]
 mod aethos_core;
 #[path = "../relay/mod.rs"]
