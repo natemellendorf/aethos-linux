@@ -299,6 +299,8 @@ pub fn connect_to_relay_gossipv1_with_auth(
 pub struct EncounterReport {
     pub transferred_items: usize,
     pub pulled_messages: Vec<EncounterMessagePreview>,
+    pub trace_requested_by_peer: bool,
+    pub trace_receipted_by_peer: bool,
     #[allow(dead_code)]
     pub remote_closed: bool,
 }
@@ -561,6 +563,8 @@ fn run_relay_round_on_socket(
     let mut saw_request = false;
     let mut saw_relay_ingest = false;
     let mut saw_receipt = false;
+    let mut trace_requested_by_peer = false;
+    let mut trace_receipted_by_peer = false;
     let mut no_progress_streak = 0usize;
     let mut remote_closed = false;
 
@@ -703,6 +707,7 @@ fn run_relay_round_on_socket(
             GossipSyncFrame::Request(request) => {
                 saw_request = true;
                 if let Some(trace_item_id) = trace_item_id {
+                    trace_requested_by_peer |= request.want.iter().any(|id| id == trace_item_id);
                     log_verbose(&format!(
                         "relay_trace_request_contains_item: relay_ws={} item_id={} requested_by_peer={}",
                         relay_ws,
@@ -796,6 +801,12 @@ fn run_relay_round_on_socket(
             }
             GossipSyncFrame::Receipt(receipt) => {
                 saw_receipt = true;
+                if let Some(trace_item_id) = trace_item_id {
+                    trace_receipted_by_peer |= receipt
+                        .received
+                        .iter()
+                        .any(|item_id| item_id == trace_item_id);
+                }
                 made_progress = !receipt.received.is_empty();
                 log_verbose(&format!(
                     "relay_encounter_recv_receipt: relay_ws={} received_items={}",
@@ -842,6 +853,8 @@ fn run_relay_round_on_socket(
     Ok(EncounterReport {
         transferred_items,
         pulled_messages,
+        trace_requested_by_peer,
+        trace_receipted_by_peer,
         remote_closed,
     })
 }

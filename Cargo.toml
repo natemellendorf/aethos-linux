@@ -7,6 +7,10 @@ edition = "2021"
 name = "aethos"
 path = "src/main.rs"
 
+[[bin]]
+name = "relay-smoke"
+path = "src/bin/relay-smoke.rs"
+
 [dependencies]
 gtk4 = "0.8"
 glib = "0.19"

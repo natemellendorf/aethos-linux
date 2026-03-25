@@ -2307,51 +2307,65 @@ fn build_ui(app: &Application) {
                     Some(&recorded_item_id),
                 );
 
-                let status = match result {
-                    Ok(report) => SessionStatus {
-                        op: SessionOp::Send,
-                        text: format!(
-                            "encounter complete (relay+LAN): pushed item {} ({} transfer(s))",
-                            short_msg_id(&recorded_item_id),
-                            report.transferred_items
-                        ),
-                        ack_msg_id: Some(recorded_item_id),
-                        outgoing_contact: Some(to),
-                        outgoing_text: Some(outgoing_text),
-                        outgoing_manifest_id,
-                        outgoing_local_id: Some(local_outgoing_id),
-                        outgoing_expiry_unix_ms: Some(expires_at_unix_ms),
-                        outgoing_error: None,
-                        pulled_messages: report
-                            .pulled_messages
-                            .into_iter()
-                            .map(|item| PulledMessagePreview {
-                                author_wayfarer_id: item.author_wayfarer_id,
-                                session_peer: item.session_peer,
-                                transport_peer: item.transport_peer,
-                                msg_id: item.item_id,
-                                text: extract_chat_text_if_json(&item.text),
-                                received_at: item.received_at_unix,
-                                manifest_id_hex: item.manifest_id_hex,
-                                receipt_manifest_id: None,
-                                receipt_received_at_unix_ms: None,
-                            })
-                            .collect(),
-                    },
-                    Err(err) => SessionStatus {
-                        op: SessionOp::Send,
-                        text: format!(
-                            "relay encounter failed; message remains queued for LAN gossip: {err}"
-                        ),
-                        ack_msg_id: None,
-                        outgoing_contact: Some(to_for_status),
-                        outgoing_text: Some(text_for_status),
-                        outgoing_manifest_id: manifest_for_status,
-                        outgoing_local_id: Some(local_outgoing_id),
-                        outgoing_expiry_unix_ms: Some(expires_at_unix_ms),
-                        outgoing_error: Some(err.clone()),
-                        pulled_messages: Vec::new(),
-                    },
+                let (status, trace_requested_by_peer, trace_receipted_by_peer) = match result {
+                    Ok(report) => {
+                        let trace_requested_by_peer = report.trace_requested_by_peer;
+                        let trace_receipted_by_peer = report.trace_receipted_by_peer;
+                        (
+                            SessionStatus {
+                                op: SessionOp::Send,
+                                text: format!(
+                                    "encounter complete (relay+LAN): pushed item {} ({} transfer(s); requested_by_peer={}; receipted_by_peer={})",
+                                    short_msg_id(&recorded_item_id),
+                                    report.transferred_items,
+                                    trace_requested_by_peer,
+                                    trace_receipted_by_peer
+                                ),
+                                ack_msg_id: Some(recorded_item_id),
+                                outgoing_contact: Some(to),
+                                outgoing_text: Some(outgoing_text),
+                                outgoing_manifest_id,
+                                outgoing_local_id: Some(local_outgoing_id),
+                                outgoing_expiry_unix_ms: Some(expires_at_unix_ms),
+                                outgoing_error: None,
+                                pulled_messages: report
+                                    .pulled_messages
+                                    .into_iter()
+                                    .map(|item| PulledMessagePreview {
+                                        author_wayfarer_id: item.author_wayfarer_id,
+                                        session_peer: item.session_peer,
+                                        transport_peer: item.transport_peer,
+                                        msg_id: item.item_id,
+                                        text: extract_chat_text_if_json(&item.text),
+                                        received_at: item.received_at_unix,
+                                        manifest_id_hex: item.manifest_id_hex,
+                                        receipt_manifest_id: None,
+                                        receipt_received_at_unix_ms: None,
+                                    })
+                                    .collect(),
+                            },
+                            trace_requested_by_peer,
+                            trace_receipted_by_peer,
+                        )
+                    }
+                    Err(err) => (
+                        SessionStatus {
+                            op: SessionOp::Send,
+                            text: format!(
+                                "relay encounter failed; message remains queued for LAN gossip: {err}"
+                            ),
+                            ack_msg_id: None,
+                            outgoing_contact: Some(to_for_status),
+                            outgoing_text: Some(text_for_status),
+                            outgoing_manifest_id: manifest_for_status,
+                            outgoing_local_id: Some(local_outgoing_id),
+                            outgoing_expiry_unix_ms: Some(expires_at_unix_ms),
+                            outgoing_error: Some(err.clone()),
+                            pulled_messages: Vec::new(),
+                        },
+                        false,
+                        false,
+                    ),
                 };
                 if status.outgoing_error.is_some() {
                     shared_log_verbose(&format!(
@@ -2369,11 +2383,13 @@ fn build_ui(app: &Application) {
                     ));
                 } else {
                     shared_log_verbose(&format!(
-                        "encounter_success: relay_ws={} to={} msg_id={} pulled_messages={}",
+                        "encounter_success: relay_ws={} to={} msg_id={} pulled_messages={} trace_requested_by_peer={} trace_receipted_by_peer={}",
                         relay_ws,
                         status.outgoing_contact.as_deref().unwrap_or("unknown"),
                         status.ack_msg_id.as_deref().unwrap_or("none"),
-                        status.pulled_messages.len()
+                        status.pulled_messages.len(),
+                        trace_requested_by_peer,
+                        trace_receipted_by_peer
                     ));
                 }
                 let _ = session_tx.send(status);
@@ -2999,10 +3015,12 @@ fn sync_inbox_once(relay_http: &str) -> Result<Vec<PulledMessagePreview>, String
     ));
     let report = run_relay_encounter_gossipv1(&relay_ws, &identity, auth.as_deref(), None)?;
     shared_log_verbose(&format!(
-        "inbox_sync_done: relay_ws={} transferred_items={} pulled_messages={}",
+        "inbox_sync_done: relay_ws={} transferred_items={} pulled_messages={} trace_requested_by_peer={} trace_receipted_by_peer={}",
         relay_ws,
         report.transferred_items,
-        report.pulled_messages.len()
+        report.pulled_messages.len(),
+        report.trace_requested_by_peer,
+        report.trace_receipted_by_peer
     ));
     Ok(report
         .pulled_messages
