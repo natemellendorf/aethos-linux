@@ -296,9 +296,56 @@ fn encode_cbor_value_raw(value: &Value) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+#[allow(dead_code)]
 pub fn decode_envelope_payload_utf8_preview(payload_b64: &str) -> Result<String, String> {
     let decoded = decode_envelope_payload_b64(payload_b64)?;
     String::from_utf8(decoded.body).map_err(|_| "envelope body is not valid UTF-8".to_string())
+}
+
+pub fn decode_envelope_payload_text_preview(payload_b64: &str) -> Result<String, String> {
+    let decoded = decode_envelope_payload_b64(payload_b64)?;
+    let utf8_body = String::from_utf8(decoded.body.clone()).ok();
+
+    if let Some(utf8_body) = utf8_body.as_ref() {
+        if let Some(chat_text) = extract_text_field_from_json(utf8_body) {
+            return Ok(chat_text);
+        }
+    }
+
+    if let Some(json_slice) = extract_json_object_slice(&decoded.body) {
+        let json_text = String::from_utf8(json_slice.to_vec())
+            .map_err(|_| "envelope body json preview was not valid UTF-8".to_string())?;
+        if let Some(chat_text) = extract_text_field_from_json(&json_text) {
+            return Ok(chat_text);
+        }
+        return Ok(json_text);
+    }
+
+    if let Some(utf8_body) = utf8_body {
+        return Ok(utf8_body);
+    }
+
+    Err("envelope body does not contain a readable text payload".to_string())
+}
+
+fn extract_text_field_from_json(json: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(json).ok()?;
+    value
+        .get("text")
+        .and_then(|candidate| candidate.as_str())
+        .map(|text| text.to_string())
+}
+
+fn extract_json_object_slice(bytes: &[u8]) -> Option<&[u8]> {
+    let start = bytes.iter().position(|byte| *byte == b'{')?;
+    let end = bytes.iter().rposition(|byte| *byte == b'}')?;
+    if end < start {
+        return None;
+    }
+
+    let slice = &bytes[start..=end];
+    serde_json::from_slice::<serde_json::Value>(slice).ok()?;
+    Some(slice)
 }
 
 fn parse_wayfarer_id_hex(hex_lower: &str) -> Result<[u8; 32], String> {
@@ -333,7 +380,7 @@ mod tests {
 
     use super::{
         build_envelope_payload_b64_from_utf8, bytes_to_hex_lower, decode_envelope_payload_b64,
-        encode_cbor_value_deterministic, parse_envelope_cbor,
+        decode_envelope_payload_text_preview, encode_cbor_value_deterministic, parse_envelope_cbor,
     };
     use base64::Engine;
     use ciborium::value::Value;
@@ -444,6 +491,22 @@ mod tests {
             decoded.author_wayfarer_id_hex,
             expected_author_wayfarer_id()
         );
+    }
+
+    #[test]
+    fn envelope_text_preview_extracts_chat_text_from_canonical_message_body() {
+        let destination = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let from = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let payload = format!(
+            "\u{0002}\u{0003}\u{0001}\u{0000}\u{0000}\u{0000}\u{0008}\u{0000}\u{0000}\u{0001}\u{009d}\u{0000}\u{0000}\u{0000}\u{0020}{from}\u{0003}\u{0000}\u{0000}\u{0000}\u{001f}{{\"text\":\"interop marker\",\"type\":\"chat\",\"v\":2}}"
+        );
+        let envelope_b64 =
+            build_envelope_payload_b64_from_utf8(destination, &payload, &TEST_SIGNING_KEY_SEED)
+                .expect("build envelope with canonical message body payload");
+
+        let preview = decode_envelope_payload_text_preview(&envelope_b64)
+            .expect("decode envelope text preview");
+        assert_eq!(preview, "interop marker");
     }
 
     #[test]

@@ -19,7 +19,7 @@ use crate::aethos_core::gossip_sync::{
 };
 use crate::aethos_core::identity_store::LocalIdentitySummary;
 use crate::aethos_core::logging::log_verbose;
-use crate::aethos_core::protocol::decode_envelope_payload_utf8_preview;
+use crate::aethos_core::protocol::decode_envelope_payload_text_preview;
 
 type RelaySocket = tungstenite::WebSocket<MaybeTlsStream<TcpStream>>;
 static RUSTLS_PROVIDER_INIT: Once = Once::new();
@@ -785,7 +785,7 @@ fn run_relay_round_on_socket(
                         session_peer: message.session_peer,
                         transport_peer: message.transport_peer,
                         item_id: item_id.clone(),
-                        text: decode_envelope_payload_utf8_preview(
+                        text: decode_envelope_payload_text_preview(
                             &transfer
                                 .objects
                                 .iter()
@@ -1023,14 +1023,42 @@ fn unix_day(now_ms: u64) -> u64 {
 }
 
 fn is_relay_ingest_allowed(relay_ws: &str) -> bool {
-    // Policy stub: RELAY_INGEST hints are only accepted over secure websocket transport.
-    // No relay allowlist or bearer-token authenticity checks are implemented here.
-    is_relay_ingest_secure_transport(relay_ws)
+    let Ok(url) = Url::parse(relay_ws) else {
+        return false;
+    };
+
+    if url.scheme() == "wss" {
+        return true;
+    }
+
+    // Local interop uses a plaintext websocket relay on loopback.
+    // Keep insecure relay-ingest disabled everywhere else.
+    url.scheme() == "ws" && is_loopback_host(url.host_str())
 }
 
 fn is_relay_ingest_secure_transport(relay_ws: &str) -> bool {
     Url::parse(relay_ws)
         .map(|url| url.scheme() == "wss")
+        .unwrap_or(false)
+}
+
+fn is_loopback_host(host: Option<&str>) -> bool {
+    let Some(host) = host else {
+        return false;
+    };
+
+    let normalized_host = host
+        .strip_prefix('[')
+        .and_then(|trimmed| trimmed.strip_suffix(']'))
+        .unwrap_or(host);
+
+    if normalized_host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+
+    normalized_host
+        .parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
         .unwrap_or(false)
 }
 
@@ -1320,8 +1348,11 @@ mod tests {
     }
 
     #[test]
-    fn relay_ingest_policy_only_allows_secure_websocket_scheme() {
+    fn relay_ingest_policy_allows_secure_and_loopback_websocket_scheme() {
         assert!(is_relay_ingest_allowed("wss://relay.example/ws"));
+        assert!(is_relay_ingest_allowed("ws://127.0.0.1:8080/ws"));
+        assert!(is_relay_ingest_allowed("ws://localhost:8080/ws"));
+        assert!(is_relay_ingest_allowed("ws://[::1]:8080/ws"));
         assert!(!is_relay_ingest_allowed("ws://relay.example/ws"));
         assert!(!is_relay_ingest_allowed("https://relay.example/ws"));
         assert!(!is_relay_ingest_allowed("not-a-url"));

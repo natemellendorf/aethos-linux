@@ -13,7 +13,7 @@ use crate::aethos_core::gossip_store_sqlite::{
 use crate::aethos_core::logging::log_verbose;
 use crate::aethos_core::protocol::{
     bytes_to_hex_lower, decode_cbor_value_exact, decode_envelope_payload_b64,
-    decode_envelope_payload_utf8_preview, encode_cbor_value_deterministic, is_valid_payload_b64,
+    decode_envelope_payload_text_preview, encode_cbor_value_deterministic, is_valid_payload_b64,
     to_cbor_value,
 };
 
@@ -571,7 +571,7 @@ pub fn import_transfer_items(
                 pending_new_inserts.push(insert);
                 accepted_item_ids.push(object.item_id.clone());
                 if parsed.to_wayfarer_id_hex == local_wayfarer_id {
-                    match decode_envelope_payload_utf8_preview(&object.envelope_b64) {
+                    match decode_envelope_payload_text_preview(&object.envelope_b64) {
                         Ok(text) => {
                             new_messages.push(ImportedEnvelope {
                                 item_id: object.item_id.clone(),
