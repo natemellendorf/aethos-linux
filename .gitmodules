@@ -1,0 +1,3 @@
+[submodule "third_party/aethos"]
+	path = third_party/aethos
+	url = https://github.com/natemellendorf/aethos.git

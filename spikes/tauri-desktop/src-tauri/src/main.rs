@@ -4,6 +4,7 @@
 )]
 
 mod app_state;
+mod app_body;
 mod media_v1;
 
 #[allow(dead_code)]
@@ -27,8 +28,12 @@ use std::time::{Duration, Instant};
 
 use app_state::{
     load_app_settings, load_chat_state, normalize_chat_state, now_unix_ms, now_unix_secs,
-    save_app_settings, save_chat_state, AppSettings, ChatAttachment, ChatDirection,
-    ChatMediaTransfer, ChatMessage, MediaTransferStatus, OutboundState, PersistedChatState,
+    save_app_settings, save_chat_state, AppSettings, ChatAttachment, ChatDirection, ChatMessage,
+    OutboundState, PersistedChatState,
+};
+use app_body::{
+    build_wayfarer_chat_body, build_wayfarer_media_manifest_body, classify_wayfarer_app_body,
+    ClassificationOutcome, OutboundMediaAsset, OutboundMediaManifestInput,
 };
 use base64::Engine;
 use image::{imageops::FilterType, ImageBuffer, Luma, Rgba, RgbaImage};
@@ -60,8 +65,7 @@ use crate::aethos_core::logging::{
     app_log_file_path, log_info, log_verbose, set_verbose_logging_enabled, verbose_logging_enabled,
 };
 use crate::aethos_core::protocol::{
-    build_envelope_payload_b64_from_utf8, bytes_to_hex_lower, decode_envelope_payload_b64,
-    is_valid_wayfarer_id,
+    build_envelope_payload_b64, bytes_to_hex_lower, is_valid_wayfarer_id,
 };
 use crate::relay::client::{
     close_relay_persistent_session, connect_to_relay_gossipv1_with_auth,
@@ -71,13 +75,10 @@ use crate::relay::client::{
 };
 use media_v1::{
     drain_pending_media_control_unicast as media_drain_pending_media_control_unicast,
-    get_completed_media_path as media_get_completed_media_path, is_media_candidate_attachment,
-    is_media_wire_message, load_completed_media as media_load_completed_media,
-    max_object_bytes as media_max_object_bytes, maybe_queue_capabilities_for_peer,
-    process_incoming_media_message,
+    get_completed_media_path as media_get_completed_media_path,
+    load_completed_media as media_load_completed_media, max_object_bytes as media_max_object_bytes,
     pulse_missing_requests_for_receiving_transfers as media_pulse_missing_requests_for_receiving_transfers,
-    run_housekeeping_tick as media_run_housekeeping_tick, send_media_manifest_and_chunks,
-    MediaMessageProcess,
+    run_housekeeping_tick as media_run_housekeeping_tick,
 };
 
 const SHARE_QR_FILE_NAME: &str = "share-wayfarer-qr.png";
@@ -796,13 +797,6 @@ fn bootstrap_state() -> Result<BootstrapState, String> {
     run_media_housekeeping_best_effort("bootstrap_state", settings.message_ttl_seconds);
     let identity = ensure_local_identity()?;
     let contacts = load_contact_aliases()?;
-    let author_signing_seed = load_local_signing_key_seed().ok();
-    if let Some(seed) = author_signing_seed.as_ref() {
-        for wayfarer_id in contacts.keys() {
-            let _ =
-                maybe_queue_capabilities_for_peer(wayfarer_id, seed, settings.message_ttl_seconds);
-        }
-    }
     let chat = load_chat_state()?;
 
     Ok(BootstrapState {
@@ -969,12 +963,6 @@ fn upsert_contact(request: UpsertContactRequest) -> Result<BTreeMap<String, Stri
     let mut contacts = load_contact_aliases()?;
     contacts.insert(wayfarer_id.clone(), alias.to_string());
     save_contact_aliases(&contacts)?;
-    if let Ok(seed) = load_local_signing_key_seed() {
-        let ttl_seconds = load_app_settings()
-            .map(|settings| settings.message_ttl_seconds)
-            .unwrap_or(3600);
-        let _ = maybe_queue_capabilities_for_peer(&wayfarer_id, &seed, ttl_seconds);
-    }
     emit_chat_snapshot_event_best_effort("upsert_contact");
     Ok(contacts)
 }
@@ -1128,114 +1116,58 @@ fn send_message_blocking(request: SendMessageRequest) -> Result<SendMessageRespo
     let identity = ensure_local_identity()?;
     let author_signing_seed = load_local_signing_key_seed()?;
     let contacts = load_contact_aliases()?;
-    let _ = maybe_queue_capabilities_for_peer(
-        wayfarer_id,
-        &author_signing_seed,
-        settings.message_ttl_seconds,
-    );
-
-    if let Some(media_attachment) = attachment
-        .as_ref()
-        .filter(|value| is_media_candidate_attachment(value))
-    {
-        let send_result = match send_media_manifest_and_chunks(
-            wayfarer_id,
-            body,
-            media_attachment,
-            &author_signing_seed,
-            settings.message_ttl_seconds,
-        ) {
-            Ok(result) => result,
-            Err(err) => {
-                log_info(&format!(
-                    "media_send_failed: to={} file={} bytes={} error={}",
-                    wayfarer_id, media_attachment.file_name, media_attachment.size_bytes, err
-                ));
-                return Err(err);
-            }
-        };
-
-        if let Some(runtime) = GOSSIP_RUNTIME.get() {
-            runtime.force_announce.store(true, Ordering::SeqCst);
-            set_gossip_event("announce queued");
-        }
-
-        let mut chat = load_chat_state()?;
-        chat.selected_contact = Some(wayfarer_id.to_string());
-        mark_contact_seen(&mut chat, wayfarer_id);
-
-        let thread = chat.threads.entry(wayfarer_id.to_string()).or_default();
-        let local_id = format!("local-media-{now_ms}-{:08x}", rand::random::<u32>());
-        thread.push(ChatMessage {
-            msg_id: local_id.clone(),
-            text: if body.is_empty() {
-                format!("[Image] {}", send_result.file_name)
-            } else {
-                body.to_string()
-            },
-            timestamp: format_timestamp_from_unix(now_secs),
-            created_at_unix: now_secs,
-            created_at_unix_ms: now_ms,
-            direction: ChatDirection::Outgoing,
-            seen: true,
-            manifest_id_hex: None,
-            delivered_at: None,
-            outbound_state: Some(OutboundState::Sending),
-            expires_at_unix_ms: Some(send_result.expires_at_unix_ms),
-            last_sync_attempt_unix_ms: Some(now_ms),
-            last_sync_error: None,
-            attachment: Some(ChatAttachment {
-                file_name: send_result.file_name.clone(),
-                mime_type: send_result.mime_type.clone(),
-                size_bytes: send_result.total_bytes,
-                content_b64: None,
-            }),
-            media: Some(ChatMediaTransfer {
-                transfer_id: send_result.transfer_id.clone(),
-                object_sha256_hex: send_result.object_sha256_hex.clone(),
-                file_name: send_result.file_name.clone(),
-                mime_type: send_result.mime_type.clone(),
-                total_bytes: send_result.total_bytes,
-                chunk_count: send_result.chunk_count,
-                received_chunks: 0,
-                received_bytes: 0,
-                status: MediaTransferStatus::Pending,
-                error: None,
-                expires_at_unix_ms: Some(send_result.expires_at_unix_ms),
-            }),
-        });
-
-        mark_outgoing_message(
-            &mut chat,
-            wayfarer_id,
-            &local_id,
-            &send_result.item_id,
-            None,
-        );
-        save_chat_state(&chat)?;
-        save_contact_aliases(&contacts)?;
-        emit_chat_snapshot_event_best_effort("send_message_blocking_media");
-
-        let message =
-            latest_message_for_contact(&chat, wayfarer_id, &send_result.item_id, &local_id)
-                .ok_or_else(|| "failed to load stored outbound media message".to_string())?;
-
-        return Ok(SendMessageResponse {
-            message,
-            chat,
-            contacts,
-            encounter_status: "media manifest + chunks queued locally".to_string(),
-            pulled_messages: 0,
-        });
-    }
 
     let expiry_ms = now_ms.saturating_add(settings.message_ttl_seconds.saturating_mul(1000));
     let local_id = format!("local-{now_ms}-{:08x}", rand::random::<u32>());
-    let outbound_payload =
-        build_outbound_chat_payload(body, &local_id, now_ms, attachment.as_ref());
-    let payload =
-        build_envelope_payload_b64_from_utf8(wayfarer_id, &outbound_payload, &author_signing_seed)?;
-    let decoded = decode_envelope_payload_b64(&payload)?;
+    let (outbound_body_bytes, outbound_display_text, outbound_type_label, outbound_attachment) =
+        if let Some(attachment) = attachment.as_ref() {
+            let transfer_ref = format!("xfer:tauri:{}:{:08x}", now_ms, rand::random::<u32>());
+            let media_manifest_input = OutboundMediaManifestInput {
+                transfer_ref,
+                media_kind: infer_media_kind(&attachment.mime_type).to_string(),
+                assets: vec![OutboundMediaAsset {
+                    asset_ref: format!(
+                        "asset:{}-{:08x}",
+                        sanitize_download_file_name(&attachment.file_name, "asset"),
+                        rand::random::<u32>()
+                    ),
+                    mime_type: attachment.mime_type.clone(),
+                    byte_length: attachment.size_bytes,
+                    name: Some(attachment.file_name.clone()),
+                }],
+                caption: (!body.is_empty()).then_some(body.to_string()),
+                created_at_unix_ms: now_ms,
+            };
+            let body_bytes = build_wayfarer_media_manifest_body(&media_manifest_input)?;
+            let display_text = if body.is_empty() {
+                format!("[Media] {}", attachment.file_name)
+            } else {
+                body.to_string()
+            };
+            (
+                body_bytes,
+                display_text,
+                "wayfarer.media_manifest.v1",
+                Some(sanitize_attachment_for_chat_history(attachment.clone())),
+            )
+        } else {
+            (
+                build_wayfarer_chat_body(body, now_ms)?,
+                body.to_string(),
+                "wayfarer.chat.v1",
+                None,
+            )
+        };
+
+    log_info(&format!(
+        "outbound_app_body_built: type={} to={} bytes={}",
+        outbound_type_label,
+        wayfarer_id,
+        outbound_body_bytes.len()
+    ));
+
+    let manifest_id_hex = bytes_to_hex_lower(&sha2::Sha256::digest(&outbound_body_bytes));
+    let payload = build_envelope_payload_b64(wayfarer_id, &outbound_body_bytes, &author_signing_seed)?;
     let item_id = gossip_record_local_payload(&payload, expiry_ms)?;
     if let Some(runtime) = GOSSIP_RUNTIME.get() {
         runtime.force_announce.store(true, Ordering::SeqCst);
@@ -1257,19 +1189,19 @@ fn send_message_blocking(request: SendMessageRequest) -> Result<SendMessageRespo
     let thread = chat.threads.entry(wayfarer_id.to_string()).or_default();
     thread.push(ChatMessage {
         msg_id: local_id.clone(),
-        text: body.to_string(),
+        text: outbound_display_text,
         timestamp: format_timestamp_from_unix(now_secs),
         created_at_unix: now_secs,
         created_at_unix_ms: now_ms,
         direction: ChatDirection::Outgoing,
         seen: true,
-        manifest_id_hex: Some(decoded.manifest_id_hex),
+        manifest_id_hex: Some(manifest_id_hex),
         delivered_at: None,
         outbound_state: Some(OutboundState::Sending),
         expires_at_unix_ms: Some(expiry_ms),
         last_sync_attempt_unix_ms: Some(now_ms),
         last_sync_error: None,
-        attachment: attachment.clone().map(sanitize_attachment_for_chat_history),
+        attachment: outbound_attachment,
         media: None,
     });
 
@@ -2586,6 +2518,7 @@ fn handle_gossip_frame(
                         session_peer: item.session_peer,
                         transport_peer: item.transport_peer,
                         item_id: item.item_id,
+                        body_bytes: item.body_bytes,
                         text: item.text,
                         received_at_unix: item.received_at_unix,
                         manifest_id_hex: item.manifest_id_hex,
@@ -3002,6 +2935,7 @@ fn run_gossip_tcp_encounter_on_stream(
                             session_peer: item.session_peer,
                             transport_peer: item.transport_peer,
                             item_id: item.item_id,
+                            body_bytes: item.body_bytes,
                             text: item.text,
                             received_at_unix: item.received_at_unix,
                             manifest_id_hex: item.manifest_id_hex,
@@ -3432,190 +3366,109 @@ fn merge_pulled_messages(
     contacts: &mut BTreeMap<String, String>,
     pulled_messages: Vec<crate::relay::client::EncounterMessagePreview>,
 ) {
-    let settings = load_app_settings().ok();
-    let ttl_seconds_max = settings
-        .as_ref()
-        .map(|value| value.message_ttl_seconds)
-        .unwrap_or(3600);
-    let identity = ensure_local_identity().ok();
-    let author_signing_seed = load_local_signing_key_seed().ok();
-    let mut auto_pong_targets = BTreeSet::new();
-
     for pulled in pulled_messages {
-        if let (Some(identity), Some(seed)) = (identity.as_ref(), author_signing_seed.as_ref()) {
-            match process_incoming_media_message(
-                &pulled,
-                chat,
-                contacts,
-                ttl_seconds_max,
-                &identity.wayfarer_id,
-                seed,
-            ) {
-                Ok(MediaMessageProcess::NotMedia) => {}
-                Ok(MediaMessageProcess::HandledSuppressed) => {
-                    continue;
-                }
-                Ok(MediaMessageProcess::HandledManifest) => {
-                    continue;
-                }
-                Err(err) => {
-                    log_verbose(&format!(
-                        "media_message_process_failed: item_id={} error={}",
-                        pulled.item_id, err
-                    ));
-                    continue;
-                }
-            }
-        }
+        let classification = classify_wayfarer_app_body(&pulled.body_bytes);
+        let outcome = classification.outcome_label();
+        let routed_to = classification
+            .routed_to
+            .as_deref()
+            .unwrap_or("none")
+            .to_string();
+        let payload_type = classification
+            .payload_type
+            .as_deref()
+            .unwrap_or("none")
+            .to_string();
 
         let sender_label = resolve_contact_id_for_preview(&pulled);
         let sender_alias = resolve_contact_alias_for_preview(&pulled);
-        if let Some(receipt_manifest) = extract_receipt_manifest_id(&pulled.text) {
-            apply_delivery_receipt(
-                chat,
-                &sender_label,
-                &receipt_manifest,
-                pulled.received_at_unix,
-            );
-            continue;
-        }
+        match classification.outcome {
+            ClassificationOutcome::AcceptDisplay {
+                chat: chat_payload,
+            } => {
+                log_info(&format!(
+                    "inbound_app_body_classification: item_id={} outcome={} type={} routed_to={} decoder_ran=true",
+                    pulled.item_id, outcome, payload_type, routed_to
+                ));
 
-        let is_new_contact = !contacts.contains_key(&sender_label);
-        if is_new_contact {
-            contacts.insert(sender_label.clone(), sender_alias);
-            if !chat.new_contacts.iter().any(|value| value == &sender_label) {
-                chat.new_contacts.push(sender_label.clone());
+                let is_new_contact = !contacts.contains_key(&sender_label);
+                if is_new_contact {
+                    contacts.insert(sender_label.clone(), sender_alias);
+                    if !chat.new_contacts.iter().any(|value| value == &sender_label) {
+                        chat.new_contacts.push(sender_label.clone());
+                    }
+                }
+
+                let seen_on_insert = chat.selected_contact.as_deref() == Some(sender_label.as_str());
+                let thread = chat.threads.entry(sender_label.clone()).or_default();
+                let exists = thread.iter().any(|existing| {
+                    existing.msg_id == pulled.item_id
+                        || (pulled.manifest_id_hex.is_some()
+                            && existing.manifest_id_hex == pulled.manifest_id_hex)
+                });
+                if exists {
+                    continue;
+                }
+
+                let message_unix_ms = chat_payload.created_at_unix_ms;
+                let message_unix = (message_unix_ms / 1000) as i64;
+                thread.push(ChatMessage {
+                    msg_id: pulled.item_id,
+                    text: chat_payload.text,
+                    timestamp: format_timestamp_from_unix(message_unix),
+                    created_at_unix: message_unix,
+                    created_at_unix_ms: message_unix_ms,
+                    direction: ChatDirection::Incoming,
+                    seen: seen_on_insert,
+                    manifest_id_hex: pulled.manifest_id_hex,
+                    delivered_at: None,
+                    outbound_state: None,
+                    expires_at_unix_ms: None,
+                    last_sync_attempt_unix_ms: None,
+                    last_sync_error: None,
+                    attachment: None,
+                    media: None,
+                });
+                sort_thread_messages(thread);
+
+                if chat.selected_contact.is_none() {
+                    chat.selected_contact = Some(sender_label.clone());
+                    mark_contact_seen(chat, &sender_label);
+                }
             }
-        }
-
-        let seen_on_insert = chat.selected_contact.as_deref() == Some(sender_label.as_str());
-
-        let thread = chat.threads.entry(sender_label.clone()).or_default();
-        let exists = thread.iter().any(|existing| {
-            existing.msg_id == pulled.item_id
-                || (pulled.manifest_id_hex.is_some()
-                    && existing.manifest_id_hex == pulled.manifest_id_hex)
-        });
-        if exists {
-            continue;
-        }
-
-        let message_unix_ms = extract_sent_at_unix_ms_if_json(&pulled.text).unwrap_or_else(|| {
-            if pulled.received_at_unix > 1_000_000_000_000 {
-                pulled.received_at_unix as u64
-            } else {
-                (pulled.received_at_unix.max(0) as u64).saturating_mul(1000)
+            ClassificationOutcome::AcceptStoreNoDisplay { .. } => {
+                log_info(&format!(
+                    "inbound_app_body_classification: item_id={} outcome={} type={} routed_to={} decoder_ran={} action=stored_without_display",
+                    pulled.item_id,
+                    outcome,
+                    payload_type,
+                    routed_to,
+                    classification.decoder_ran
+                ));
             }
-        });
-        let message_unix = (message_unix_ms / 1000) as i64;
-        thread.push(ChatMessage {
-            msg_id: pulled.item_id,
-            text: extract_chat_text_if_json(&pulled.text),
-            timestamp: format_timestamp_from_unix(message_unix),
-            created_at_unix: message_unix,
-            created_at_unix_ms: message_unix_ms,
-            direction: ChatDirection::Incoming,
-            seen: seen_on_insert,
-            manifest_id_hex: pulled.manifest_id_hex,
-            delivered_at: None,
-            outbound_state: None,
-            expires_at_unix_ms: None,
-            last_sync_attempt_unix_ms: None,
-            last_sync_error: None,
-            attachment: extract_attachment_if_json(&pulled.text)
-                .map(sanitize_attachment_for_chat_history),
-            media: None,
-        });
-        sort_thread_messages(thread);
-
-        if is_ping_only_chat_payload(&pulled.text) && is_valid_wayfarer_id(&sender_label) {
-            auto_pong_targets.insert(sender_label.clone());
-        }
-
-        if chat.selected_contact.is_none() {
-            chat.selected_contact = Some(sender_label.clone());
-            mark_contact_seen(chat, &sender_label);
-        }
-    }
-
-    for target in auto_pong_targets {
-        if let Err(err) = queue_auto_pong_message(chat, &target) {
-            log_info(&format!(
-                "auto_pong_queue_failed: to={} error={}",
-                target, err
-            ));
+            ClassificationOutcome::UnsupportedSafeSkip {
+                payload_type: skipped_type,
+            } => {
+                log_info(&format!(
+                    "inbound_app_body_classification: item_id={} outcome={} type={} routed_to={} decoder_ran=false action=safe_skip",
+                    pulled.item_id, outcome, skipped_type, routed_to
+                ));
+            }
+            ClassificationOutcome::Reject { reason } => {
+                log_info(&format!(
+                    "inbound_app_body_classification: item_id={} outcome={} type={} routed_to={} decoder_ran={} reject_reason={}",
+                    pulled.item_id,
+                    outcome,
+                    payload_type,
+                    routed_to,
+                    classification.decoder_ran,
+                    reason
+                ));
+            }
         }
     }
 
     normalize_chat_state(chat);
-}
-
-fn queue_auto_pong_message(chat: &mut PersistedChatState, wayfarer_id: &str) -> Result<(), String> {
-    if !is_valid_wayfarer_id(wayfarer_id) {
-        return Ok(());
-    }
-
-    let now_ms = now_unix_ms();
-    let now_secs = now_unix_secs();
-    let settings = load_app_settings()?;
-    let author_signing_seed = load_local_signing_key_seed()?;
-    let _ = maybe_queue_capabilities_for_peer(
-        wayfarer_id,
-        &author_signing_seed,
-        settings.message_ttl_seconds,
-    );
-
-    let body = "/pong";
-    let expiry_ms = now_ms.saturating_add(settings.message_ttl_seconds.saturating_mul(1000));
-    let local_id = format!("local-auto-{}-{:08x}", now_ms, rand::random::<u32>());
-    let outbound_payload = build_outbound_chat_payload(body, &local_id, now_ms, None);
-    let payload =
-        build_envelope_payload_b64_from_utf8(wayfarer_id, &outbound_payload, &author_signing_seed)?;
-    let decoded = decode_envelope_payload_b64(&payload)?;
-    let item_id = gossip_record_local_payload(&payload, expiry_ms)?;
-
-    if let Some(runtime) = GOSSIP_RUNTIME.get() {
-        runtime.force_announce.store(true, Ordering::SeqCst);
-        set_gossip_event("announce queued");
-    }
-
-    mark_contact_seen(chat, wayfarer_id);
-    let thread = chat.threads.entry(wayfarer_id.to_string()).or_default();
-    thread.push(ChatMessage {
-        msg_id: local_id.clone(),
-        text: body.to_string(),
-        timestamp: format_timestamp_from_unix(now_secs),
-        created_at_unix: now_secs,
-        created_at_unix_ms: now_ms,
-        direction: ChatDirection::Outgoing,
-        seen: true,
-        manifest_id_hex: Some(decoded.manifest_id_hex),
-        delivered_at: None,
-        outbound_state: Some(OutboundState::Sending),
-        expires_at_unix_ms: Some(expiry_ms),
-        last_sync_attempt_unix_ms: Some(now_ms),
-        last_sync_error: None,
-        attachment: None,
-        media: None,
-    });
-    mark_outgoing_message(chat, wayfarer_id, &local_id, &item_id, None);
-
-    let relay_http = settings
-        .relay_endpoints
-        .first()
-        .cloned()
-        .map(|endpoint| normalize_http_endpoint(&endpoint));
-    let relay_enabled = settings.relay_sync_enabled && relay_http.is_some();
-    if relay_enabled {
-        request_relay_sync("auto_pong");
-    }
-
-    log_info(&format!(
-        "auto_pong_queued: to={} item_id={} ttl_s={}",
-        wayfarer_id, item_id, settings.message_ttl_seconds
-    ));
-
-    Ok(())
 }
 
 fn resolve_contact_id_for_preview(
@@ -3650,28 +3503,6 @@ fn resolve_contact_alias_for_preview(
     "Unknown peer".to_string()
 }
 
-fn apply_delivery_receipt(
-    chat: &mut PersistedChatState,
-    contact: &str,
-    receipt_manifest_id: &str,
-    received_at_unix: i64,
-) {
-    let Some(thread) = chat.threads.get_mut(contact) else {
-        return;
-    };
-
-    for message in thread.iter_mut().rev() {
-        if matches!(message.direction, ChatDirection::Outgoing)
-            && message.manifest_id_hex.as_deref() == Some(receipt_manifest_id)
-        {
-            message.outbound_state = Some(OutboundState::Sent);
-            message.delivered_at = Some(format_timestamp_from_unix(received_at_unix));
-            message.last_sync_error = None;
-            break;
-        }
-    }
-}
-
 fn latest_message_for_contact(
     chat: &PersistedChatState,
     contact: &str,
@@ -3694,102 +3525,12 @@ fn latest_message_for_contact(
     })
 }
 
-fn extract_chat_text_if_json(input: &str) -> String {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(input) else {
-        return input.to_string();
-    };
-
-    if let Some(msg_type) = value.get("type").and_then(|v| v.as_str()) {
-        if msg_type == "aethos.media.manifest.v1" {
-            if let Some(caption) = value.get("caption").and_then(|v| v.as_str()) {
-                if !caption.trim().is_empty() {
-                    return caption.trim().to_string();
-                }
-            }
-            if let Some(file_name) = value.get("file_name").and_then(|v| v.as_str()) {
-                return format!("[Image] {file_name}");
-            }
-            return "[Image]".to_string();
-        }
-        if is_media_wire_message(input) {
-            return String::new();
-        }
-    }
-
-    if let Some(text) = value.get("text").and_then(|v| v.as_str()) {
-        if !text.is_empty() {
-            return text.to_string();
-        }
-    }
-
-    if let Some(file_name) = value
-        .get("attachment")
-        .and_then(|v| v.get("file_name").or_else(|| v.get("fileName")))
-        .and_then(|v| v.as_str())
-    {
-        return format!("[File] {file_name}");
-    }
-
-    input.to_string()
-}
-
-fn is_ping_only_chat_payload(input: &str) -> bool {
-    if is_media_wire_message(input) {
-        return false;
-    }
-    if extract_attachment_if_json(input).is_some() {
-        return false;
-    }
-
-    extract_chat_text_if_json(input).trim() == "/ping"
-}
-
-fn extract_sent_at_unix_ms_if_json(input: &str) -> Option<u64> {
-    let value = serde_json::from_str::<serde_json::Value>(input).ok()?;
-    value
-        .get("sent_at_unix_ms")
-        .or_else(|| value.get("sentAtUnixMs"))
-        .and_then(|v| v.as_u64())
-}
-
 fn sort_thread_messages(thread: &mut [ChatMessage]) {
     thread.sort_by(|left, right| {
         left.created_at_unix
             .cmp(&right.created_at_unix)
             .then_with(|| left.msg_id.cmp(&right.msg_id))
     });
-}
-
-fn extract_attachment_if_json(input: &str) -> Option<ChatAttachment> {
-    let value = serde_json::from_str::<serde_json::Value>(input).ok()?;
-    let attachment = value.get("attachment")?;
-
-    let file_name = attachment
-        .get("file_name")
-        .or_else(|| attachment.get("fileName"))
-        .and_then(|v| v.as_str())?
-        .to_string();
-    let mime_type = attachment
-        .get("mime_type")
-        .or_else(|| attachment.get("mimeType"))
-        .and_then(|v| v.as_str())?
-        .to_string();
-    let size_bytes = attachment
-        .get("size_bytes")
-        .or_else(|| attachment.get("sizeBytes"))
-        .and_then(|v| v.as_u64())?;
-    let content_b64 = attachment
-        .get("content_b64")
-        .or_else(|| attachment.get("contentB64"))
-        .and_then(|v| v.as_str())
-        .map(|v| v.to_string());
-
-    Some(ChatAttachment {
-        file_name,
-        mime_type,
-        size_bytes,
-        content_b64,
-    })
 }
 
 fn sanitize_attachment_for_chat_history(mut attachment: ChatAttachment) -> ChatAttachment {
@@ -3819,28 +3560,18 @@ fn sanitize_download_file_name(input: &str, fallback: &str) -> String {
     }
 }
 
-fn build_outbound_chat_payload(
-    text: &str,
-    client_msg_id: &str,
-    sent_at_unix_ms: u64,
-    attachment: Option<&ChatAttachment>,
-) -> String {
-    let mut value = serde_json::json!({
-        "text": text,
-        "client_msg_id": client_msg_id,
-        "sent_at_unix_ms": sent_at_unix_ms,
-    });
-
-    if let Some(attachment) = attachment {
-        value["attachment"] = serde_json::json!({
-            "file_name": attachment.file_name,
-            "mime_type": attachment.mime_type,
-            "size_bytes": attachment.size_bytes,
-            "content_b64": attachment.content_b64,
-        });
+fn infer_media_kind(mime_type: &str) -> &'static str {
+    let mime = mime_type.trim().to_ascii_lowercase();
+    if mime.starts_with("image/") {
+        return "image";
     }
-
-    value.to_string()
+    if mime.starts_with("video/") {
+        return "video";
+    }
+    if mime.starts_with("audio/") {
+        return "audio";
+    }
+    "file"
 }
 
 fn validate_send_attachment(attachment: &SendAttachmentRequest) -> Result<ChatAttachment, String> {
@@ -3937,27 +3668,6 @@ fn emit_sound_event_best_effort(kind: &str, context: &str) {
         Err(err) => log_verbose(&format!(
             "sound_emit_failed context={context} kind={kind}: {err}"
         )),
-    }
-}
-
-fn extract_receipt_manifest_id(input: &str) -> Option<String> {
-    let value = serde_json::from_str::<serde_json::Value>(input).ok()?;
-    let candidate = value
-        .get("receipt_manifest_id")
-        .and_then(|item| item.as_str())
-        .or_else(|| {
-            value
-                .get("receiptManifestId")
-                .and_then(|item| item.as_str())
-        })
-        .or_else(|| value.get("manifest_id_hex").and_then(|item| item.as_str()))
-        .or_else(|| value.get("manifestIdHex").and_then(|item| item.as_str()))?;
-
-    let normalized = candidate.trim().to_ascii_lowercase();
-    if normalized.len() == 64 && normalized.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        Some(normalized)
-    } else {
-        None
     }
 }
 
@@ -4700,12 +4410,15 @@ mod tests {
     fn imported_message_is_kept_when_sender_is_unresolved() {
         let mut chat = PersistedChatState::default();
         let mut contacts = BTreeMap::new();
+        let body = build_wayfarer_chat_body("hello from unresolved sender", 1_735_689_600_000)
+            .expect("build chat body");
         let pulled = vec![crate::relay::client::EncounterMessagePreview {
             author_wayfarer_id: None,
             session_peer: None,
             transport_peer: None,
             item_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
-            text: "hello from unresolved sender".to_string(),
+            body_bytes: body,
+            text: String::new(),
             received_at_unix: 1,
             manifest_id_hex: None,
         }];
@@ -4720,103 +4433,12 @@ mod tests {
     }
 
     #[test]
-    fn outbound_chat_payload_json_keeps_display_text() {
-        let payload = build_outbound_chat_payload("hello", "local-123", 42, None);
-        assert_eq!(extract_chat_text_if_json(&payload), "hello");
-    }
-
-    #[test]
-    fn outbound_chat_payload_keeps_emoji_text() {
-        let payload = build_outbound_chat_payload("hello 🌬️🚀", "local-emoji", 42, None);
-        assert_eq!(extract_chat_text_if_json(&payload), "hello 🌬️🚀");
-    }
-
-    #[test]
-    fn ping_only_payload_is_detected_for_auto_pong() {
-        let payload = build_outbound_chat_payload("/ping", "local-ping", 42, None);
-        assert!(is_ping_only_chat_payload(&payload));
-    }
-
-    #[test]
-    fn ping_with_attachment_does_not_trigger_auto_pong() {
-        let attachment = ChatAttachment {
-            file_name: "note.txt".to_string(),
-            mime_type: "text/plain".to_string(),
-            size_bytes: 4,
-            content_b64: Some(base64::engine::general_purpose::STANDARD.encode("test")),
-        };
-        let payload = build_outbound_chat_payload("/ping", "local-ping", 42, Some(&attachment));
-        assert!(!is_ping_only_chat_payload(&payload));
-    }
-
-    #[test]
-    fn non_ping_payload_does_not_trigger_auto_pong() {
-        let payload = build_outbound_chat_payload("hello", "local-hello", 42, None);
-        assert!(!is_ping_only_chat_payload(&payload));
-    }
-
-    #[test]
-    fn outbound_chat_payload_roundtrips_attachment_metadata() {
-        let attachment = ChatAttachment {
-            file_name: "note.txt".to_string(),
-            mime_type: "text/plain".to_string(),
-            size_bytes: 4,
-            content_b64: Some(base64::engine::general_purpose::STANDARD.encode("test")),
-        };
-        let payload = build_outbound_chat_payload("", "local-file", 42, Some(&attachment));
-        let extracted = extract_attachment_if_json(&payload).expect("attachment extracted");
-        assert_eq!(extracted.file_name, "note.txt");
-        assert_eq!(extracted.mime_type, "text/plain");
-        assert_eq!(extracted.size_bytes, 4);
-    }
-
-    #[test]
-    fn outbound_chat_payload_exposes_sent_at_for_thread_sorting() {
-        let payload = build_outbound_chat_payload("hello", "local-123", 1700000000123, None);
-        assert_eq!(
-            extract_sent_at_unix_ms_if_json(&payload),
-            Some(1_700_000_000_123)
-        );
-    }
-
-    #[test]
-    fn media_manifest_payload_preserves_caption_text() {
-        let payload = serde_json::json!({
-            "type": "aethos.media.manifest.v1",
-            "caption": "photo caption",
-            "file_name": "photo.png"
-        })
-        .to_string();
-        assert_eq!(extract_chat_text_if_json(&payload), "photo caption");
-    }
-
-    #[test]
-    fn media_manifest_payload_falls_back_to_image_label() {
-        let payload = serde_json::json!({
-            "type": "aethos.media.manifest.v1",
-            "file_name": "photo.png"
-        })
-        .to_string();
-        assert_eq!(extract_chat_text_if_json(&payload), "[Image] photo.png");
-    }
-
-    #[test]
     fn incoming_messages_are_sorted_by_sent_at_when_present() {
         let mut chat = PersistedChatState::default();
         let mut contacts = BTreeMap::new();
 
-        let newer = serde_json::json!({
-            "text": "newer",
-            "client_msg_id": "m2",
-            "sent_at_unix_ms": 2000
-        })
-        .to_string();
-        let older = serde_json::json!({
-            "text": "older",
-            "client_msg_id": "m1",
-            "sent_at_unix_ms": 1000
-        })
-        .to_string();
+        let newer = build_wayfarer_chat_body("newer", 2000).expect("build newer payload");
+        let older = build_wayfarer_chat_body("older", 1000).expect("build older payload");
 
         merge_pulled_messages(
             &mut chat,
@@ -4831,7 +4453,8 @@ mod tests {
                     transport_peer: None,
                     item_id: "fbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                         .to_string(),
-                    text: newer,
+                    body_bytes: newer,
+                    text: String::new(),
                     received_at_unix: 20,
                     manifest_id_hex: None,
                 },
@@ -4844,7 +4467,8 @@ mod tests {
                     transport_peer: None,
                     item_id: "abbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                         .to_string(),
-                    text: older,
+                    body_bytes: older,
+                    text: String::new(),
                     received_at_unix: 10,
                     manifest_id_hex: None,
                 },
@@ -4858,30 +4482,6 @@ mod tests {
         assert_eq!(thread.len(), 2);
         assert_eq!(thread[0].text, "older");
         assert_eq!(thread[1].text, "newer");
-    }
-
-    #[test]
-    fn outbound_chat_payload_changes_manifest_for_same_text() {
-        let recipient = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let signing_seed = [9u8; 32];
-
-        let payload_a = build_envelope_payload_b64_from_utf8(
-            recipient,
-            &build_outbound_chat_payload("same text", "local-1", 1000, None),
-            &signing_seed,
-        )
-        .expect("build payload a");
-        let payload_b = build_envelope_payload_b64_from_utf8(
-            recipient,
-            &build_outbound_chat_payload("same text", "local-2", 1000, None),
-            &signing_seed,
-        )
-        .expect("build payload b");
-
-        let decoded_a = decode_envelope_payload_b64(&payload_a).expect("decode payload a");
-        let decoded_b = decode_envelope_payload_b64(&payload_b).expect("decode payload b");
-
-        assert_ne!(decoded_a.manifest_id_hex, decoded_b.manifest_id_hex);
     }
 
     #[test]
@@ -4932,9 +4532,11 @@ mod tests {
         let item_id = with_state_dir(&temp_dir, || {
             let identity = ensure_local_identity().expect("ensure identity");
             let signing_seed = load_local_signing_key_seed().expect("load signing seed");
-            let payload = build_envelope_payload_b64_from_utf8(
+            let body =
+                build_wayfarer_chat_body("udp fallback", now_unix_ms()).expect("build chat body");
+            let payload = build_envelope_payload_b64(
                 &identity.wayfarer_id,
-                &build_outbound_chat_payload("udp fallback", "local-test", now_unix_ms(), None),
+                &body,
                 &signing_seed,
             )
             .expect("build envelope");
@@ -5165,14 +4767,14 @@ mod tests {
             let seed = load_local_signing_key_seed().expect("signing seed a");
             let mut objects = Vec::new();
             for idx in 0..9u64 {
-                let payload = build_envelope_payload_b64_from_utf8(
+                let body = build_wayfarer_chat_body(
+                    &format!("suite-a-to-b-{idx}"),
+                    now_unix_ms().saturating_add(idx),
+                )
+                .expect("build chat body");
+                let payload = build_envelope_payload_b64(
                     &identity_b.wayfarer_id,
-                    &build_outbound_chat_payload(
-                        &format!("suite-a-to-b-{idx}"),
-                        &format!("local-a-{idx}"),
-                        now_unix_ms().saturating_add(idx),
-                        None,
-                    ),
+                    &body,
                     &seed,
                 )
                 .expect("build payload a->b");
@@ -5222,6 +4824,7 @@ mod tests {
                             session_peer: item.session_peer,
                             transport_peer: item.transport_peer,
                             item_id: item.item_id,
+                            body_bytes: item.body_bytes,
                             text: item.text,
                             received_at_unix: item.received_at_unix,
                             manifest_id_hex: item.manifest_id_hex,

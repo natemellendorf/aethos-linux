@@ -109,6 +109,7 @@ pub struct ImportedEnvelope {
     pub author_wayfarer_id: Option<String>,
     pub transport_peer: Option<String>,
     pub session_peer: Option<String>,
+    pub body_bytes: Vec<u8>,
     pub text: String,
     pub received_at_unix: i64,
     pub manifest_id_hex: Option<String>,
@@ -571,28 +572,18 @@ pub fn import_transfer_items(
                 pending_new_inserts.push(insert);
                 accepted_item_ids.push(object.item_id.clone());
                 if parsed.to_wayfarer_id_hex == local_wayfarer_id {
-                    match decode_envelope_payload_text_preview(&object.envelope_b64) {
-                        Ok(text) => {
-                            new_messages.push(ImportedEnvelope {
-                                item_id: object.item_id.clone(),
-                                author_wayfarer_id: Some(parsed.author_wayfarer_id_hex.clone()),
-                                transport_peer: transport_peer.map(|value| value.to_string()),
-                                session_peer: session_peer_wayfarer_id
-                                    .map(|value| value.to_string()),
-                                text,
-                                received_at_unix: (now_ms / 1000) as i64,
-                                manifest_id_hex: Some(parsed.manifest_id_hex),
-                            });
-                        }
-                        Err(_) => {
-                            log_verbose(&format!(
-                                "transfer_import_skip_non_utf8_payload: item_id={} transport_peer={} session_peer={}",
-                                object.item_id,
-                                transport_peer.unwrap_or("none"),
-                                session_peer_wayfarer_id.unwrap_or("none")
-                            ));
-                        }
-                    }
+                    let preview_text = decode_envelope_payload_text_preview(&object.envelope_b64)
+                        .unwrap_or_default();
+                    new_messages.push(ImportedEnvelope {
+                        item_id: object.item_id.clone(),
+                        author_wayfarer_id: Some(parsed.author_wayfarer_id_hex.clone()),
+                        transport_peer: transport_peer.map(|value| value.to_string()),
+                        session_peer: session_peer_wayfarer_id.map(|value| value.to_string()),
+                        body_bytes: parsed.body,
+                        text: preview_text,
+                        received_at_unix: (now_ms / 1000) as i64,
+                        manifest_id_hex: Some(parsed.manifest_id_hex),
+                    });
                 } else {
                     log_verbose(&format!(
                         "transfer_import_stored_nonlocal: item_id={} to={} local={}",
@@ -1387,6 +1378,11 @@ mod tests {
 
         assert_eq!(imported.accepted_item_ids.len(), 1);
         assert!(imported.rejected_items.is_empty());
-        assert!(imported.new_messages.is_empty());
+        assert_eq!(imported.new_messages.len(), 1);
+        assert!(imported.new_messages[0].text.is_empty());
+        assert_eq!(
+            imported.new_messages[0].body_bytes,
+            vec![0xff, 0xfe, 0xfd, 0x00]
+        );
     }
 }

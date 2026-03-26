@@ -279,11 +279,19 @@ fn canonicalize_cbor_value(mut value: Value) -> Result<Value, String> {
                 *key = canonicalize_cbor_value(key.clone())?;
                 *entry_value = canonicalize_cbor_value(entry_value.clone())?;
             }
-            entries.sort_by(|(left_key, _), (right_key, _)| {
-                let left_encoded = encode_cbor_value_raw(left_key).unwrap_or_default();
-                let right_encoded = encode_cbor_value_raw(right_key).unwrap_or_default();
-                left_encoded.cmp(&right_encoded)
+
+            let mut encoded_entries = Vec::with_capacity(entries.len());
+            for (key, entry_value) in entries.drain(..) {
+                let encoded_key = encode_cbor_value_raw(&key)?;
+                encoded_entries.push((encoded_key, key, entry_value));
+            }
+            encoded_entries.sort_by(|(left_encoded, _, _), (right_encoded, _, _)| {
+                left_encoded.cmp(right_encoded)
             });
+            *entries = encoded_entries
+                .into_iter()
+                .map(|(_, key, entry_value)| (key, entry_value))
+                .collect();
         }
         _ => {}
     }

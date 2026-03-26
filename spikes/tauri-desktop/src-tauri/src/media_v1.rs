@@ -3587,6 +3587,7 @@ mod tests {
             session_peer: None,
             transport_peer: None,
             item_id: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string(),
+            body_bytes: b"{}".to_vec(),
             text: "{}".to_string(),
             received_at_unix: now_unix_ms() as i64,
             manifest_id_hex: None,

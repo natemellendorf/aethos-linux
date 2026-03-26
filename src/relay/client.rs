@@ -19,7 +19,6 @@ use crate::aethos_core::gossip_sync::{
 };
 use crate::aethos_core::identity_store::LocalIdentitySummary;
 use crate::aethos_core::logging::log_verbose;
-use crate::aethos_core::protocol::decode_envelope_payload_text_preview;
 
 type RelaySocket = tungstenite::WebSocket<MaybeTlsStream<TcpStream>>;
 static RUSTLS_PROVIDER_INIT: Once = Once::new();
@@ -311,6 +310,8 @@ pub struct EncounterMessagePreview {
     pub session_peer: Option<String>,
     pub transport_peer: Option<String>,
     pub item_id: String,
+    #[allow(dead_code)]
+    pub body_bytes: Vec<u8>,
     pub text: String,
     pub received_at_unix: i64,
     pub manifest_id_hex: Option<String>,
@@ -779,21 +780,18 @@ fn run_relay_round_on_socket(
                 ));
 
                 for message in imported.new_messages {
-                    let item_id = message.item_id.clone();
+                    let text = if message.text.is_empty() {
+                        String::from_utf8(message.body_bytes.clone()).unwrap_or_default()
+                    } else {
+                        message.text.clone()
+                    };
                     pulled_messages.push(EncounterMessagePreview {
                         author_wayfarer_id: message.author_wayfarer_id,
                         session_peer: message.session_peer,
                         transport_peer: message.transport_peer,
-                        item_id: item_id.clone(),
-                        text: decode_envelope_payload_text_preview(
-                            &transfer
-                                .objects
-                                .iter()
-                                .find(|o| o.item_id == item_id)
-                                .map(|o| o.envelope_b64.clone())
-                                .unwrap_or_default(),
-                        )
-                        .unwrap_or(message.text),
+                        item_id: message.item_id,
+                        body_bytes: message.body_bytes,
+                        text,
                         received_at_unix: message.received_at_unix,
                         manifest_id_hex: message.manifest_id_hex,
                     });
