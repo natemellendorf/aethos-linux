@@ -537,6 +537,7 @@ pub fn max_object_bytes() -> u64 {
     MAX_OBJECT_BYTES
 }
 
+#[allow(dead_code)] // Reserved for pending composer-side media wire payload guards.
 pub fn is_media_wire_message(input: &str) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(input) else {
         return false;
