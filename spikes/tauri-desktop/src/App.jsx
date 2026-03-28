@@ -1261,9 +1261,19 @@ export default function App() {
                 {entries.map(([id, alias]) => {
                   const unread = (chat.threads[id] || []).filter((m) => m.direction === "Incoming" && !m.seen).length;
                   const isNew = (chat.newContacts || []).includes(id);
+                  const shouldNotify = id !== selectedContactId && (isNew || unread > 0);
                   return (
-                    <button data-testid={`chat-contact-${id}`} key={id} className={cn("w-full rounded-lg border p-2.5 text-left", id === selectedContactId ? "border-blue-300 bg-blue-500/20" : "border-border/60 bg-background/50")} onClick={() => selectContact(id)}>
-                      <div className="flex items-center justify-between gap-2"><span className="truncate font-semibold">{alias || tinyId(id)}</span>{isNew ? <Badge className="bg-violet-500/20">NEW</Badge> : unread > 0 ? <Badge>{unread}</Badge> : null}</div>
+                    <button
+                      data-testid={`chat-contact-${id}`}
+                      key={id}
+                      className={cn(
+                        "chat-thread-row w-full rounded-lg border p-2.5 text-left",
+                        id === selectedContactId ? "border-blue-300 bg-blue-500/20" : "border-border/60 bg-background/50",
+                        shouldNotify ? "chat-thread-row-alert" : ""
+                      )}
+                      onClick={() => selectContact(id)}
+                    >
+                      <div className="flex items-center justify-between gap-2"><span className="truncate font-semibold">{alias || tinyId(id)}</span></div>
                       <p className="mt-1 truncate text-xs text-muted-foreground">{tinyId(id)}</p>
                     </button>
                   );

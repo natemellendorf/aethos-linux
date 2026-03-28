@@ -3366,6 +3366,7 @@ fn merge_pulled_messages(
     contacts: &mut BTreeMap<String, String>,
     pulled_messages: Vec<crate::relay::client::EncounterMessagePreview>,
 ) {
+    let mut auto_pong_targets = BTreeSet::new();
     for pulled in pulled_messages {
         let classification = classify_wayfarer_app_body(&pulled.body_bytes);
         let outcome = classification.outcome_label();
@@ -3431,6 +3432,13 @@ fn merge_pulled_messages(
                 });
                 sort_thread_messages(thread);
 
+                if is_valid_wayfarer_id(&sender_label)
+                    && is_ping_only_chat_text(thread.last().map(|msg| msg.text.as_str()).unwrap_or(""))
+                    && !thread_has_recent_outgoing_pong(thread)
+                {
+                    auto_pong_targets.insert(sender_label.clone());
+                }
+
                 if chat.selected_contact.is_none() {
                     chat.selected_contact = Some(sender_label.clone());
                     mark_contact_seen(chat, &sender_label);
@@ -3468,7 +3476,88 @@ fn merge_pulled_messages(
         }
     }
 
+    for target in auto_pong_targets {
+        if let Err(err) = queue_auto_pong_message(chat, &target) {
+            log_info(&format!(
+                "auto_pong_queue_failed: to={} error={}",
+                target, err
+            ));
+        }
+    }
+
     normalize_chat_state(chat);
+}
+
+fn is_ping_only_chat_text(text: &str) -> bool {
+    text.trim() == "/ping"
+}
+
+fn thread_has_recent_outgoing_pong(thread: &[ChatMessage]) -> bool {
+    let now = now_unix_secs();
+    thread.iter().rev().any(|message| {
+        matches!(message.direction, ChatDirection::Outgoing)
+            && message.text.trim() == "/pong"
+            && now.saturating_sub(message.created_at_unix) <= 30
+    })
+}
+
+fn queue_auto_pong_message(chat: &mut PersistedChatState, wayfarer_id: &str) -> Result<(), String> {
+    if !is_valid_wayfarer_id(wayfarer_id) {
+        return Ok(());
+    }
+
+    let now_ms = now_unix_ms();
+    let now_secs = now_unix_secs();
+    let settings = load_app_settings()?;
+    let _ = ensure_local_identity()?;
+    let author_signing_seed = load_local_signing_key_seed()?;
+    let body_bytes = build_wayfarer_chat_body("/pong", now_ms)?;
+    let manifest_id_hex = bytes_to_hex_lower(&sha2::Sha256::digest(&body_bytes));
+    let payload = build_envelope_payload_b64(wayfarer_id, &body_bytes, &author_signing_seed)?;
+    let expiry_ms = now_ms.saturating_add(settings.message_ttl_seconds.saturating_mul(1000));
+    let item_id = gossip_record_local_payload(&payload, expiry_ms)?;
+
+    if let Some(runtime) = GOSSIP_RUNTIME.get() {
+        runtime.force_announce.store(true, Ordering::SeqCst);
+        set_gossip_event("announce queued");
+    }
+
+    let relay_http = settings
+        .relay_endpoints
+        .first()
+        .cloned()
+        .map(|endpoint| normalize_http_endpoint(&endpoint));
+    if settings.relay_sync_enabled && relay_http.is_some() {
+        request_relay_sync("auto_pong");
+    }
+
+    mark_contact_seen(chat, wayfarer_id);
+    let thread = chat.threads.entry(wayfarer_id.to_string()).or_default();
+    thread.push(ChatMessage {
+        msg_id: item_id.clone(),
+        text: "/pong".to_string(),
+        timestamp: format_timestamp_from_unix(now_secs),
+        created_at_unix: now_secs,
+        created_at_unix_ms: now_ms,
+        direction: ChatDirection::Outgoing,
+        seen: true,
+        manifest_id_hex: Some(manifest_id_hex),
+        delivered_at: None,
+        outbound_state: Some(OutboundState::Sending),
+        expires_at_unix_ms: Some(expiry_ms),
+        last_sync_attempt_unix_ms: Some(now_ms),
+        last_sync_error: None,
+        attachment: None,
+        media: None,
+    });
+    sort_thread_messages(thread);
+
+    log_info(&format!(
+        "auto_pong_queued: to={} item_id={} ttl_s={}",
+        wayfarer_id, item_id, settings.message_ttl_seconds
+    ));
+
+    Ok(())
 }
 
 fn resolve_contact_id_for_preview(
@@ -4482,6 +4571,51 @@ mod tests {
         assert_eq!(thread.len(), 2);
         assert_eq!(thread[0].text, "older");
         assert_eq!(thread[1].text, "newer");
+    }
+
+    #[test]
+    fn ping_text_is_detected_for_auto_pong() {
+        assert!(is_ping_only_chat_text("/ping"));
+        assert!(is_ping_only_chat_text(" /ping "));
+        assert!(!is_ping_only_chat_text("/ping now"));
+        assert!(!is_ping_only_chat_text("/pong"));
+    }
+
+    #[test]
+    fn merge_pulled_messages_queues_auto_pong_for_ping() {
+        let _lock = shared_test_env_lock().lock().expect("lock");
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aethos-tauri-test-auto-pong-{}",
+            rand::random::<u64>()
+        ));
+
+        with_state_dir(&temp_dir, || {
+            let _ = ensure_local_identity().expect("ensure identity");
+            let mut chat = PersistedChatState::default();
+            let mut contacts = BTreeMap::new();
+            let sender = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+            let body = build_wayfarer_chat_body("/ping", now_unix_ms()).expect("build chat body");
+            let pulled = vec![crate::relay::client::EncounterMessagePreview {
+                author_wayfarer_id: Some(sender.to_string()),
+                session_peer: None,
+                transport_peer: None,
+                item_id: "fbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .to_string(),
+                body_bytes: body,
+                text: String::new(),
+                received_at_unix: now_unix_secs(),
+                manifest_id_hex: None,
+            }];
+
+            merge_pulled_messages(&mut chat, &mut contacts, pulled);
+            let thread = chat.threads.get(sender).expect("thread should exist");
+            assert!(thread.iter().any(|msg| {
+                matches!(msg.direction, ChatDirection::Incoming) && msg.text.trim() == "/ping"
+            }));
+            assert!(thread.iter().any(|msg| {
+                matches!(msg.direction, ChatDirection::Outgoing) && msg.text.trim() == "/pong"
+            }));
+        });
     }
 
     #[test]
