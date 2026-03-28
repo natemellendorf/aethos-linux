@@ -15,7 +15,7 @@ use serde::Serialize;
 use aethos_core::gossip_sync::{eligible_item_ids, record_local_payload};
 use aethos_core::identity_store::{ensure_local_identity, load_local_signing_key_seed};
 use aethos_core::logging::set_verbose_logging_enabled;
-use aethos_core::protocol::{build_envelope_payload_b64_from_utf8, is_valid_wayfarer_id};
+use aethos_core::protocol::{build_wayfarer_chat_envelope_payload_b64, is_valid_wayfarer_id};
 use relay::client::{
     connect_to_relay_gossipv1_with_auth, run_relay_encounter_gossipv1_for_duration, to_ws_endpoint,
 };
@@ -222,19 +222,22 @@ fn main() -> ExitCode {
     }
 
     let message_body = format!("relay-smoke:{}:{}", summary.run_id, now_unix_ms());
-    let payload_b64 =
-        match build_envelope_payload_b64_from_utf8(&target_wayfarer_id, &message_body, &local_seed)
-        {
-            Ok(payload) => payload,
-            Err(err) => {
-                summary.message = format!("failed to build envelope payload: {err}");
-                append_log(
-                    &mut log_lines,
-                    &format!("relay_smoke_fail reason=build_payload_error error={err}"),
-                );
-                return finalize(&artifact_dir, &summary, &log_lines, false);
-            }
-        };
+    let payload_b64 = match build_wayfarer_chat_envelope_payload_b64(
+        &target_wayfarer_id,
+        &message_body,
+        &local_seed,
+        now_unix_ms() as i64,
+    ) {
+        Ok(payload) => payload,
+        Err(err) => {
+            summary.message = format!("failed to build envelope payload: {err}");
+            append_log(
+                &mut log_lines,
+                &format!("relay_smoke_fail reason=build_payload_error error={err}"),
+            );
+            return finalize(&artifact_dir, &summary, &log_lines, false);
+        }
+    };
 
     let expiry_unix_ms = now_unix_ms().saturating_add(ttl_seconds.saturating_mul(1_000));
     let item_id = match record_local_payload(&payload_b64, expiry_unix_ms) {

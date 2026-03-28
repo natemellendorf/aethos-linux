@@ -73,6 +73,7 @@ impl EnvelopeV1 {
     }
 }
 
+#[allow(dead_code)]
 pub fn build_envelope_payload_b64_from_utf8(
     to_wayfarer_id_hex: &str,
     body_utf8: &str,
@@ -81,6 +82,48 @@ pub fn build_envelope_payload_b64_from_utf8(
     build_envelope_payload_b64(
         to_wayfarer_id_hex,
         body_utf8.as_bytes(),
+        author_signing_key_seed,
+    )
+}
+
+pub fn build_wayfarer_chat_envelope_payload_b64(
+    to_wayfarer_id_hex: &str,
+    chat_text: &str,
+    author_signing_key_seed: &[u8; 32],
+    created_at_unix_ms: i64,
+) -> Result<String, String> {
+    if chat_text.trim().is_empty() {
+        return Err("chat text must be non-empty".to_string());
+    }
+    if created_at_unix_ms < 0 {
+        return Err("created_at_unix_ms must be non-negative".to_string());
+    }
+
+    let signing_key = SigningKey::from_bytes(author_signing_key_seed);
+    let author_wayfarer_id_hex = bytes_to_hex_lower(&Sha256::digest(signing_key.verifying_key()));
+    let wayfarer_chat_body = encode_cbor_value_deterministic(&Value::Map(vec![
+        (
+            Value::Text("type".to_string()),
+            Value::Text("wayfarer.chat.v1".to_string()),
+        ),
+        (
+            Value::Text("text".to_string()),
+            Value::Text(chat_text.to_string()),
+        ),
+        (
+            Value::Text("created_at_unix_ms".to_string()),
+            Value::Integer(created_at_unix_ms.into()),
+        ),
+    ]))?;
+    let canonical_message = build_canonical_message_v2(
+        &author_wayfarer_id_hex,
+        &wayfarer_chat_body,
+        created_at_unix_ms,
+    )?;
+
+    build_envelope_payload_b64(
+        to_wayfarer_id_hex,
+        &canonical_message,
         author_signing_key_seed,
     )
 }
@@ -317,42 +360,10 @@ pub fn decode_envelope_payload_utf8_preview(payload_b64: &str) -> Result<String,
 
 pub fn decode_envelope_payload_text_preview(payload_b64: &str) -> Result<String, String> {
     let decoded = decode_envelope_payload_b64(payload_b64)?;
-
-    if let Ok(message) = decode_canonical_message_v2(&decoded.body) {
-        if let Some(chat_text) = extract_wayfarer_chat_text_from_cbor(&message.body) {
-            return Ok(chat_text);
-        }
-
-        if let Ok(utf8_body) = String::from_utf8(message.body.clone()) {
-            if let Some(chat_text) = extract_text_field_from_json(&utf8_body) {
-                return Ok(chat_text);
-            }
-            return Ok(utf8_body);
-        }
-    }
-
-    let utf8_body = String::from_utf8(decoded.body.clone()).ok();
-
-    if let Some(utf8_body) = utf8_body.as_ref() {
-        if let Some(chat_text) = extract_text_field_from_json(utf8_body) {
-            return Ok(chat_text);
-        }
-    }
-
-    if let Some(json_slice) = extract_json_object_slice(&decoded.body) {
-        let json_text = String::from_utf8(json_slice.to_vec())
-            .map_err(|_| "envelope body json preview was not valid UTF-8".to_string())?;
-        if let Some(chat_text) = extract_text_field_from_json(&json_text) {
-            return Ok(chat_text);
-        }
-        return Ok(json_text);
-    }
-
-    if let Some(utf8_body) = utf8_body {
-        return Ok(utf8_body);
-    }
-
-    Err("envelope body does not contain a readable text payload".to_string())
+    let message = decode_canonical_message_v2(&decoded.body)
+        .map_err(|err| format!("canonical message decode failed: {err}"))?;
+    extract_wayfarer_chat_text_from_cbor(&message.body)
+        .ok_or_else(|| "payload is not a valid wayfarer.chat.v1 message".to_string())
 }
 
 fn decode_canonical_message_v2(raw: &[u8]) -> Result<DecodedCanonicalMessageV2, String> {
@@ -458,24 +469,24 @@ fn extract_wayfarer_chat_text_from_cbor(body: &[u8]) -> Option<String> {
     text
 }
 
-fn extract_text_field_from_json(json: &str) -> Option<String> {
-    let value = serde_json::from_str::<serde_json::Value>(json).ok()?;
-    value
-        .get("text")
-        .and_then(|candidate| candidate.as_str())
-        .map(|text| text.to_string())
-}
+fn build_canonical_message_v2(
+    author_wayfarer_id_hex: &str,
+    body: &[u8],
+    created_at_unix_ms: i64,
+) -> Result<Vec<u8>, String> {
+    let author_wayfarer_id = parse_wayfarer_id_hex(author_wayfarer_id_hex)?;
 
-fn extract_json_object_slice(bytes: &[u8]) -> Option<&[u8]> {
-    let start = bytes.iter().position(|byte| *byte == b'{')?;
-    let end = bytes.iter().rposition(|byte| *byte == b'}')?;
-    if end < start {
-        return None;
-    }
-
-    let slice = &bytes[start..=end];
-    serde_json::from_slice::<serde_json::Value>(slice).ok()?;
-    Some(slice)
+    let mut out = vec![2u8, 3u8];
+    out.push(1);
+    out.extend_from_slice(&(8u32).to_be_bytes());
+    out.extend_from_slice(&created_at_unix_ms.to_be_bytes());
+    out.push(2);
+    out.extend_from_slice(&(32u32).to_be_bytes());
+    out.extend_from_slice(&author_wayfarer_id);
+    out.push(3);
+    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    out.extend_from_slice(body);
+    Ok(out)
 }
 
 fn parse_wayfarer_id_hex(hex_lower: &str) -> Result<[u8; 32], String> {
@@ -643,7 +654,7 @@ mod tests {
     }
 
     #[test]
-    fn envelope_text_preview_extracts_chat_text_from_canonical_message_body() {
+    fn envelope_text_preview_rejects_non_contract_legacy_chat_json_body() {
         let destination = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let from = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let payload = format!(
@@ -653,9 +664,9 @@ mod tests {
             build_envelope_payload_b64_from_utf8(destination, &payload, &TEST_SIGNING_KEY_SEED)
                 .expect("build envelope with canonical message body payload");
 
-        let preview = decode_envelope_payload_text_preview(&envelope_b64)
-            .expect("decode envelope text preview");
-        assert_eq!(preview, "interop marker");
+        assert!(decode_envelope_payload_text_preview(&envelope_b64)
+            .expect_err("legacy json body should not pass strict contract preview")
+            .contains("canonical message decode failed"));
     }
 
     #[test]

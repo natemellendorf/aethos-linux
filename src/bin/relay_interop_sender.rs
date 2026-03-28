@@ -14,7 +14,7 @@ use serde_json::json;
 
 use aethos_core::gossip_sync::record_local_payload;
 use aethos_core::identity_store::{ensure_local_identity, load_local_signing_key_seed};
-use aethos_core::protocol::build_envelope_payload_b64_from_utf8;
+use aethos_core::protocol::build_wayfarer_chat_envelope_payload_b64;
 use relay::client::run_relay_encounter_gossipv1_for_duration;
 
 const DEFAULT_TIMEOUT_SECONDS: u64 = 90;
@@ -73,10 +73,11 @@ fn run() -> Result<(), String> {
         }),
     )?;
 
-    let payload = build_envelope_payload_b64_from_utf8(
+    let payload = build_wayfarer_chat_envelope_payload_b64(
         &config.to_wayfarer_id,
         &config.message,
         &signing_seed,
+        now_unix_ms() as i64,
     )?;
     let expiry_unix_ms = now_unix_ms().saturating_add(config.ttl_seconds.saturating_mul(1_000));
     let item_id = record_local_payload(&payload, expiry_unix_ms)?;

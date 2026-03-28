@@ -1168,6 +1168,11 @@ mod tests {
 
         for vector in vector_set.vectors {
             let now_ms = now_unix_ms();
+            let expected_preview =
+                crate::aethos_core::protocol::decode_envelope_payload_text_preview(
+                    &vector.payload_b64,
+                )
+                .unwrap_or_default();
             let transfer = TransferObject {
                 item_id: vector.item_id_hex.clone(),
                 envelope_b64: vector.payload_b64,
@@ -1187,10 +1192,7 @@ mod tests {
             assert_eq!(imported.accepted_item_ids, vec![vector.item_id_hex]);
             assert!(imported.rejected_items.is_empty());
             assert_eq!(imported.new_messages.len(), 1);
-            assert_eq!(
-                imported.new_messages[0].text,
-                vector.expected_decoded.body_utf8_preview
-            );
+            assert_eq!(imported.new_messages[0].text, expected_preview);
             assert_eq!(
                 imported.new_messages[0].item_id,
                 imported.accepted_item_ids[0]

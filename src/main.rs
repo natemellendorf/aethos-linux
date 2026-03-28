@@ -47,7 +47,7 @@ use crate::aethos_core::logging::{
     log_verbose as shared_log_verbose, set_verbose_logging_enabled,
 };
 use crate::aethos_core::protocol::{
-    build_envelope_payload_b64_from_utf8, decode_envelope_payload_b64, is_valid_wayfarer_id,
+    build_wayfarer_chat_envelope_payload_b64, decode_envelope_payload_b64, is_valid_wayfarer_id,
 };
 use crate::relay::client::{
     connect_to_relay_gossipv1, connect_to_relay_gossipv1_with_auth, normalize_http_endpoint,
@@ -2190,10 +2190,11 @@ fn build_ui(app: &Application) {
                     return;
                 }
             };
-            let payload_b64 = match build_envelope_payload_b64_from_utf8(
+            let payload_b64 = match build_wayfarer_chat_envelope_payload_b64(
                 &to,
                 &outgoing_text,
                 &author_signing_seed,
+                now_unix_ms() as i64,
             ) {
                 Ok(payload) => payload,
                 Err(err) => {
@@ -3471,8 +3472,12 @@ fn queue_auto_pong_message(
         return Err("invalid wayfarer_id for auto pong".to_string());
     }
     let author_signing_seed = load_local_signing_key_seed()?;
-    let payload_b64 =
-        build_envelope_payload_b64_from_utf8(to_wayfarer_id, "/pong", &author_signing_seed)?;
+    let payload_b64 = build_wayfarer_chat_envelope_payload_b64(
+        to_wayfarer_id,
+        "/pong",
+        &author_signing_seed,
+        now_unix_ms() as i64,
+    )?;
     let now_ms = now_unix_ms();
     let expiry_unix_ms = now_ms.saturating_add(ttl_seconds.saturating_mul(1000));
     let item_id = gossip_record_local_payload(&payload_b64, expiry_unix_ms)?;
