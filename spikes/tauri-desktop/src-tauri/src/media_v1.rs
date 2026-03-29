@@ -20,10 +20,10 @@ use crate::app_state::{
 };
 use crate::relay::client::EncounterMessagePreview;
 
-const MEDIA_CAPABILITIES_TYPE: &str = "aethos.media.capabilities.v1";
-const MEDIA_MANIFEST_TYPE: &str = "aethos.media.manifest.v1";
-const MEDIA_CHUNK_TYPE: &str = "aethos.media.chunk.v1";
-const MEDIA_MISSING_TYPE: &str = "aethos.media.missing.v1";
+const MEDIA_CAPABILITIES_TYPE: &str = "wayfarer.media.capabilities.v1";
+const MEDIA_MANIFEST_TYPE: &str = "wayfarer.media_manifest.v1";
+const MEDIA_CHUNK_TYPE: &str = "wayfarer.media.chunk.v1";
+const MEDIA_MISSING_TYPE: &str = "wayfarer.media.missing.v1";
 
 const MAX_ITEM_PAYLOAD_B64_BYTES_DEFAULT: usize = 64 * 1024;
 const MAX_OBJECT_BYTES: u64 = 128 * 1024 * 1024;
@@ -743,7 +743,9 @@ pub fn process_incoming_media_message(
     local_wayfarer_id: &str,
     author_signing_seed: &[u8; 32],
 ) -> Result<MediaMessageProcess, String> {
-    let Some(parsed) = parse_media_message(&pulled.text)? else {
+    let media_text = String::from_utf8(pulled.body_bytes.clone())
+        .map_err(|_| "invalid media message body encoding; expected utf8".to_string())?;
+    let Some(parsed) = parse_media_message(&media_text)? else {
         return Ok(MediaMessageProcess::NotMedia);
     };
 
@@ -3479,7 +3481,7 @@ mod tests {
 
     #[test]
     fn media_wire_detection_matches_spec_types() {
-        let msg = serde_json::json!({"type":"aethos.media.chunk.v1","x":1}).to_string();
+        let msg = serde_json::json!({"type":"wayfarer.media.chunk.v1","x":1}).to_string();
         assert!(is_media_wire_message(&msg));
         assert!(!is_media_wire_message("{\"type\":\"chat\"}"));
         assert!(!is_media_wire_message("not-json"));

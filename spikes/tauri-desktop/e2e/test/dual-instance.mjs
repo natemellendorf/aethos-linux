@@ -429,6 +429,8 @@ async function clickTab(driver, tabId) {
 }
 
 async function openContactsAndAdd(driver, id, alias) {
+  const normalizedId = normalizedIdText(id);
+  const normalizedAlias = String(alias || "").trim();
   await clickTab(driver, "contacts");
   await waitForSplashToClear(driver);
   const beforeContacts = new Set(
@@ -436,32 +438,53 @@ async function openContactsAndAdd(driver, id, alias) {
       "return Array.from(document.querySelectorAll('[data-testid^=\"chat-contact-\"]')).map((el)=>el.getAttribute('data-testid').replace('chat-contact-',''));"
     )
   );
-  const idInput = await driver.findElement(By.css("[data-testid='contact-wayfarer-id']"));
-  const aliasInput = await driver.findElement(By.css("[data-testid='contact-alias']"));
-  await idInput.clear();
-  await idInput.sendKeys(id);
-  await aliasInput.clear();
-  await aliasInput.sendKeys(alias);
-  const saveBtn = await driver.findElement(By.css("[data-testid='contact-save']"));
-  await driver.executeScript("arguments[0].scrollIntoView({block: 'center'}); arguments[0].click();", saveBtn);
+  let saved = false;
+  for (let attempt = 0; attempt < 6 && !saved; attempt += 1) {
+    await clickTab(driver, "contacts");
+    const idInput = await driver.findElement(By.css("[data-testid='contact-wayfarer-id']"));
+    const aliasInput = await driver.findElement(By.css("[data-testid='contact-alias']"));
 
-  const saved = await waitFor(async () => {
-    try {
-      await clickTab(driver, "chats");
-      const selector = `[data-testid='chat-contact-${id.toLowerCase()}']`;
-      const matches = await driver.findElements(By.css(selector));
-      return matches.length > 0;
-    } catch {
-      return false;
+    await idInput.clear();
+    await idInput.sendKeys(normalizedId);
+    await aliasInput.clear();
+    await aliasInput.sendKeys(normalizedAlias);
+
+    const fieldsReady = await waitFor(async () => {
+      try {
+        const state = await driver.executeScript(
+          "const id=document.querySelector('[data-testid=\"contact-wayfarer-id\"]')?.value || ''; const alias=document.querySelector('[data-testid=\"contact-alias\"]')?.value || ''; return { id, alias };"
+        );
+        return normalizedIdText(state?.id) === normalizedId && String(state?.alias || "").trim() === normalizedAlias;
+      } catch {
+        return false;
+      }
+    }, 3000, 150);
+
+    if (!fieldsReady) {
+      continue;
     }
-  }, 30000, 500);
+
+    const saveBtn = await driver.findElement(By.css("[data-testid='contact-save']"));
+    await driver.executeScript("arguments[0].scrollIntoView({block: 'center'}); arguments[0].click();", saveBtn);
+
+    saved = await waitFor(async () => {
+      try {
+        await clickTab(driver, "chats");
+        const selector = `[data-testid='chat-contact-${normalizedId}']`;
+        const matches = await driver.findElements(By.css(selector));
+        return matches.length > 0;
+      } catch {
+        return false;
+      }
+    }, 6000, 250);
+  }
 
   if (!saved) {
     await clickTab(driver, "contacts");
     const debugContactState = await driver.executeScript(
       "const id=document.querySelector('[data-testid=\"contact-wayfarer-id\"]')?.value || ''; const alias=document.querySelector('[data-testid=\"contact-alias\"]')?.value || ''; const contactList=Array.from(document.querySelectorAll('[data-testid^=\"chat-contact-\"]')).map((el)=>el.getAttribute('data-testid').replace('chat-contact-','')); const status=document.querySelector('[data-testid=\"status-text\"]')?.textContent || ''; return {id, alias, contactList, status};"
     );
-    throw new Error(`contact did not appear in chat list: ${id}; debug=${JSON.stringify(debugContactState)}; before=${JSON.stringify(Array.from(beforeContacts))}`);
+    throw new Error(`contact did not appear in chat list: ${normalizedId}; debug=${JSON.stringify(debugContactState)}; before=${JSON.stringify(Array.from(beforeContacts))}`);
   }
 }
 

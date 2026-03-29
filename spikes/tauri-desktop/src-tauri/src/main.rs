@@ -28,8 +28,8 @@ use std::time::{Duration, Instant};
 
 use app_state::{
     load_app_settings, load_chat_state, normalize_chat_state, now_unix_ms, now_unix_secs,
-    save_app_settings, save_chat_state, AppSettings, ChatAttachment, ChatDirection, ChatMessage,
-    OutboundState, PersistedChatState,
+    save_app_settings, save_chat_state, AppSettings, ChatAttachment, ChatDirection, ChatMediaTransfer,
+    ChatMessage, MediaTransferStatus, OutboundState, PersistedChatState,
 };
 use app_body::{
     build_wayfarer_chat_body, build_wayfarer_media_manifest_body, classify_wayfarer_app_body,
@@ -76,9 +76,13 @@ use crate::relay::client::{
 use media_v1::{
     drain_pending_media_control_unicast as media_drain_pending_media_control_unicast,
     get_completed_media_path as media_get_completed_media_path,
+    is_media_candidate_attachment as media_is_candidate_attachment,
     load_completed_media as media_load_completed_media, max_object_bytes as media_max_object_bytes,
+    maybe_queue_capabilities_for_peer as media_maybe_queue_capabilities_for_peer,
+    process_incoming_media_message as media_process_incoming_message,
     pulse_missing_requests_for_receiving_transfers as media_pulse_missing_requests_for_receiving_transfers,
     run_housekeeping_tick as media_run_housekeeping_tick,
+    send_media_manifest_and_chunks as media_send_manifest_and_chunks, MediaMessageProcess,
 };
 
 const SHARE_QR_FILE_NAME: &str = "share-wayfarer-qr.png";
@@ -963,6 +967,22 @@ fn upsert_contact(request: UpsertContactRequest) -> Result<BTreeMap<String, Stri
     let mut contacts = load_contact_aliases()?;
     contacts.insert(wayfarer_id.clone(), alias.to_string());
     save_contact_aliases(&contacts)?;
+
+    if let (Ok(signing_seed), Ok(settings)) = (load_local_signing_key_seed(), load_app_settings()) {
+        let _ = media_maybe_queue_capabilities_for_peer(
+            &wayfarer_id,
+            &signing_seed,
+            settings.message_ttl_seconds,
+        );
+        if let Some(runtime) = GOSSIP_RUNTIME.get() {
+            runtime.force_announce.store(true, Ordering::SeqCst);
+            set_gossip_event("announce queued");
+        }
+        if settings.relay_sync_enabled && !settings.relay_endpoints.is_empty() {
+            request_relay_sync("upsert_contact_media_capabilities");
+        }
+    }
+
     emit_chat_snapshot_event_best_effort("upsert_contact");
     Ok(contacts)
 }
@@ -1116,6 +1136,90 @@ fn send_message_blocking(request: SendMessageRequest) -> Result<SendMessageRespo
     let identity = ensure_local_identity()?;
     let author_signing_seed = load_local_signing_key_seed()?;
     let contacts = load_contact_aliases()?;
+
+    if let Some(media_attachment) = attachment
+        .as_ref()
+        .filter(|candidate| media_is_candidate_attachment(candidate))
+    {
+        let media_send = media_send_manifest_and_chunks(
+            wayfarer_id,
+            body,
+            media_attachment,
+            &author_signing_seed,
+            settings.message_ttl_seconds,
+        )?;
+
+        if let Some(runtime) = GOSSIP_RUNTIME.get() {
+            runtime.force_announce.store(true, Ordering::SeqCst);
+            set_gossip_event("announce queued");
+        }
+
+        let local_id = format!("local-{now_ms}-{:08x}", rand::random::<u32>());
+        let mut chat = load_chat_state()?;
+        chat.selected_contact = Some(wayfarer_id.to_string());
+        mark_contact_seen(&mut chat, wayfarer_id);
+
+        let thread = chat.threads.entry(wayfarer_id.to_string()).or_default();
+        thread.push(ChatMessage {
+            msg_id: local_id.clone(),
+            text: if body.is_empty() {
+                format!("[Media] {}", media_send.file_name)
+            } else {
+                body.to_string()
+            },
+            timestamp: format_timestamp_from_unix(now_secs),
+            created_at_unix: now_secs,
+            created_at_unix_ms: now_ms,
+            direction: ChatDirection::Outgoing,
+            seen: true,
+            manifest_id_hex: Some(media_send.object_sha256_hex.clone()),
+            delivered_at: None,
+            outbound_state: Some(OutboundState::Sending),
+            expires_at_unix_ms: Some(media_send.expires_at_unix_ms),
+            last_sync_attempt_unix_ms: Some(now_ms),
+            last_sync_error: None,
+            attachment: Some(sanitize_attachment_for_chat_history(media_attachment.clone())),
+            media: Some(ChatMediaTransfer {
+                transfer_id: media_send.transfer_id.clone(),
+                object_sha256_hex: media_send.object_sha256_hex.clone(),
+                file_name: media_send.file_name.clone(),
+                mime_type: media_send.mime_type.clone(),
+                total_bytes: media_send.total_bytes,
+                chunk_count: media_send.chunk_count,
+                received_chunks: 0,
+                received_bytes: 0,
+                status: MediaTransferStatus::Pending,
+                error: None,
+                expires_at_unix_ms: Some(media_send.expires_at_unix_ms),
+            }),
+        });
+        mark_outgoing_message(
+            &mut chat,
+            wayfarer_id,
+            &local_id,
+            &media_send.item_id,
+            None,
+        );
+
+        if settings.relay_sync_enabled && !settings.relay_endpoints.is_empty() {
+            request_relay_sync("send_media_manifest_and_chunks");
+        }
+
+        save_chat_state(&chat)?;
+        save_contact_aliases(&contacts)?;
+        emit_chat_snapshot_event_best_effort("send_message_media");
+
+        let message = latest_message_for_contact(&chat, wayfarer_id, &media_send.item_id, &local_id)
+            .ok_or_else(|| "failed to load stored outbound media message".to_string())?;
+
+        return Ok(SendMessageResponse {
+            message,
+            chat,
+            contacts,
+            encounter_status: "media manifest + chunks queued locally".to_string(),
+            pulled_messages: 0,
+        });
+    }
 
     let expiry_ms = now_ms.saturating_add(settings.message_ttl_seconds.saturating_mul(1000));
     let local_id = format!("local-{now_ms}-{:08x}", rand::random::<u32>());
@@ -3366,8 +3470,38 @@ fn merge_pulled_messages(
     contacts: &mut BTreeMap<String, String>,
     pulled_messages: Vec<crate::relay::client::EncounterMessagePreview>,
 ) {
+    let ttl_seconds_max = load_app_settings()
+        .map(|settings| settings.message_ttl_seconds)
+        .unwrap_or(3600);
+    let local_wayfarer_id = ensure_local_identity().ok().map(|identity| identity.wayfarer_id);
+    let author_signing_seed = load_local_signing_key_seed().ok();
+
     let mut auto_pong_targets = BTreeSet::new();
     for pulled in pulled_messages {
+        if let (Some(local_wayfarer_id), Some(author_signing_seed)) =
+            (local_wayfarer_id.as_deref(), author_signing_seed.as_ref())
+        {
+            match media_process_incoming_message(
+                &pulled,
+                chat,
+                contacts,
+                ttl_seconds_max,
+                local_wayfarer_id,
+                author_signing_seed,
+            ) {
+                Ok(MediaMessageProcess::HandledManifest | MediaMessageProcess::HandledSuppressed) => {
+                    continue;
+                }
+                Ok(MediaMessageProcess::NotMedia) => {}
+                Err(err) => {
+                    log_verbose(&format!(
+                        "media_inbound_process_failed: item_id={} error={}",
+                        pulled.item_id, err
+                    ));
+                }
+            }
+        }
+
         let classification = classify_wayfarer_app_body(&pulled.body_bytes);
         let outcome = classification.outcome_label();
         let routed_to = classification
