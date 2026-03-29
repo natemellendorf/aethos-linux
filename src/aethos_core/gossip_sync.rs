@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use crate::aethos_core::gossip_store_sqlite::{
     self, ImportWriteObject, RecordPutOutcome, StoredItemRecord,
 };
+use crate::aethos_core::identity_store::ensure_local_identity;
 use crate::aethos_core::logging::log_verbose;
 use crate::aethos_core::protocol::{
     bytes_to_hex_lower, decode_cbor_value_exact, decode_envelope_payload_b64,
@@ -372,13 +373,59 @@ pub fn missing_item_ids(item_ids: &[String]) -> Result<Vec<String>, String> {
 }
 
 pub fn eligible_item_ids(now_ms: u64) -> Result<Vec<String>, String> {
-    gossip_store_sqlite::eligible_item_ids(now_ms)
+    let candidate_ids = gossip_store_sqlite::eligible_item_ids(now_ms)?;
+    filter_non_self_advertisable_item_ids(candidate_ids)
 }
 
 fn eligible_relay_ingest_item_ids(now_ms: u64, max_items: usize) -> Result<Vec<String>, String> {
-    let mut selected = gossip_store_sqlite::eligible_relay_ingest_item_ids(now_ms, max_items)?;
+    let selected = gossip_store_sqlite::eligible_relay_ingest_item_ids(now_ms, max_items)?;
+    let mut selected = filter_non_self_advertisable_item_ids(selected)?;
     selected.sort_by_key(|item_id| decode_item_id(item_id).unwrap_or_default());
     Ok(selected)
+}
+
+fn filter_non_self_advertisable_item_ids(item_ids: Vec<String>) -> Result<Vec<String>, String> {
+    let local_wayfarer_id = match ensure_local_identity() {
+        Ok(identity) => identity.wayfarer_id,
+        Err(err) => {
+            log_verbose(&format!(
+                "gossip_advertise_filter_identity_unavailable: {}",
+                err
+            ));
+            return Ok(item_ids);
+        }
+    };
+
+    let existing = gossip_store_sqlite::get_existing_items_for_ids(&item_ids)?;
+    let mut filtered = Vec::with_capacity(item_ids.len());
+    let mut dropped = 0usize;
+    for item_id in item_ids {
+        let Some(record) = existing.get(&item_id) else {
+            continue;
+        };
+        match decode_envelope_payload_b64(&record.envelope_b64) {
+            Ok(decoded) if decoded.to_wayfarer_id_hex == local_wayfarer_id => {
+                dropped = dropped.saturating_add(1);
+            }
+            Ok(_) => filtered.push(item_id),
+            Err(err) => {
+                log_verbose(&format!(
+                    "gossip_advertise_filter_decode_failed: item_id={} error={}",
+                    item_id, err
+                ));
+                filtered.push(item_id);
+            }
+        }
+    }
+
+    if dropped > 0 {
+        log_verbose(&format!(
+            "gossip_advertise_filter_self_target_dropped: dropped={} kept={}",
+            dropped,
+            filtered.len()
+        ));
+    }
+    Ok(filtered)
 }
 
 pub fn record_local_payload(payload_b64: &str, expiry_unix_ms: u64) -> Result<String, String> {
@@ -708,8 +755,19 @@ fn validate_summary(summary: &SummaryFrame) -> Result<(), String> {
 }
 
 fn build_summary_preview_item_ids(now_ms: u64) -> Result<Vec<String>, String> {
+    let local_wayfarer_id = ensure_local_identity()
+        .ok()
+        .map(|identity| identity.wayfarer_id);
     let mut ranked = gossip_store_sqlite::summary_preview_candidates(now_ms)?
-        .iter()
+        .into_iter()
+        .filter(|item| {
+            let Some(local_wayfarer_id) = local_wayfarer_id.as_deref() else {
+                return true;
+            };
+            decode_envelope_payload_b64(&item.envelope_b64)
+                .map(|decoded| decoded.to_wayfarer_id_hex != local_wayfarer_id)
+                .unwrap_or(true)
+        })
         .map(|item| {
             (
                 item.hop_count,
