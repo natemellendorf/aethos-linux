@@ -42,11 +42,6 @@ pub struct DecodedEnvelopeV1 {
     pub body: Vec<u8>,
 }
 
-#[derive(Debug, Clone)]
-struct DecodedCanonicalMessageV2 {
-    body: Vec<u8>,
-}
-
 impl EnvelopeV1 {
     pub fn canonical_bytes_v1(&self) -> Result<Vec<u8>, String> {
         let mut payload_fields = BTreeMap::<String, ByteBuf>::new();
@@ -99,8 +94,6 @@ pub fn build_wayfarer_chat_envelope_payload_b64(
         return Err("created_at_unix_ms must be non-negative".to_string());
     }
 
-    let signing_key = SigningKey::from_bytes(author_signing_key_seed);
-    let author_wayfarer_id_hex = bytes_to_hex_lower(&Sha256::digest(signing_key.verifying_key()));
     let wayfarer_chat_body = encode_cbor_value_deterministic(&Value::Map(vec![
         (
             Value::Text("type".to_string()),
@@ -115,15 +108,10 @@ pub fn build_wayfarer_chat_envelope_payload_b64(
             Value::Integer(created_at_unix_ms.into()),
         ),
     ]))?;
-    let canonical_message = build_canonical_message_v2(
-        &author_wayfarer_id_hex,
-        &wayfarer_chat_body,
-        created_at_unix_ms,
-    )?;
 
     build_envelope_payload_b64(
         to_wayfarer_id_hex,
-        &canonical_message,
+        &wayfarer_chat_body,
         author_signing_key_seed,
     )
 }
@@ -360,84 +348,8 @@ pub fn decode_envelope_payload_utf8_preview(payload_b64: &str) -> Result<String,
 
 pub fn decode_envelope_payload_text_preview(payload_b64: &str) -> Result<String, String> {
     let decoded = decode_envelope_payload_b64(payload_b64)?;
-    let message = decode_canonical_message_v2(&decoded.body)
-        .map_err(|err| format!("canonical message decode failed: {err}"))?;
-    extract_wayfarer_chat_text_from_cbor(&message.body)
+    extract_wayfarer_chat_text_from_cbor(&decoded.body)
         .ok_or_else(|| "payload is not a valid wayfarer.chat.v1 message".to_string())
-}
-
-fn decode_canonical_message_v2(raw: &[u8]) -> Result<DecodedCanonicalMessageV2, String> {
-    if raw.len() < 2 {
-        return Err("canonical message is truncated".to_string());
-    }
-    if raw[0] != 2 || raw[1] != 3 {
-        return Err("canonical message has invalid version or type".to_string());
-    }
-
-    let mut offset = 2usize;
-    let mut created_at_unix_ms: Option<i64> = None;
-    let mut author_wayfarer_id: Option<&[u8]> = None;
-    let mut body: Option<Vec<u8>> = None;
-
-    while offset < raw.len() {
-        let field_id = raw[offset];
-        offset += 1;
-        if offset + 4 > raw.len() {
-            return Err("canonical message field length is truncated".to_string());
-        }
-        let field_len = u32::from_be_bytes([
-            raw[offset],
-            raw[offset + 1],
-            raw[offset + 2],
-            raw[offset + 3],
-        ]) as usize;
-        offset += 4;
-        if offset + field_len > raw.len() {
-            return Err("canonical message field payload is truncated".to_string());
-        }
-        let field_raw = &raw[offset..offset + field_len];
-        offset += field_len;
-
-        match field_id {
-            1 => {
-                if field_raw.len() != 8 {
-                    return Err(
-                        "canonical message created_at_unix_ms has invalid length".to_string()
-                    );
-                }
-                let mut bytes = [0u8; 8];
-                bytes.copy_from_slice(field_raw);
-                created_at_unix_ms = Some(i64::from_be_bytes(bytes));
-            }
-            2 => {
-                if field_raw.len() != 32 {
-                    return Err(
-                        "canonical message author_wayfarer_id has invalid length".to_string()
-                    );
-                }
-                author_wayfarer_id = Some(field_raw);
-            }
-            3 => {
-                body = Some(field_raw.to_vec());
-            }
-            4 => {}
-            _ => {
-                return Err(format!(
-                    "canonical message contains unknown field {field_id}"
-                ))
-            }
-        }
-    }
-
-    if created_at_unix_ms.is_none() {
-        return Err("canonical message missing created_at_unix_ms".to_string());
-    }
-    if author_wayfarer_id.is_none() {
-        return Err("canonical message missing author_wayfarer_id".to_string());
-    }
-    let body = body.ok_or_else(|| "canonical message missing body".to_string())?;
-
-    Ok(DecodedCanonicalMessageV2 { body })
 }
 
 fn extract_wayfarer_chat_text_from_cbor(body: &[u8]) -> Option<String> {
@@ -467,26 +379,6 @@ fn extract_wayfarer_chat_text_from_cbor(body: &[u8]) -> Option<String> {
     }
 
     text
-}
-
-fn build_canonical_message_v2(
-    author_wayfarer_id_hex: &str,
-    body: &[u8],
-    created_at_unix_ms: i64,
-) -> Result<Vec<u8>, String> {
-    let author_wayfarer_id = parse_wayfarer_id_hex(author_wayfarer_id_hex)?;
-
-    let mut out = vec![2u8, 3u8];
-    out.push(1);
-    out.extend_from_slice(&(8u32).to_be_bytes());
-    out.extend_from_slice(&created_at_unix_ms.to_be_bytes());
-    out.push(2);
-    out.extend_from_slice(&(32u32).to_be_bytes());
-    out.extend_from_slice(&author_wayfarer_id);
-    out.push(3);
-    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
-    out.extend_from_slice(body);
-    Ok(out)
 }
 
 fn parse_wayfarer_id_hex(hex_lower: &str) -> Result<[u8; 32], String> {
@@ -537,24 +429,6 @@ mod tests {
     fn expected_author_wayfarer_id() -> String {
         let verifying_key = SigningKey::from_bytes(&TEST_SIGNING_KEY_SEED).verifying_key();
         bytes_to_hex_lower(&Sha256::digest(verifying_key.to_bytes()))
-    }
-
-    fn build_test_canonical_message(
-        author_byte: u8,
-        body: &[u8],
-        created_at_unix_ms: i64,
-    ) -> Vec<u8> {
-        let mut out = vec![2u8, 3u8];
-        out.push(1);
-        out.extend_from_slice(&(8u32).to_be_bytes());
-        out.extend_from_slice(&created_at_unix_ms.to_be_bytes());
-        out.push(2);
-        out.extend_from_slice(&(32u32).to_be_bytes());
-        out.extend_from_slice(&[author_byte; 32]);
-        out.push(3);
-        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
-        out.extend_from_slice(body);
-        out
     }
 
     #[test]
@@ -656,21 +530,18 @@ mod tests {
     #[test]
     fn envelope_text_preview_rejects_non_contract_legacy_chat_json_body() {
         let destination = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let from = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        let payload = format!(
-            "\u{0002}\u{0003}\u{0001}\u{0000}\u{0000}\u{0000}\u{0008}\u{0000}\u{0000}\u{0001}\u{009d}\u{0000}\u{0000}\u{0000}\u{0020}{from}\u{0003}\u{0000}\u{0000}\u{0000}\u{001f}{{\"text\":\"interop marker\",\"type\":\"chat\",\"v\":2}}"
-        );
+        let payload = "{\"text\":\"interop marker\",\"type\":\"chat\",\"v\":2}";
         let envelope_b64 =
-            build_envelope_payload_b64_from_utf8(destination, &payload, &TEST_SIGNING_KEY_SEED)
-                .expect("build envelope with canonical message body payload");
+            build_envelope_payload_b64_from_utf8(destination, payload, &TEST_SIGNING_KEY_SEED)
+                .expect("build envelope with legacy JSON body payload");
 
         assert!(decode_envelope_payload_text_preview(&envelope_b64)
             .expect_err("legacy json body should not pass strict contract preview")
-            .contains("canonical message decode failed"));
+            .contains("payload is not a valid wayfarer.chat.v1 message"));
     }
 
     #[test]
-    fn envelope_text_preview_extracts_wayfarer_chat_text_from_canonical_message_body() {
+    fn envelope_text_preview_extracts_wayfarer_chat_text_from_app_body() {
         let destination = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let wayfarer_chat_body = encode_cbor_value_deterministic(&Value::Map(vec![
             (
@@ -687,11 +558,9 @@ mod tests {
             ),
         ]))
         .expect("encode wayfarer chat body");
-        let canonical_message =
-            build_test_canonical_message(0xbb, &wayfarer_chat_body, 1_735_689_600_000);
         let envelope_b64 =
-            build_envelope_payload_b64(destination, &canonical_message, &TEST_SIGNING_KEY_SEED)
-                .expect("build envelope with wayfarer canonical message body");
+            build_envelope_payload_b64(destination, &wayfarer_chat_body, &TEST_SIGNING_KEY_SEED)
+                .expect("build envelope with wayfarer app body");
 
         let preview = decode_envelope_payload_text_preview(&envelope_b64)
             .expect("decode wayfarer chat preview");

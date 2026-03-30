@@ -258,7 +258,7 @@ pub fn select_request_item_ids_from_summary_with_candidates(
     max_want: usize,
     candidate_item_ids: &[String],
 ) -> Result<Vec<String>, String> {
-    let local_have = eligible_item_ids(now_unix_ms())?;
+    let local_have = gossip_store_sqlite::eligible_item_ids(now_unix_ms())?;
     select_request_item_ids_from_summary_with_context(
         summary,
         max_want,

@@ -3,8 +3,8 @@
     windows_subsystem = "windows"
 )]
 
-mod app_state;
 mod app_body;
+mod app_state;
 mod media_v1;
 
 #[allow(dead_code)]
@@ -26,14 +26,14 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use app_state::{
-    load_app_settings, load_chat_state, normalize_chat_state, now_unix_ms, now_unix_secs,
-    save_app_settings, save_chat_state, AppSettings, ChatAttachment, ChatDirection, ChatMediaTransfer,
-    ChatMessage, MediaTransferStatus, OutboundState, PersistedChatState,
-};
 use app_body::{
     build_wayfarer_chat_body, build_wayfarer_media_manifest_body, classify_wayfarer_app_body,
     ClassificationOutcome, OutboundMediaAsset, OutboundMediaManifestInput,
+};
+use app_state::{
+    load_app_settings, load_chat_state, normalize_chat_state, now_unix_ms, now_unix_secs,
+    save_app_settings, save_chat_state, AppSettings, ChatAttachment, ChatDirection,
+    ChatMediaTransfer, ChatMessage, MediaTransferStatus, OutboundState, PersistedChatState,
 };
 use base64::Engine;
 use image::{imageops::FilterType, ImageBuffer, Luma, Rgba, RgbaImage};
@@ -49,9 +49,8 @@ use crate::aethos_core::gossip_sync::{
     build_hello_frame as build_gossip_hello_frame,
     build_relay_ingest_frame as build_gossip_relay_ingest_frame,
     build_request_frame as build_gossip_request_frame,
-    build_summary_frame as build_gossip_summary_frame,
-    import_transfer_items, missing_item_ids as gossip_missing_item_ids,
-    parse_frame as parse_gossip_frame,
+    build_summary_frame as build_gossip_summary_frame, import_transfer_items,
+    missing_item_ids as gossip_missing_item_ids, parse_frame as parse_gossip_frame,
     select_request_item_ids_from_summary_with_candidates as gossip_select_request_item_ids_from_summary,
     serialize_frame as serialize_gossip_frame, transfer_items_for_request as gossip_transfer_items,
     GossipSyncFrame, ReceiptFrame, GOSSIP_LAN_PORT, MAX_FRAME_BYTES, MAX_TRANSFER_BYTES,
@@ -70,9 +69,8 @@ use crate::aethos_core::protocol::{
 use crate::relay::client::{
     close_relay_persistent_session, connect_to_relay_gossipv1_with_auth,
     maybe_send_relay_heartbeat, normalize_http_endpoint, open_relay_persistent_session,
-    poll_relay_inbound_on_persistent_session,
-    relay_session_snapshot, run_relay_encounter_gossipv1, run_relay_round_on_persistent_session,
-    to_ws_endpoint, RelayPersistentSession,
+    poll_relay_inbound_on_persistent_session, relay_session_snapshot, run_relay_encounter_gossipv1,
+    run_relay_round_on_persistent_session, to_ws_endpoint, RelayPersistentSession,
 };
 use media_v1::{
     drain_pending_media_control_unicast as media_drain_pending_media_control_unicast,
@@ -84,6 +82,7 @@ use media_v1::{
     pulse_missing_requests_for_receiving_transfers as media_pulse_missing_requests_for_receiving_transfers,
     run_housekeeping_tick as media_run_housekeeping_tick,
     send_media_manifest_and_chunks as media_send_manifest_and_chunks, MediaMessageProcess,
+    PendingMediaControlKind, PendingMediaControlUnicast,
 };
 
 const SHARE_QR_FILE_NAME: &str = "share-wayfarer-qr.png";
@@ -108,6 +107,7 @@ const LAN_ENCOUNTER_MAX_BYTES: u64 = 2_000_000;
 const LAN_ENCOUNTER_IDLE_BACKOFF_MS: u64 = 70;
 const GOSSIP_UDP_SOCKET_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 const E2E_UDP_TRANSFER_FRAME_MAX_BYTES_DEFAULT: usize = 32 * 1024;
+const UDP_TRANSFER_FRAME_HARD_MAX_BYTES: usize = 65_507;
 const E2E_MEDIA_HOUSEKEEPING_MIN_INTERVAL_MS_DEFAULT: u64 = 2_000;
 
 fn lan_fallback_transfer_max_bytes() -> u64 {
@@ -138,7 +138,7 @@ fn lan_tcp_request_encounter_enabled() -> bool {
     std::env::var("AETHOS_LAN_TCP_REQUEST_ENCOUNTER")
         .ok()
         .map(|value| value.trim() != "0")
-        .unwrap_or(true)
+        .unwrap_or(false)
 }
 
 fn lan_fallback_max_chunks_per_request() -> usize {
@@ -177,6 +177,10 @@ fn e2e_udp_transfer_frame_max_bytes() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .map(|value| value.clamp(4 * 1024, MAX_FRAME_BYTES))
         .unwrap_or(E2E_UDP_TRANSFER_FRAME_MAX_BYTES_DEFAULT)
+}
+
+fn udp_transfer_frame_max_bytes() -> usize {
+    e2e_udp_transfer_frame_max_bytes().min(UDP_TRANSFER_FRAME_HARD_MAX_BYTES)
 }
 
 fn media_housekeeping_min_interval_ms(context: &str) -> u64 {
@@ -234,6 +238,109 @@ fn gossip_loopback_only_enabled() -> bool {
     std::env::var("AETHOS_GOSSIP_LOOPBACK_ONLY")
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
+}
+
+fn e2e_enabled() -> bool {
+    std::env::var("AETHOS_E2E")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn media_control_fastlane_tcp_enabled() -> bool {
+    std::env::var("AETHOS_MEDIA_CONTROL_FASTLANE_TCP")
+        .ok()
+        .map(|value| value.trim() != "0")
+        .unwrap_or_else(e2e_enabled)
+}
+
+fn missing_request_tcp_mirror_enabled() -> bool {
+    std::env::var("AETHOS_MEDIA_MISSING_TCP_MIRROR")
+        .ok()
+        .map(|value| value.trim() != "0")
+        .unwrap_or_else(e2e_enabled)
+}
+
+fn missing_request_tcp_mirror_max_per_minute() -> usize {
+    std::env::var("AETHOS_MEDIA_MISSING_TCP_MIRROR_MAX_PER_MINUTE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|value| value.clamp(1, 300))
+        .unwrap_or(40)
+}
+
+fn missing_request_tcp_mirror_min_interval_ms() -> u64 {
+    std::env::var("AETHOS_MEDIA_MISSING_TCP_MIRROR_MIN_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|value| value.clamp(300, 10_000))
+        .unwrap_or(1_200)
+}
+
+fn media_control_fastlane_tcp_min_payload_b64_bytes() -> usize {
+    std::env::var("AETHOS_MEDIA_CONTROL_FASTLANE_TCP_MIN_PAYLOAD_B64_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1024)
+}
+
+fn media_control_fastlane_tcp_batch_max_items() -> usize {
+    let default_limit = if e2e_enabled() { 4 } else { 8 };
+    std::env::var("AETHOS_MEDIA_CONTROL_FASTLANE_TCP_BATCH_MAX_ITEMS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|value| value.clamp(1, 256))
+        .unwrap_or(default_limit)
+}
+
+#[derive(Default)]
+struct MissingRequestTcpMirrorBudget {
+    window_started_unix_ms: u64,
+    sent_in_window: usize,
+    last_sent_unix_ms_by_transfer: HashMap<String, u64>,
+}
+
+fn missing_request_tcp_mirror_budget() -> &'static Mutex<MissingRequestTcpMirrorBudget> {
+    static BUDGET: OnceLock<Mutex<MissingRequestTcpMirrorBudget>> = OnceLock::new();
+    BUDGET.get_or_init(|| Mutex::new(MissingRequestTcpMirrorBudget::default()))
+}
+
+fn allow_missing_request_tcp_mirror(transfer_id: Option<&str>) -> bool {
+    if !missing_request_tcp_mirror_enabled() {
+        return false;
+    }
+    let now_ms = now_unix_ms();
+    let max_per_minute = missing_request_tcp_mirror_max_per_minute();
+    let min_interval_ms = missing_request_tcp_mirror_min_interval_ms();
+    let Ok(mut budget) = missing_request_tcp_mirror_budget().lock() else {
+        return false;
+    };
+    if now_ms.saturating_sub(budget.window_started_unix_ms) >= 60_000 {
+        budget.window_started_unix_ms = now_ms;
+        budget.sent_in_window = 0;
+    }
+    if budget.sent_in_window >= max_per_minute {
+        return false;
+    }
+    if let Some(transfer_id) = transfer_id {
+        if let Some(last_sent) = budget
+            .last_sent_unix_ms_by_transfer
+            .get(transfer_id)
+            .copied()
+        {
+            if now_ms.saturating_sub(last_sent) < min_interval_ms {
+                return false;
+            }
+        }
+        budget
+            .last_sent_unix_ms_by_transfer
+            .retain(|_, last_sent| now_ms.saturating_sub(*last_sent) < 120_000);
+        budget
+            .last_sent_unix_ms_by_transfer
+            .insert(transfer_id.to_string(), now_ms);
+    }
+    budget.sent_in_window = budget.sent_in_window.saturating_add(1);
+    true
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1180,7 +1287,9 @@ fn send_message_blocking(request: SendMessageRequest) -> Result<SendMessageRespo
             expires_at_unix_ms: Some(media_send.expires_at_unix_ms),
             last_sync_attempt_unix_ms: Some(now_ms),
             last_sync_error: None,
-            attachment: Some(sanitize_attachment_for_chat_history(media_attachment.clone())),
+            attachment: Some(sanitize_attachment_for_chat_history(
+                media_attachment.clone(),
+            )),
             media: Some(ChatMediaTransfer {
                 transfer_id: media_send.transfer_id.clone(),
                 object_sha256_hex: media_send.object_sha256_hex.clone(),
@@ -1195,13 +1304,7 @@ fn send_message_blocking(request: SendMessageRequest) -> Result<SendMessageRespo
                 expires_at_unix_ms: Some(media_send.expires_at_unix_ms),
             }),
         });
-        mark_outgoing_message(
-            &mut chat,
-            wayfarer_id,
-            &local_id,
-            &media_send.item_id,
-            None,
-        );
+        mark_outgoing_message(&mut chat, wayfarer_id, &local_id, &media_send.item_id, None);
 
         if settings.relay_sync_enabled && !settings.relay_endpoints.is_empty() {
             request_relay_sync("send_media_manifest_and_chunks");
@@ -1211,8 +1314,9 @@ fn send_message_blocking(request: SendMessageRequest) -> Result<SendMessageRespo
         save_contact_aliases(&contacts)?;
         emit_chat_snapshot_event_best_effort("send_message_media");
 
-        let message = latest_message_for_contact(&chat, wayfarer_id, &media_send.item_id, &local_id)
-            .ok_or_else(|| "failed to load stored outbound media message".to_string())?;
+        let message =
+            latest_message_for_contact(&chat, wayfarer_id, &media_send.item_id, &local_id)
+                .ok_or_else(|| "failed to load stored outbound media message".to_string())?;
 
         return Ok(SendMessageResponse {
             message,
@@ -1273,7 +1377,8 @@ fn send_message_blocking(request: SendMessageRequest) -> Result<SendMessageRespo
     ));
 
     let manifest_id_hex = bytes_to_hex_lower(&sha2::Sha256::digest(&outbound_body_bytes));
-    let payload = build_envelope_payload_b64(wayfarer_id, &outbound_body_bytes, &author_signing_seed)?;
+    let payload =
+        build_envelope_payload_b64(wayfarer_id, &outbound_body_bytes, &author_signing_seed)?;
     let item_id = gossip_record_local_payload(&payload, expiry_ms)?;
     if let Some(runtime) = GOSSIP_RUNTIME.get() {
         runtime.force_announce.store(true, Ordering::SeqCst);
@@ -1396,6 +1501,144 @@ fn run_media_housekeeping_best_effort(context: &str, ttl_seconds_max: u64) {
     }
 }
 
+fn try_send_media_control_fastlane_tcp(
+    peer_wayfarer_id: &str,
+    peer_addr: SocketAddr,
+    envelopes: &[PendingMediaControlUnicast],
+) -> usize {
+    if envelopes.is_empty() {
+        return 0;
+    }
+    let addr = format!("{}:{}", peer_addr.ip(), peer_addr.port());
+    let connect_stream = || -> Result<TcpStream, String> {
+        let stream = TcpStream::connect(&addr)
+            .map_err(|err| format!("tcp connect failed ({addr}): {err}"))?;
+        let _ = stream.set_nodelay(true);
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(8)));
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(3000)));
+        Ok(stream)
+    };
+
+    let mut stream = match connect_stream() {
+        Ok(stream) => stream,
+        Err(err) => {
+            log_verbose(&format!(
+                "media_control_fastlane_tcp_connect_failed: peer={} addr={} error={}",
+                peer_wayfarer_id, addr, err
+            ));
+            return 0;
+        }
+    };
+
+    let mut sent = 0usize;
+    let base_batch_items = media_control_fastlane_tcp_batch_max_items()
+        .min(envelopes.len())
+        .max(1);
+    let mut current_batch_items = base_batch_items;
+    let mut idx = 0usize;
+    let mut reconnect_fail_streak = 0usize;
+    while idx < envelopes.len() {
+        let batch_end = (idx + current_batch_items).min(envelopes.len());
+        let batch = &envelopes[idx..batch_end];
+        let objects = batch
+            .iter()
+            .map(|envelope| crate::aethos_core::gossip_sync::TransferObject {
+                item_id: envelope.item_id.clone(),
+                envelope_b64: envelope.payload_b64.clone(),
+                expiry_unix_ms: envelope.expiry_unix_ms,
+                hop_count: 1,
+            })
+            .collect::<Vec<_>>();
+        let transfer =
+            GossipSyncFrame::Transfer(crate::aethos_core::gossip_sync::TransferFrame { objects });
+        match send_gossip_frame_tcp(&mut stream, &transfer) {
+            Ok(()) => {
+                sent = sent.saturating_add(batch.len());
+                reconnect_fail_streak = 0;
+                log_verbose(&format!(
+                    "media_control_fastlane_sent: transport=tcp peer={} addr={} batch_items={} first_item={} last_item={}",
+                    peer_wayfarer_id,
+                    addr,
+                    batch.len(),
+                    batch
+                        .first()
+                        .map(|value| value.item_id.as_str())
+                        .unwrap_or("none"),
+                    batch
+                        .last()
+                        .map(|value| value.item_id.as_str())
+                        .unwrap_or("none")
+                ));
+                for _ in 0..3 {
+                    match read_gossip_frame_tcp(&mut stream) {
+                        Ok(_) => {}
+                        Err(err)
+                            if err.contains("timeout")
+                                || err.contains("WouldBlock")
+                                || err.contains("UnexpectedEof")
+                                || err.contains("eof") =>
+                        {
+                            break;
+                        }
+                        Err(_) => {
+                            break;
+                        }
+                    }
+                }
+                idx = batch_end;
+            }
+            Err(err) => {
+                log_verbose(&format!(
+                    "media_control_fastlane_tcp_send_failed: peer={} addr={} batch_items={} idx={} error={}",
+                    peer_wayfarer_id,
+                    addr,
+                    batch.len(),
+                    idx,
+                    err
+                ));
+                if current_batch_items > 1 {
+                    current_batch_items = (current_batch_items / 2).max(1);
+                    log_verbose(&format!(
+                        "media_control_fastlane_tcp_batch_reduced: peer={} addr={} next_batch_items={}",
+                        peer_wayfarer_id, addr, current_batch_items
+                    ));
+                    match connect_stream() {
+                        Ok(new_stream) => {
+                            stream = new_stream;
+                        }
+                        Err(connect_err) => {
+                            log_verbose(&format!(
+                                "media_control_fastlane_tcp_reconnect_failed: peer={} addr={} error={}",
+                                peer_wayfarer_id, addr, connect_err
+                            ));
+                            break;
+                        }
+                    }
+                    continue;
+                }
+
+                reconnect_fail_streak = reconnect_fail_streak.saturating_add(1);
+                if reconnect_fail_streak >= 3 {
+                    break;
+                }
+                match connect_stream() {
+                    Ok(new_stream) => {
+                        stream = new_stream;
+                    }
+                    Err(connect_err) => {
+                        log_verbose(&format!(
+                            "media_control_fastlane_tcp_reconnect_failed: peer={} addr={} error={}",
+                            peer_wayfarer_id, addr, connect_err
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    sent
+}
+
 fn flush_media_control_fastlane(
     socket: &UdpSocket,
     peer_addr_by_node: &HashMap<String, SocketAddr>,
@@ -1420,72 +1663,60 @@ fn flush_media_control_fastlane(
             continue;
         };
 
-        let mut batch_objects = Vec::new();
-        let mut batch_item_ids = Vec::new();
+        let tcp_enabled = media_control_fastlane_tcp_enabled() && !lan_tcp_disabled();
+        let tcp_min_payload_b64 = media_control_fastlane_tcp_min_payload_b64_bytes();
+        let mut tcp_chunk_envelopes = Vec::new();
+        let mut tcp_missing_mirror_envelopes = Vec::new();
+        let mut udp_envelopes = Vec::new();
         for envelope in envelopes {
+            match envelope.kind {
+                PendingMediaControlKind::ChunkResponse => {
+                    if tcp_enabled && envelope.payload_b64.len() >= tcp_min_payload_b64 {
+                        tcp_chunk_envelopes.push(envelope);
+                    } else {
+                        udp_envelopes.push(envelope);
+                    }
+                }
+                PendingMediaControlKind::MissingRequest => {
+                    if tcp_enabled
+                        && envelope.tcp_mirror
+                        && allow_missing_request_tcp_mirror(envelope.transfer_id.as_deref())
+                    {
+                        tcp_missing_mirror_envelopes.push(envelope.clone());
+                    }
+                    udp_envelopes.push(envelope);
+                }
+            }
+        }
+
+        if tcp_enabled && !tcp_missing_mirror_envelopes.is_empty() {
+            let _ = try_send_media_control_fastlane_tcp(
+                &peer_wayfarer_id,
+                *peer_addr,
+                &tcp_missing_mirror_envelopes,
+            );
+        }
+        if tcp_enabled && !tcp_chunk_envelopes.is_empty() {
+            let tcp_sent = try_send_media_control_fastlane_tcp(
+                &peer_wayfarer_id,
+                *peer_addr,
+                &tcp_chunk_envelopes,
+            );
+            udp_envelopes.extend(tcp_chunk_envelopes.into_iter().skip(tcp_sent));
+        } else {
+            udp_envelopes.extend(tcp_chunk_envelopes);
+        }
+
+        for envelope in udp_envelopes {
             let object = crate::aethos_core::gossip_sync::TransferObject {
                 item_id: envelope.item_id.clone(),
                 envelope_b64: envelope.payload_b64.clone(),
                 expiry_unix_ms: envelope.expiry_unix_ms,
                 hop_count: 1,
             };
-
-            let mut candidate_objects = batch_objects.clone();
-            candidate_objects.push(object.clone());
-            let candidate_frame =
-                GossipSyncFrame::Transfer(crate::aethos_core::gossip_sync::TransferFrame {
-                    objects: candidate_objects.clone(),
-                });
-            let candidate_fits = serialize_gossip_frame(&candidate_frame)
-                .map(|raw| raw.len() <= e2e_udp_transfer_frame_max_bytes())
-                .unwrap_or(false);
-
-            if candidate_fits {
-                batch_objects = candidate_objects;
-                batch_item_ids.push(envelope.item_id);
-                continue;
-            }
-
-            if !batch_objects.is_empty() {
-                let transfer =
-                    GossipSyncFrame::Transfer(crate::aethos_core::gossip_sync::TransferFrame {
-                        objects: batch_objects.clone(),
-                    });
-                match send_gossip_frame(
-                    socket,
-                    &peer_addr.ip().to_string(),
-                    peer_addr.port(),
-                    &transfer,
-                ) {
-                    Ok(()) => {
-                        for item_id in &batch_item_ids {
-                            log_verbose(&format!(
-                                "media_control_fastlane_sent: peer={} addr={} item_id={}",
-                                peer_wayfarer_id, peer_addr, item_id
-                            ));
-                        }
-                    }
-                    Err(err) => {
-                        for item_id in &batch_item_ids {
-                            log_verbose(&format!(
-                                "media_control_fastlane_send_failed: peer={} addr={} item_id={} error={}",
-                                peer_wayfarer_id, peer_addr, item_id, err
-                            ));
-                        }
-                    }
-                }
-                batch_objects.clear();
-                batch_item_ids.clear();
-            }
-
-            batch_objects.push(object);
-            batch_item_ids.push(envelope.item_id);
-        }
-
-        if !batch_objects.is_empty() {
             let transfer =
                 GossipSyncFrame::Transfer(crate::aethos_core::gossip_sync::TransferFrame {
-                    objects: batch_objects,
+                    objects: vec![object],
                 });
             match send_gossip_frame(
                 socket,
@@ -1494,20 +1725,16 @@ fn flush_media_control_fastlane(
                 &transfer,
             ) {
                 Ok(()) => {
-                    for item_id in &batch_item_ids {
-                        log_verbose(&format!(
-                            "media_control_fastlane_sent: peer={} addr={} item_id={}",
-                            peer_wayfarer_id, peer_addr, item_id
-                        ));
-                    }
+                    log_verbose(&format!(
+                        "media_control_fastlane_sent: peer={} addr={} item_id={}",
+                        peer_wayfarer_id, peer_addr, envelope.item_id
+                    ));
                 }
                 Err(err) => {
-                    for item_id in &batch_item_ids {
-                        log_verbose(&format!(
-                            "media_control_fastlane_send_failed: peer={} addr={} item_id={} error={}",
-                            peer_wayfarer_id, peer_addr, item_id, err
-                        ));
-                    }
+                    log_verbose(&format!(
+                        "media_control_fastlane_send_failed: peer={} addr={} item_id={} error={}",
+                        peer_wayfarer_id, peer_addr, envelope.item_id, err
+                    ));
                 }
             }
         }
@@ -1924,8 +2151,8 @@ fn start_relay_worker_if_needed() {
                                 }
                             }
                             if saw_inbound_activity {
-                                next_periodic_sync_at =
-                                    Instant::now() + Duration::from_secs(RELAY_PERIODIC_SYNC_INTERVAL_SECS);
+                                next_periodic_sync_at = Instant::now()
+                                    + Duration::from_secs(RELAY_PERIODIC_SYNC_INTERVAL_SECS);
                             }
                             continue;
                         }
@@ -1964,15 +2191,19 @@ fn start_relay_worker_if_needed() {
                 relay_slot, relay_ws, sync_trigger
             ));
 
-            if relay_sessions.get(relay_slot).and_then(|slot| slot.as_ref()).is_none() {
+            if relay_sessions
+                .get(relay_slot)
+                .and_then(|slot| slot.as_ref())
+                .is_none()
+            {
                 match open_relay_persistent_session(&relay_ws, &identity, auth.as_deref()) {
                     Ok(session) => {
                         relay_sessions[relay_slot] = Some(session);
                     }
                     Err(err) => {
                         relay_failures[relay_slot] = relay_failures[relay_slot].saturating_add(1);
-                        let backoff_secs =
-                            2_u64.saturating_pow(relay_failures[relay_slot].saturating_sub(1).min(6));
+                        let backoff_secs = 2_u64
+                            .saturating_pow(relay_failures[relay_slot].saturating_sub(1).min(6));
                         relay_next_attempt_at[relay_slot] =
                             Instant::now() + Duration::from_secs(backoff_secs.min(60));
                         set_relay_worker_status(&format!(
@@ -2012,11 +2243,15 @@ fn start_relay_worker_if_needed() {
                 }
             }
 
-            let round_result = if let Some(session) = relay_sessions
-                .get_mut(relay_slot)
-                .and_then(Option::as_mut)
+            let round_result = if let Some(session) =
+                relay_sessions.get_mut(relay_slot).and_then(Option::as_mut)
             {
-                run_relay_round_on_persistent_session(session, &identity, None, Duration::from_secs(45))
+                run_relay_round_on_persistent_session(
+                    session,
+                    &identity,
+                    None,
+                    Duration::from_secs(45),
+                )
             } else {
                 Err("relay persistent session unavailable".to_string())
             };
@@ -2097,11 +2332,17 @@ fn apply_relay_pulled_messages(
     let mut chat = load_chat_state()?;
     let mut contacts = load_contact_aliases()?;
     let pulled_count = pulled_messages.len();
-    merge_pulled_messages(&mut chat, &mut contacts, pulled_messages);
-    save_chat_state(&chat)?;
-    save_contact_aliases(&contacts)?;
-    emit_chat_snapshot_event_best_effort(context);
-    emit_sound_event_best_effort("sync", context);
+    let merge_outcome = merge_pulled_messages(&mut chat, &mut contacts, pulled_messages);
+    if merge_outcome.chat_changed {
+        save_chat_state(&chat)?;
+    }
+    if merge_outcome.contacts_changed {
+        save_contact_aliases(&contacts)?;
+    }
+    if merge_outcome.chat_changed || merge_outcome.contacts_changed {
+        emit_chat_snapshot_event_best_effort(context);
+        emit_sound_event_best_effort("sync", context);
+    }
     Ok(pulled_count)
 }
 
@@ -2156,10 +2397,6 @@ fn start_gossip_worker_if_needed(initial_enabled: bool) {
         let mut udp_peer_interactions: HashMap<String, UdpPeerInteraction> = HashMap::new();
         let mut recent_served_request_by_peer: HashMap<String, (u64, Instant)> = HashMap::new();
         let mut recent_outbound_request_by_peer: HashMap<String, (u64, Instant)> = HashMap::new();
-        let local_wayfarer_id = ensure_local_identity()
-            .map(|identity| identity.wayfarer_id)
-            .ok();
-        let local_signing_seed = load_local_signing_key_seed().ok();
         let mut last_missing_pulse = Instant::now() - Duration::from_millis(500);
         let tcp_listener = match bind_gossip_tcp_listener() {
             Ok(listener) => Some(listener),
@@ -2219,15 +2456,15 @@ fn start_gossip_worker_if_needed(initial_enabled: bool) {
             flush_media_control_fastlane(&socket, &peer_addr_by_node);
 
             if last_missing_pulse.elapsed() >= Duration::from_millis(250) {
-                if let (Some(local_id), Some(seed)) =
-                    (local_wayfarer_id.as_deref(), local_signing_seed.as_ref())
+                if let (Ok(identity), Ok(seed)) =
+                    (ensure_local_identity(), load_local_signing_key_seed())
                 {
                     let ttl_seconds = load_app_settings()
                         .map(|settings| settings.message_ttl_seconds)
                         .unwrap_or(3600);
                     match media_pulse_missing_requests_for_receiving_transfers(
-                        local_id,
-                        seed,
+                        &identity.wayfarer_id,
+                        &seed,
                         ttl_seconds,
                     ) {
                         Ok(requested) if requested > 0 => {
@@ -2702,15 +2939,21 @@ fn handle_gossip_frame(
                         manifest_id_hex: item.manifest_id_hex,
                     })
                     .collect::<Vec<_>>();
-                merge_pulled_messages(&mut chat, &mut contacts, pulled);
-                save_chat_state(&chat)?;
-                save_contact_aliases(&contacts)?;
-                emit_chat_snapshot_event_best_effort("gossip_transfer_import");
-                emit_sound_event_best_effort("sync", "gossip_transfer_import");
-                runtime
-                    .last_activity_ms
-                    .store(now_unix_ms(), Ordering::SeqCst);
-                set_gossip_event("received messages");
+                let merge_outcome = merge_pulled_messages(&mut chat, &mut contacts, pulled);
+                if merge_outcome.chat_changed {
+                    save_chat_state(&chat)?;
+                }
+                if merge_outcome.contacts_changed {
+                    save_contact_aliases(&contacts)?;
+                }
+                if merge_outcome.chat_changed || merge_outcome.contacts_changed {
+                    emit_chat_snapshot_event_best_effort("gossip_transfer_import");
+                    emit_sound_event_best_effort("sync", "gossip_transfer_import");
+                    runtime
+                        .last_activity_ms
+                        .store(now_unix_ms(), Ordering::SeqCst);
+                    set_gossip_event("received messages");
+                }
                 log_verbose(&format!(
                     "gossip_transfer_imported_messages={} from={}",
                     imported_count, source
@@ -2815,7 +3058,7 @@ fn send_gossip_frame(
 ) -> Result<(), String> {
     let raw = serialize_gossip_frame(frame)?;
     if matches!(frame, GossipSyncFrame::Transfer(_)) {
-        let max_transfer_frame = e2e_udp_transfer_frame_max_bytes();
+        let max_transfer_frame = udp_transfer_frame_max_bytes();
         if raw.len() > max_transfer_frame {
             return Err(format!(
                 "udp transfer frame exceeds max bytes: {} > {}",
@@ -2938,12 +3181,17 @@ fn run_gossip_tcp_encounter_on_stream(
         }
     }
 
+    let mut push_only_transfer_mode = false;
+    let mut received_first_frame = false;
+
     loop {
         if let Some(stop_reason) = encounter.should_stop(runtime, false) {
             encounter.finish(stop_reason, trigger);
             break;
         }
-        encounter.rounds = encounter.rounds.saturating_add(1);
+        if !push_only_transfer_mode {
+            encounter.rounds = encounter.rounds.saturating_add(1);
+        }
 
         let frame = match read_gossip_frame_tcp(stream) {
             Ok(frame) => frame,
@@ -2959,6 +3207,17 @@ fn run_gossip_tcp_encounter_on_stream(
         };
 
         let mut did_progress = false;
+
+        if !received_first_frame {
+            push_only_transfer_mode = matches!(frame, GossipSyncFrame::Transfer(_));
+            received_first_frame = true;
+            if push_only_transfer_mode {
+                log_verbose(&format!(
+                    "gossip_tcp_push_only_mode: trigger={} peer={}",
+                    trigger, encounter.peer_identity
+                ));
+            }
+        }
 
         match frame {
             GossipSyncFrame::Hello(_) => {
@@ -3119,15 +3378,21 @@ fn run_gossip_tcp_encounter_on_stream(
                             manifest_id_hex: item.manifest_id_hex,
                         })
                         .collect::<Vec<_>>();
-                    merge_pulled_messages(&mut chat, &mut contacts, pulled);
-                    save_chat_state(&chat)?;
-                    save_contact_aliases(&contacts)?;
-                    emit_chat_snapshot_event_best_effort("gossip_tcp_transfer_import");
-                    emit_sound_event_best_effort("sync", "gossip_tcp_transfer_import");
-                    runtime
-                        .last_activity_ms
-                        .store(now_unix_ms(), Ordering::SeqCst);
-                    set_gossip_event("received messages");
+                    let merge_outcome = merge_pulled_messages(&mut chat, &mut contacts, pulled);
+                    if merge_outcome.chat_changed {
+                        save_chat_state(&chat)?;
+                    }
+                    if merge_outcome.contacts_changed {
+                        save_contact_aliases(&contacts)?;
+                    }
+                    if merge_outcome.chat_changed || merge_outcome.contacts_changed {
+                        emit_chat_snapshot_event_best_effort("gossip_tcp_transfer_import");
+                        emit_sound_event_best_effort("sync", "gossip_tcp_transfer_import");
+                        runtime
+                            .last_activity_ms
+                            .store(now_unix_ms(), Ordering::SeqCst);
+                        set_gossip_event("received messages");
+                    }
                 }
 
                 if accepted_delta == 0 {
@@ -3135,20 +3400,22 @@ fn run_gossip_tcp_encounter_on_stream(
                     break;
                 }
 
-                let receipt = GossipSyncFrame::Receipt(ReceiptFrame {
-                    received: result.accepted_item_ids,
-                });
-                if let Err(err) = send_gossip_frame_tcp(stream, &receipt) {
-                    log_verbose(&format!(
-                        "gossip_tcp_receipt_send_failed: peer={} error={}",
-                        transport_peer, err
-                    ));
-                }
-                if let Ok(summary) = build_gossip_summary_frame(now_unix_ms()) {
-                    let _ = send_gossip_frame_tcp(stream, &summary);
-                }
-                if let Ok(ingest) = build_gossip_relay_ingest_frame(now_unix_ms()) {
-                    let _ = send_gossip_frame_tcp(stream, &ingest);
+                if !push_only_transfer_mode {
+                    let receipt = GossipSyncFrame::Receipt(ReceiptFrame {
+                        received: result.accepted_item_ids,
+                    });
+                    if let Err(err) = send_gossip_frame_tcp(stream, &receipt) {
+                        log_verbose(&format!(
+                            "gossip_tcp_receipt_send_failed: peer={} error={}",
+                            transport_peer, err
+                        ));
+                    }
+                    if let Ok(summary) = build_gossip_summary_frame(now_unix_ms()) {
+                        let _ = send_gossip_frame_tcp(stream, &summary);
+                    }
+                    if let Ok(ingest) = build_gossip_relay_ingest_frame(now_unix_ms()) {
+                        let _ = send_gossip_frame_tcp(stream, &ingest);
+                    }
                 }
                 log_verbose(&format!(
                     "gossip_encounter_round: transport=tcp trigger={} peer={} round={} frame=TRANSFER transfer_objects={} transfer_bytes={} accepted={} rejected={} accepted_delta={} accepted_total={} bytes_imported={}",
@@ -3539,18 +3806,27 @@ fn mark_contact_seen(chat: &mut PersistedChatState, contact: &str) {
     chat.new_contacts.retain(|value| value != contact);
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct MergePulledOutcome {
+    chat_changed: bool,
+    contacts_changed: bool,
+}
+
 fn merge_pulled_messages(
     chat: &mut PersistedChatState,
     contacts: &mut BTreeMap<String, String>,
     pulled_messages: Vec<crate::relay::client::EncounterMessagePreview>,
-) {
+) -> MergePulledOutcome {
     let ttl_seconds_max = load_app_settings()
         .map(|settings| settings.message_ttl_seconds)
         .unwrap_or(3600);
-    let local_wayfarer_id = ensure_local_identity().ok().map(|identity| identity.wayfarer_id);
+    let local_wayfarer_id = ensure_local_identity()
+        .ok()
+        .map(|identity| identity.wayfarer_id);
     let author_signing_seed = load_local_signing_key_seed().ok();
 
     let mut auto_pong_targets = BTreeSet::new();
+    let mut outcome = MergePulledOutcome::default();
     for pulled in pulled_messages {
         if let (Some(local_wayfarer_id), Some(author_signing_seed)) =
             (local_wayfarer_id.as_deref(), author_signing_seed.as_ref())
@@ -3563,7 +3839,9 @@ fn merge_pulled_messages(
                 local_wayfarer_id,
                 author_signing_seed,
             ) {
-                Ok(MediaMessageProcess::HandledManifest | MediaMessageProcess::HandledSuppressed) => {
+                Ok(MediaMessageProcess::HandledManifest { chat_updated })
+                | Ok(MediaMessageProcess::HandledSuppressed { chat_updated }) => {
+                    outcome.chat_changed |= chat_updated;
                     continue;
                 }
                 Ok(MediaMessageProcess::NotMedia) => {}
@@ -3577,7 +3855,7 @@ fn merge_pulled_messages(
         }
 
         let classification = classify_wayfarer_app_body(&pulled.body_bytes);
-        let outcome = classification.outcome_label();
+        let outcome_label = classification.outcome_label();
         let routed_to = classification
             .routed_to
             .as_deref()
@@ -3592,23 +3870,24 @@ fn merge_pulled_messages(
         let sender_label = resolve_contact_id_for_preview(&pulled);
         let sender_alias = resolve_contact_alias_for_preview(&pulled);
         match classification.outcome {
-            ClassificationOutcome::AcceptDisplay {
-                chat: chat_payload,
-            } => {
+            ClassificationOutcome::AcceptDisplay { chat: chat_payload } => {
                 log_info(&format!(
                     "inbound_app_body_classification: item_id={} outcome={} type={} routed_to={} decoder_ran=true",
-                    pulled.item_id, outcome, payload_type, routed_to
+                    pulled.item_id, outcome_label, payload_type, routed_to
                 ));
 
                 let is_new_contact = !contacts.contains_key(&sender_label);
                 if is_new_contact {
                     contacts.insert(sender_label.clone(), sender_alias);
+                    outcome.contacts_changed = true;
                     if !chat.new_contacts.iter().any(|value| value == &sender_label) {
                         chat.new_contacts.push(sender_label.clone());
+                        outcome.chat_changed = true;
                     }
                 }
 
-                let seen_on_insert = chat.selected_contact.as_deref() == Some(sender_label.as_str());
+                let seen_on_insert =
+                    chat.selected_contact.as_deref() == Some(sender_label.as_str());
                 let thread = chat.threads.entry(sender_label.clone()).or_default();
                 let exists = thread.iter().any(|existing| {
                     existing.msg_id == pulled.item_id
@@ -3639,9 +3918,12 @@ fn merge_pulled_messages(
                     media: None,
                 });
                 sort_thread_messages(thread);
+                outcome.chat_changed = true;
 
                 if is_valid_wayfarer_id(&sender_label)
-                    && is_ping_only_chat_text(thread.last().map(|msg| msg.text.as_str()).unwrap_or(""))
+                    && is_ping_only_chat_text(
+                        thread.last().map(|msg| msg.text.as_str()).unwrap_or(""),
+                    )
                     && !thread_has_recent_outgoing_pong(thread)
                 {
                     auto_pong_targets.insert(sender_label.clone());
@@ -3650,13 +3932,14 @@ fn merge_pulled_messages(
                 if chat.selected_contact.is_none() {
                     chat.selected_contact = Some(sender_label.clone());
                     mark_contact_seen(chat, &sender_label);
+                    outcome.chat_changed = true;
                 }
             }
             ClassificationOutcome::AcceptStoreNoDisplay { .. } => {
                 log_info(&format!(
                     "inbound_app_body_classification: item_id={} outcome={} type={} routed_to={} decoder_ran={} action=stored_without_display",
                     pulled.item_id,
-                    outcome,
+                    outcome_label,
                     payload_type,
                     routed_to,
                     classification.decoder_ran
@@ -3667,14 +3950,14 @@ fn merge_pulled_messages(
             } => {
                 log_info(&format!(
                     "inbound_app_body_classification: item_id={} outcome={} type={} routed_to={} decoder_ran=false action=safe_skip",
-                    pulled.item_id, outcome, skipped_type, routed_to
+                    pulled.item_id, outcome_label, skipped_type, routed_to
                 ));
             }
             ClassificationOutcome::Reject { reason } => {
                 log_info(&format!(
                     "inbound_app_body_classification: item_id={} outcome={} type={} routed_to={} decoder_ran={} reject_reason={}",
                     pulled.item_id,
-                    outcome,
+                    outcome_label,
                     payload_type,
                     routed_to,
                     classification.decoder_ran,
@@ -3690,10 +3973,15 @@ fn merge_pulled_messages(
                 "auto_pong_queue_failed: to={} error={}",
                 target, err
             ));
+        } else {
+            outcome.chat_changed = true;
         }
     }
 
-    normalize_chat_state(chat);
+    if outcome.chat_changed {
+        normalize_chat_state(chat);
+    }
+    outcome
 }
 
 fn is_ping_only_chat_text(text: &str) -> bool {
@@ -4426,6 +4714,10 @@ fn apply_cli_state_overrides() {
                 std::env::set_var("XDG_DATA_HOME", path);
                 std::env::set_var("XDG_STATE_HOME", path);
             }
+        } else if let Some(value) = arg.strip_prefix("--aethos-e2e=") {
+            if !value.trim().is_empty() {
+                std::env::set_var("AETHOS_E2E", value.trim());
+            }
         } else if let Some(port) = arg.strip_prefix("--aethos-gossip-lan-port=") {
             if !port.trim().is_empty() {
                 std::env::set_var("AETHOS_GOSSIP_LAN_PORT", port.trim());
@@ -4505,6 +4797,10 @@ fn apply_cli_state_overrides() {
             if !value.trim().is_empty() {
                 std::env::set_var("AETHOS_LAN_MEDIA_CONTROL_FASTLANE_MAX_ITEMS", value.trim());
             }
+        } else if let Some(value) = arg.strip_prefix("--aethos-media-control-fastlane-tcp=") {
+            if !value.trim().is_empty() {
+                std::env::set_var("AETHOS_MEDIA_CONTROL_FASTLANE_TCP", value.trim());
+            }
         } else if let Some(value) = arg.strip_prefix("--aethos-media-missing-fastlane-redundancy=")
         {
             if !value.trim().is_empty() {
@@ -4530,6 +4826,15 @@ fn apply_cli_state_overrides() {
             if !value.trim().is_empty() {
                 std::env::set_var(
                     "AETHOS_MEDIA_E2E_MISSING_RESPONSE_DEDUP_WINDOW_MS",
+                    value.trim(),
+                );
+            }
+        } else if let Some(value) =
+            arg.strip_prefix("--aethos-media-e2e-missing-response-chunk-ceiling=")
+        {
+            if !value.trim().is_empty() {
+                std::env::set_var(
+                    "AETHOS_MEDIA_E2E_MISSING_RESPONSE_CHUNK_CEILING",
                     value.trim(),
                 );
             }
@@ -4876,12 +5181,8 @@ mod tests {
             let signing_seed = load_local_signing_key_seed().expect("load signing seed");
             let body =
                 build_wayfarer_chat_body("udp fallback", now_unix_ms()).expect("build chat body");
-            let payload = build_envelope_payload_b64(
-                &identity.wayfarer_id,
-                &body,
-                &signing_seed,
-            )
-            .expect("build envelope");
+            let payload = build_envelope_payload_b64(&identity.wayfarer_id, &body, &signing_seed)
+                .expect("build envelope");
             gossip_record_local_payload(&payload, now_unix_ms().saturating_add(60_000))
                 .expect("record local payload")
         });
@@ -5114,12 +5415,8 @@ mod tests {
                     now_unix_ms().saturating_add(idx),
                 )
                 .expect("build chat body");
-                let payload = build_envelope_payload_b64(
-                    &identity_b.wayfarer_id,
-                    &body,
-                    &seed,
-                )
-                .expect("build payload a->b");
+                let payload = build_envelope_payload_b64(&identity_b.wayfarer_id, &body, &seed)
+                    .expect("build payload a->b");
                 let envelope_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
                     .decode(&payload)
                     .expect("decode envelope bytes");

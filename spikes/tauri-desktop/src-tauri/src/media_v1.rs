@@ -40,7 +40,7 @@ const ORPHAN_MAX_AGE_MS: u64 = 30 * 60 * 1000;
 const ORPHAN_SWEEP_MIN_INTERVAL_MS: u64 = 15 * 1000;
 const MISSING_RANGE_CAP: usize = 256;
 const MISSING_MIN_INTERVAL_MS_DEFAULT: u64 = 1200;
-const MISSING_REQUEST_CHUNK_TARGET: usize = 64;
+const MISSING_REQUEST_CHUNK_TARGET: usize = 128;
 const MISSING_FASTLANE_REDUNDANCY_DEFAULT: usize = 2;
 const COMPLETE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const COMPLETE_MAX_AGE_MS: u64 = 90 * 24 * 60 * 60 * 1000;
@@ -52,7 +52,7 @@ const CHUNKS_PER_MINUTE_LIMIT: usize = 1200;
 #[allow(dead_code)] // Reserved for pending corrupt-chunk abort handling wiring.
 const CORRUPT_CHUNK_ABORT_STRIKES: u8 = 3;
 #[allow(dead_code)] // Reserved for pending initial outbound media send burst wiring.
-const INITIAL_OUTBOUND_CHUNK_CEILING: usize = 16;
+const INITIAL_OUTBOUND_CHUNK_CEILING: usize = 128;
 #[allow(dead_code)] // Reserved for pending missing-response fastlane wiring.
 const MISSING_RESPONSE_CHUNK_CEILING: usize = 64;
 const MEDIA_CONTROL_FASTLANE_QUEUE_MAX: usize = 512;
@@ -63,8 +63,14 @@ const E2E_WIRE_BUCKET_BURST_BYTES_DEFAULT: u64 = 64 * 1024 * 1024;
 #[allow(dead_code)] // Reserved for pending E2E missing-response fastlane tuning.
 const E2E_MISSING_RESPONSE_CHUNK_DEDUP_WINDOW_MS_DEFAULT: u64 = 1_500;
 #[allow(dead_code)] // Reserved for pending E2E missing-response fastlane tuning.
-const E2E_MISSING_RESPONSE_CHUNK_CEILING_DEFAULT: usize = 128;
+const E2E_MISSING_RESPONSE_CHUNK_CEILING_DEFAULT: usize = 64;
 const E2E_CHUNKS_PER_MINUTE_LIMIT_DEFAULT: usize = 4_000;
+
+#[derive(Debug, Clone, Copy)]
+pub enum PendingMediaControlKind {
+    MissingRequest,
+    ChunkResponse,
+}
 
 #[derive(Debug, Clone)]
 pub struct PendingMediaControlUnicast {
@@ -72,6 +78,9 @@ pub struct PendingMediaControlUnicast {
     pub item_id: String,
     pub payload_b64: String,
     pub expiry_unix_ms: u64,
+    pub kind: PendingMediaControlKind,
+    pub transfer_id: Option<String>,
+    pub tcp_mirror: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,8 +118,8 @@ pub struct OutboundMediaSendResult {
 #[derive(Debug, Clone)]
 pub enum MediaMessageProcess {
     NotMedia,
-    HandledSuppressed,
-    HandledManifest,
+    HandledSuppressed { chat_updated: bool },
+    HandledManifest { chat_updated: bool },
 }
 
 #[allow(dead_code)] // Reserved for pending media capability handshake wiring.
@@ -310,6 +319,22 @@ struct OutboundLimiter {
     chunk_sends: VecDeque<u64>,
 }
 
+#[derive(Debug, Clone)]
+struct MissingRequestPlan {
+    ranges: Vec<ChunkRange>,
+    selected_chunks: Vec<u32>,
+    missing_total: usize,
+    cursor_start: u32,
+    cursor_next: u32,
+}
+
+#[derive(Debug, Clone)]
+struct MissingRequestYieldState {
+    requested_at_unix_ms: u64,
+    requested_chunks: BTreeMap<u32, bool>,
+    delivered_chunks: usize,
+}
+
 impl Default for OutboundLimiter {
     fn default() -> Self {
         Self {
@@ -331,11 +356,30 @@ fn pending_media_control_unicast_queue() -> &'static Mutex<VecDeque<PendingMedia
     QUEUE.get_or_init(|| Mutex::new(VecDeque::new()))
 }
 
+fn media_control_fastlane_queue_max() -> usize {
+    let default_limit = std::env::var("AETHOS_E2E")
+        .ok()
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .map(|enabled| {
+            if enabled {
+                8_192
+            } else {
+                MEDIA_CONTROL_FASTLANE_QUEUE_MAX
+            }
+        })
+        .unwrap_or(MEDIA_CONTROL_FASTLANE_QUEUE_MAX);
+    std::env::var("AETHOS_MEDIA_CONTROL_FASTLANE_QUEUE_MAX")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|value| value.clamp(128, 65_536))
+        .unwrap_or(default_limit)
+}
+
 fn queue_pending_media_control_unicast(envelope: PendingMediaControlUnicast) {
     let Ok(mut queue) = pending_media_control_unicast_queue().lock() else {
         return;
     };
-    if queue.len() >= MEDIA_CONTROL_FASTLANE_QUEUE_MAX {
+    if queue.len() >= media_control_fastlane_queue_max() {
         let _ = queue.pop_front();
     }
     queue.push_back(envelope);
@@ -347,6 +391,14 @@ fn missing_fastlane_redundancy() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .map(|value| value.clamp(1, 4))
         .unwrap_or(MISSING_FASTLANE_REDUNDANCY_DEFAULT)
+}
+
+fn missing_request_tcp_mirror_stall_ms() -> u64 {
+    std::env::var("AETHOS_MEDIA_MISSING_TCP_MIRROR_STALL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|value| value.clamp(300, 10_000))
+        .unwrap_or(900)
 }
 
 pub fn drain_pending_media_control_unicast(max_items: usize) -> Vec<PendingMediaControlUnicast> {
@@ -491,6 +543,85 @@ fn missing_request_tracker() -> &'static Mutex<HashMap<String, u64>> {
 fn missing_request_cursor_tracker() -> &'static Mutex<HashMap<String, u32>> {
     static TRACKER: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
     TRACKER.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn missing_request_yield_tracker() -> &'static Mutex<HashMap<String, MissingRequestYieldState>> {
+    static TRACKER: OnceLock<Mutex<HashMap<String, MissingRequestYieldState>>> = OnceLock::new();
+    TRACKER.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn note_missing_request_plan(
+    sender_wayfarer_id: &str,
+    transfer_id: &str,
+    selected_chunks: &[u32],
+    now_ms: u64,
+) -> Option<(u64, usize, usize, usize)> {
+    let key = format!("{sender_wayfarer_id}:{transfer_id}");
+    let Ok(mut tracker) = missing_request_yield_tracker().lock() else {
+        return None;
+    };
+    let previous = tracker.remove(&key).map(|state| {
+        let requested_chunks = state
+            .requested_chunks
+            .len()
+            .saturating_add(state.delivered_chunks);
+        let pending_chunks = state.requested_chunks.len();
+        (
+            now_ms.saturating_sub(state.requested_at_unix_ms),
+            requested_chunks,
+            state.delivered_chunks,
+            pending_chunks,
+        )
+    });
+
+    let mut requested = BTreeMap::new();
+    for chunk_index in selected_chunks {
+        requested.insert(*chunk_index, true);
+    }
+    tracker.insert(
+        key,
+        MissingRequestYieldState {
+            requested_at_unix_ms: now_ms,
+            requested_chunks: requested,
+            delivered_chunks: 0,
+        },
+    );
+    previous
+}
+
+fn note_missing_request_chunk_delivered(
+    sender_wayfarer_id: &str,
+    transfer_id: &str,
+    chunk_index: u32,
+    now_ms: u64,
+) -> Option<(u64, usize, usize, usize)> {
+    let key = format!("{sender_wayfarer_id}:{transfer_id}");
+    let Ok(mut tracker) = missing_request_yield_tracker().lock() else {
+        return None;
+    };
+    let state = tracker.get_mut(&key)?;
+    if state.requested_chunks.remove(&chunk_index).is_none() {
+        return None;
+    }
+    state.delivered_chunks = state.delivered_chunks.saturating_add(1);
+    let requested_chunks = state
+        .requested_chunks
+        .len()
+        .saturating_add(state.delivered_chunks);
+    let pending_chunks = state.requested_chunks.len();
+    Some((
+        now_ms.saturating_sub(state.requested_at_unix_ms),
+        requested_chunks,
+        state.delivered_chunks,
+        pending_chunks,
+    ))
+}
+
+fn clear_missing_request_yield(sender_wayfarer_id: &str, transfer_id: &str) {
+    let key = format!("{sender_wayfarer_id}:{transfer_id}");
+    if let Ok(mut tracker) = missing_request_yield_tracker().lock() {
+        tracker.remove(&key);
+    }
 }
 
 #[allow(dead_code)] // Reserved for pending missing-response dedup tracker wiring.
@@ -765,7 +896,9 @@ pub fn process_incoming_media_message(
                     save_capabilities_cache(&cache)?;
                 }
             }
-            Ok(MediaMessageProcess::HandledSuppressed)
+            Ok(MediaMessageProcess::HandledSuppressed {
+                chat_updated: false,
+            })
         }
         ParsedMediaMessage::Manifest(msg) => {
             validate_manifest(&msg)?;
@@ -777,13 +910,16 @@ pub fn process_incoming_media_message(
 
             if let Some(mut existing) = load_incoming_state(Some(&sender), &msg.transfer_id)? {
                 if existing.object_sha256_hex != msg.object_sha256_hex {
-                    return Ok(MediaMessageProcess::HandledSuppressed);
+                    return Ok(MediaMessageProcess::HandledSuppressed {
+                        chat_updated: false,
+                    });
                 }
 
                 recover_transfer_progress_from_disk(&mut existing, true)?;
                 let (status, error) = transfer_status_and_error(&existing);
-                upsert_manifest_chat_message(chat, pulled, &msg, status.clone(), error.clone());
-                update_chat_media_progress(
+                let mut chat_updated =
+                    upsert_manifest_chat_message(chat, pulled, &msg, status.clone(), error.clone());
+                chat_updated |= update_chat_media_progress(
                     chat,
                     &existing.sender_wayfarer_id,
                     &existing.transfer_id,
@@ -794,7 +930,7 @@ pub fn process_incoming_media_message(
                 );
 
                 if transfer_is_terminal(&existing) {
-                    return Ok(MediaMessageProcess::HandledManifest);
+                    return Ok(MediaMessageProcess::HandledManifest { chat_updated });
                 }
 
                 existing.file_name = msg.file_name.clone();
@@ -813,11 +949,11 @@ pub fn process_incoming_media_message(
                     author_signing_seed,
                     ttl_seconds_max,
                 );
-                return Ok(MediaMessageProcess::HandledManifest);
+                return Ok(MediaMessageProcess::HandledManifest { chat_updated });
             }
 
             if msg.expires_at_unix_ms <= now_unix_ms() {
-                upsert_manifest_chat_message(
+                let chat_updated = upsert_manifest_chat_message(
                     chat,
                     pulled,
                     &msg,
@@ -829,7 +965,7 @@ pub fn process_incoming_media_message(
                     pulled.author_wayfarer_id.as_deref(),
                     "expired_manifest",
                 )?;
-                return Ok(MediaMessageProcess::HandledManifest);
+                return Ok(MediaMessageProcess::HandledManifest { chat_updated });
             }
 
             let incoming = IncomingTransferState {
@@ -852,7 +988,13 @@ pub fn process_incoming_media_message(
                 completed_unix_ms: None,
             };
             persist_incoming_state(&incoming)?;
-            upsert_manifest_chat_message(chat, pulled, &msg, MediaTransferStatus::Receiving, None);
+            let chat_updated = upsert_manifest_chat_message(
+                chat,
+                pulled,
+                &msg,
+                MediaTransferStatus::Receiving,
+                None,
+            );
             log_verbose(&format!(
                 "media_manifest_upserted: sender={} transfer_id={} object_sha={} thread_messages={}",
                 sender,
@@ -869,9 +1011,10 @@ pub fn process_incoming_media_message(
                 author_signing_seed,
                 ttl_seconds_max,
             );
-            Ok(MediaMessageProcess::HandledManifest)
+            Ok(MediaMessageProcess::HandledManifest { chat_updated })
         }
         ParsedMediaMessage::Chunk(msg) => {
+            let mut chat_updated = false;
             let sender = pulled
                 .author_wayfarer_id
                 .clone()
@@ -880,47 +1023,47 @@ pub fn process_incoming_media_message(
             let max_item_payload_b64_bytes = negotiated_payload_b64_limit_for_sender(&sender);
             if msg.expires_at_unix_ms <= now_unix_ms() {
                 mark_transfer_failed(&msg.transfer_id, Some(&sender), "chunk_expired")?;
-                update_chat_media_state(
+                chat_updated |= update_chat_media_state(
                     chat,
                     &sender,
                     &msg.transfer_id,
                     MediaTransferStatus::Failed,
                     Some("chunk_expired".to_string()),
                 );
-                return Ok(MediaMessageProcess::HandledSuppressed);
+                return Ok(MediaMessageProcess::HandledSuppressed { chat_updated });
             }
 
             let mut transfer = match load_incoming_state(Some(&sender), &msg.transfer_id)? {
                 Some(state) => state,
                 None => {
                     let _ = store_orphan_chunk(&sender, &msg);
-                    return Ok(MediaMessageProcess::HandledSuppressed);
+                    return Ok(MediaMessageProcess::HandledSuppressed { chat_updated });
                 }
             };
 
             recover_transfer_progress_from_disk(&mut transfer, true)?;
             if transfer_is_terminal(&transfer) {
-                return Ok(MediaMessageProcess::HandledSuppressed);
+                return Ok(MediaMessageProcess::HandledSuppressed { chat_updated });
             }
 
             if transfer.expires_at_unix_ms <= now_unix_ms() {
                 transfer.failed_error = Some("expired_transfer".to_string());
                 persist_incoming_state(&transfer)?;
-                update_chat_media_state(
+                chat_updated |= update_chat_media_state(
                     chat,
                     &transfer.sender_wayfarer_id,
                     &transfer.transfer_id,
                     MediaTransferStatus::Failed,
                     Some("expired_transfer".to_string()),
                 );
-                return Ok(MediaMessageProcess::HandledSuppressed);
+                return Ok(MediaMessageProcess::HandledSuppressed { chat_updated });
             }
 
             if msg.object_sha256_hex != transfer.object_sha256_hex {
-                return Ok(MediaMessageProcess::HandledSuppressed);
+                return Ok(MediaMessageProcess::HandledSuppressed { chat_updated });
             }
             if msg.chunk_index >= transfer.chunk_count {
-                return Ok(MediaMessageProcess::HandledSuppressed);
+                return Ok(MediaMessageProcess::HandledSuppressed { chat_updated });
             }
             if msg.payload_b64.contains('=') {
                 strike_or_abort_corrupt_chunk(
@@ -929,7 +1072,8 @@ pub fn process_incoming_media_message(
                     "chunk_payload_not_base64url_nopad",
                     chat,
                 )?;
-                return Ok(MediaMessageProcess::HandledSuppressed);
+                chat_updated = true;
+                return Ok(MediaMessageProcess::HandledSuppressed { chat_updated });
             }
 
             let expected_len = expected_chunk_len(&transfer, msg.chunk_index)?;
@@ -941,7 +1085,8 @@ pub fn process_incoming_media_message(
                 max_item_payload_b64_bytes,
             ) {
                 strike_or_abort_corrupt_chunk(&mut transfer, msg.chunk_index, reason, chat)?;
-                return Ok(MediaMessageProcess::HandledSuppressed);
+                chat_updated = true;
+                return Ok(MediaMessageProcess::HandledSuppressed { chat_updated });
             }
 
             let bytes =
@@ -954,7 +1099,8 @@ pub fn process_incoming_media_message(
                             "chunk_payload_decode_failed",
                             chat,
                         )?;
-                        return Ok(MediaMessageProcess::HandledSuppressed);
+                        chat_updated = true;
+                        return Ok(MediaMessageProcess::HandledSuppressed { chat_updated });
                     }
                 };
             if bytes.len() != msg.chunk_bytes as usize {
@@ -964,7 +1110,8 @@ pub fn process_incoming_media_message(
                     "chunk_length_mismatch",
                     chat,
                 )?;
-                return Ok(MediaMessageProcess::HandledSuppressed);
+                chat_updated = true;
+                return Ok(MediaMessageProcess::HandledSuppressed { chat_updated });
             }
             if bytes.len() != expected_len {
                 strike_or_abort_corrupt_chunk(
@@ -973,7 +1120,8 @@ pub fn process_incoming_media_message(
                     "chunk_expected_length_mismatch",
                     chat,
                 )?;
-                return Ok(MediaMessageProcess::HandledSuppressed);
+                chat_updated = true;
+                return Ok(MediaMessageProcess::HandledSuppressed { chat_updated });
             }
 
             let actual_chunk_sha = bytes_to_hex_lower(&Sha256::digest(&bytes));
@@ -984,7 +1132,8 @@ pub fn process_incoming_media_message(
                     "chunk_hash_mismatch",
                     chat,
                 )?;
-                return Ok(MediaMessageProcess::HandledSuppressed);
+                chat_updated = true;
+                return Ok(MediaMessageProcess::HandledSuppressed { chat_updated });
             }
 
             ensure_spool_quota(&transfer.sender_wayfarer_id, bytes.len() as u64)?;
@@ -999,6 +1148,7 @@ pub fn process_incoming_media_message(
                 transfer.received_chunks = transfer.received_chunks.saturating_add(1);
                 transfer.received_bytes =
                     transfer.received_bytes.saturating_add(bytes.len() as u64);
+                let now_ms = now_unix_ms();
                 log_verbose(&format!(
                     "media_chunk_ingested: sender={} transfer_id={} chunk_index={} received_chunks={} chunk_count={}",
                     transfer.sender_wayfarer_id,
@@ -1007,6 +1157,25 @@ pub fn process_incoming_media_message(
                     transfer.received_chunks,
                     transfer.chunk_count
                 ));
+                if let Some((age_ms, requested_chunks, delivered_chunks, pending_chunks)) =
+                    note_missing_request_chunk_delivered(
+                        &transfer.sender_wayfarer_id,
+                        &transfer.transfer_id,
+                        msg.chunk_index,
+                        now_ms,
+                    )
+                {
+                    log_verbose(&format!(
+                        "media_missing_yield_progress: sender={} transfer_id={} chunk_index={} age_ms={} requested_chunks={} delivered_chunks={} pending_chunks={}",
+                        transfer.sender_wayfarer_id,
+                        transfer.transfer_id,
+                        msg.chunk_index,
+                        age_ms,
+                        requested_chunks,
+                        delivered_chunks,
+                        pending_chunks
+                    ));
+                }
             } else {
                 log_verbose(&format!(
                     "media_chunk_duplicate: sender={} transfer_id={} chunk_index={}",
@@ -1018,7 +1187,7 @@ pub fn process_incoming_media_message(
             recover_transfer_progress_from_disk(&mut transfer, true)?;
             let (status, error) = transfer_status_and_error(&transfer);
 
-            update_chat_media_progress(
+            chat_updated |= update_chat_media_progress(
                 chat,
                 &transfer.sender_wayfarer_id,
                 &transfer.transfer_id,
@@ -1027,6 +1196,10 @@ pub fn process_incoming_media_message(
                 status.clone(),
                 error,
             );
+
+            if status != MediaTransferStatus::Receiving {
+                clear_missing_request_yield(&transfer.sender_wayfarer_id, &transfer.transfer_id);
+            }
 
             if status == MediaTransferStatus::Receiving {
                 let _ = send_missing_request_if_due(
@@ -1037,7 +1210,7 @@ pub fn process_incoming_media_message(
                 );
             }
 
-            Ok(MediaMessageProcess::HandledSuppressed)
+            Ok(MediaMessageProcess::HandledSuppressed { chat_updated })
         }
         ParsedMediaMessage::Missing(msg) => {
             let sender = pulled
@@ -1060,22 +1233,29 @@ pub fn process_incoming_media_message(
                     msg.ranges.len(),
                     MISSING_RANGE_CAP
                 ));
-                return Ok(MediaMessageProcess::HandledSuppressed);
+                return Ok(MediaMessageProcess::HandledSuppressed {
+                    chat_updated: false,
+                });
             }
             if !peer_supports_media_v1(&sender)? {
                 log_verbose(&format!(
                     "media_missing_ignored: requester={} transfer_id={} reason=requester_capability_missing",
                     sender, msg.transfer_id
                 ));
-                return Ok(MediaMessageProcess::HandledSuppressed);
+                return Ok(MediaMessageProcess::HandledSuppressed {
+                    chat_updated: false,
+                });
             }
 
-            if !missing_request_interval_ok(&sender, &msg.transfer_id, msg.sent_at_unix_ms) {
+            let arrival_now_ms = now_unix_ms();
+            if !missing_request_interval_ok(&sender, &msg.transfer_id, arrival_now_ms) {
                 log_verbose(&format!(
-                    "media_missing_ignored: requester={} transfer_id={} reason=interval_gate sent_at_ms={}",
-                    sender, msg.transfer_id, msg.sent_at_unix_ms
+                    "media_missing_ignored: requester={} transfer_id={} reason=interval_gate sent_at_ms={} arrival_ms={}",
+                    sender, msg.transfer_id, msg.sent_at_unix_ms, arrival_now_ms
                 ));
-                return Ok(MediaMessageProcess::HandledSuppressed);
+                return Ok(MediaMessageProcess::HandledSuppressed {
+                    chat_updated: false,
+                });
             }
 
             if let Some(outbound) = load_outbound_state(&msg.transfer_id)? {
@@ -1087,14 +1267,18 @@ pub fn process_incoming_media_message(
                         outbound.object_sha256_hex,
                         msg.object_sha256_hex
                     ));
-                    return Ok(MediaMessageProcess::HandledSuppressed);
+                    return Ok(MediaMessageProcess::HandledSuppressed {
+                        chat_updated: false,
+                    });
                 }
                 if outbound.expires_at_unix_ms <= now_unix_ms() {
                     log_verbose(&format!(
                         "media_missing_ignored: requester={} transfer_id={} reason=outbound_expired expires_at_ms={}",
                         sender, msg.transfer_id, outbound.expires_at_unix_ms
                     ));
-                    return Ok(MediaMessageProcess::HandledSuppressed);
+                    return Ok(MediaMessageProcess::HandledSuppressed {
+                        chat_updated: false,
+                    });
                 }
 
                 let source_path = outbound_source_path(&outbound.transfer_id);
@@ -1203,7 +1387,9 @@ pub fn process_incoming_media_message(
                 ));
             }
 
-            Ok(MediaMessageProcess::HandledSuppressed)
+            Ok(MediaMessageProcess::HandledSuppressed {
+                chat_updated: false,
+            })
         }
     }
 }
@@ -1541,17 +1727,23 @@ fn queue_chunk_message_fastlane(
         author_signing_seed,
         max_item_payload_b64_bytes,
     )?;
-    rate_limit_outbound(payload.len(), now_ms, false, true)?;
     let expiry = apply_expiry_authority(manifest.expires_at_unix_ms, now_ms, ttl_seconds_max);
+    let item_id = gossip_record_local_payload(&payload, expiry)?;
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(&payload)
         .map_err(|err| format!("failed decoding chunk envelope payload for fastlane: {err}"))?;
-    let item_id = bytes_to_hex_lower(&Sha256::digest(&raw));
+    let derived_item_id = bytes_to_hex_lower(&Sha256::digest(&raw));
+    if derived_item_id != item_id {
+        return Err("fastlane chunk item_id mismatch with stored payload".to_string());
+    }
     queue_pending_media_control_unicast(PendingMediaControlUnicast {
         peer_wayfarer_id: to_wayfarer_id.to_string(),
         item_id: item_id.clone(),
         payload_b64: payload,
         expiry_unix_ms: expiry,
+        kind: PendingMediaControlKind::ChunkResponse,
+        transfer_id: Some(manifest.transfer_id.clone()),
+        tcp_mirror: false,
     });
     Ok(item_id)
 }
@@ -2250,8 +2442,8 @@ fn update_chat_media_state(
     transfer_id: &str,
     status: MediaTransferStatus,
     error: Option<String>,
-) {
-    update_chat_media_progress(chat, sender_wayfarer_id, transfer_id, 0, 0, status, error);
+) -> bool {
+    update_chat_media_progress(chat, sender_wayfarer_id, transfer_id, 0, 0, status, error)
 }
 
 #[allow(dead_code)] // Reserved for pending inbound transfer progress updates.
@@ -2263,9 +2455,9 @@ fn update_chat_media_progress(
     received_bytes: u64,
     status: MediaTransferStatus,
     error: Option<String>,
-) {
+) -> bool {
     let Some(thread) = chat.threads.get_mut(sender_wayfarer_id) else {
-        return;
+        return false;
     };
     for message in thread.iter_mut().rev() {
         let Some(media) = message.media.as_mut() else {
@@ -2274,12 +2466,19 @@ fn update_chat_media_progress(
         if media.transfer_id != transfer_id {
             continue;
         }
-        media.received_chunks = received_chunks.min(media.chunk_count);
-        media.received_bytes = received_bytes.min(media.total_bytes);
+        let next_chunks = received_chunks.min(media.chunk_count);
+        let next_bytes = received_bytes.min(media.total_bytes);
+        let changed = media.received_chunks != next_chunks
+            || media.received_bytes != next_bytes
+            || media.status != status
+            || media.error != error;
+        media.received_chunks = next_chunks;
+        media.received_bytes = next_bytes;
         media.status = status.clone();
         media.error = error.clone();
-        return;
+        return changed;
     }
+    false
 }
 
 #[allow(dead_code)] // Reserved for pending manifest-to-chat projection wiring.
@@ -2289,7 +2488,7 @@ fn upsert_manifest_chat_message(
     manifest: &MediaManifestMessage,
     status: MediaTransferStatus,
     error: Option<String>,
-) {
+) -> bool {
     let sender = pulled
         .author_wayfarer_id
         .clone()
@@ -2305,12 +2504,19 @@ fn upsert_manifest_chat_message(
             .unwrap_or(false)
     }) {
         if let Some(media) = existing.media.as_mut() {
-            media.received_chunks = media.received_chunks.max(0);
-            media.received_bytes = media.received_bytes.max(0);
+            let next_chunks = media.received_chunks.max(0);
+            let next_bytes = media.received_bytes.max(0);
+            let changed = media.received_chunks != next_chunks
+                || media.received_bytes != next_bytes
+                || media.status != status
+                || media.error != error;
+            media.received_chunks = next_chunks;
+            media.received_bytes = next_bytes;
             media.status = status;
             media.error = error;
+            return changed;
         }
-        return;
+        return false;
     }
 
     let caption = manifest
@@ -2358,6 +2564,7 @@ fn upsert_manifest_chat_message(
             expires_at_unix_ms: Some(manifest.expires_at_unix_ms),
         }),
     });
+    true
 }
 
 fn send_missing_request_if_due(
@@ -2386,15 +2593,38 @@ fn send_missing_request_if_due(
         return Ok(false);
     }
 
-    let ranges = compute_missing_ranges(&state)?;
-    if ranges.is_empty() {
+    let plan = compute_missing_plan(&state)?;
+    if plan.ranges.is_empty() {
         return Ok(false);
+    }
+    let mut mirror_tcp = false;
+    if let Some((age_ms, requested_chunks, delivered_chunks, pending_chunks)) =
+        note_missing_request_plan(
+            &state.sender_wayfarer_id,
+            &state.transfer_id,
+            &plan.selected_chunks,
+            now_ms,
+        )
+    {
+        if delivered_chunks == 0 && age_ms >= missing_request_tcp_mirror_stall_ms() {
+            mirror_tcp = true;
+        }
+        log_verbose(&format!(
+            "media_missing_yield_rollover: local={} sender={} transfer_id={} age_ms={} requested_chunks={} delivered_chunks={} pending_chunks={}",
+            local_wayfarer_id,
+            state.sender_wayfarer_id,
+            state.transfer_id,
+            age_ms,
+            requested_chunks,
+            delivered_chunks,
+            pending_chunks
+        ));
     }
     let request = MediaMissingMessage {
         msg_type: MEDIA_MISSING_TYPE.to_string(),
         transfer_id: state.transfer_id.clone(),
         object_sha256_hex: state.object_sha256_hex.clone(),
-        ranges,
+        ranges: plan.ranges.clone(),
         sent_at_unix_ms: now_ms,
     };
 
@@ -2418,11 +2648,29 @@ fn send_missing_request_if_due(
             item_id: item_id.clone(),
             payload_b64: payload.clone(),
             expiry_unix_ms: expiry,
+            kind: PendingMediaControlKind::MissingRequest,
+            transfer_id: Some(state.transfer_id.clone()),
+            tcp_mirror: mirror_tcp,
         });
     }
     state.last_missing_unix_ms = now_ms;
     persist_incoming_state(&state)?;
     if is_valid_wayfarer_id(local_wayfarer_id) {
+        let first_chunk = plan.selected_chunks.first().copied().unwrap_or(0);
+        let last_chunk = plan.selected_chunks.last().copied().unwrap_or(0);
+        log_verbose(&format!(
+            "media_missing_plan: local={} sender={} transfer_id={} missing_total={} selected_chunks={} ranges={} cursor_start={} cursor_next={} first_chunk={} last_chunk={}",
+            local_wayfarer_id,
+            state.sender_wayfarer_id,
+            state.transfer_id,
+            plan.missing_total,
+            plan.selected_chunks.len(),
+            request.ranges.len(),
+            plan.cursor_start,
+            plan.cursor_next,
+            first_chunk,
+            last_chunk
+        ));
         log_verbose(&format!(
             "media_missing_requested: local={} sender={} transfer_id={} ranges={}",
             local_wayfarer_id,
@@ -2434,7 +2682,12 @@ fn send_missing_request_if_due(
     Ok(true)
 }
 
+#[allow(dead_code)] // Reserved for pending direct missing-range planner tests.
 fn compute_missing_ranges(transfer: &IncomingTransferState) -> Result<Vec<ChunkRange>, String> {
+    Ok(compute_missing_plan(transfer)?.ranges)
+}
+
+fn compute_missing_plan(transfer: &IncomingTransferState) -> Result<MissingRequestPlan, String> {
     let mut missing = Vec::new();
     for chunk_index in 0..transfer.chunk_count {
         let path = incoming_chunk_path(
@@ -2447,7 +2700,13 @@ fn compute_missing_ranges(transfer: &IncomingTransferState) -> Result<Vec<ChunkR
         }
     }
     if missing.is_empty() {
-        return Ok(Vec::new());
+        return Ok(MissingRequestPlan {
+            ranges: Vec::new(),
+            selected_chunks: Vec::new(),
+            missing_total: 0,
+            cursor_start: 0,
+            cursor_next: 0,
+        });
     }
 
     let request_key = format!("{}:{}", transfer.sender_wayfarer_id, transfer.transfer_id);
@@ -2456,6 +2715,7 @@ fn compute_missing_ranges(transfer: &IncomingTransferState) -> Result<Vec<ChunkR
         .ok()
         .and_then(|tracker| tracker.get(&request_key).copied())
         .unwrap_or(0);
+    let missing_total = missing.len();
     let start_pos = missing
         .iter()
         .position(|chunk_index| *chunk_index >= cursor)
@@ -2479,14 +2739,20 @@ fn compute_missing_ranges(transfer: &IncomingTransferState) -> Result<Vec<ChunkR
     let mut ranges = Vec::new();
     let mut start = selected[0];
     let mut prev = selected[0];
-    for chunk in selected.into_iter().skip(1) {
+    for chunk in selected.iter().copied().skip(1) {
         if chunk == prev.saturating_add(1) {
             prev = chunk;
             continue;
         }
         ranges.push(ChunkRange { start, end: prev });
         if ranges.len() >= MISSING_RANGE_CAP {
-            return Ok(ranges);
+            return Ok(MissingRequestPlan {
+                ranges,
+                selected_chunks: selected,
+                missing_total,
+                cursor_start: cursor,
+                cursor_next: next_cursor,
+            });
         }
         start = chunk;
         prev = chunk;
@@ -2494,7 +2760,13 @@ fn compute_missing_ranges(transfer: &IncomingTransferState) -> Result<Vec<ChunkR
     if ranges.len() < MISSING_RANGE_CAP {
         ranges.push(ChunkRange { start, end: prev });
     }
-    Ok(ranges)
+    Ok(MissingRequestPlan {
+        ranges,
+        selected_chunks: selected,
+        missing_total,
+        cursor_start: cursor,
+        cursor_next: next_cursor,
+    })
 }
 
 #[allow(dead_code)] // Reserved for pending missing-request interval suppression wiring.
@@ -3021,7 +3293,7 @@ fn missing_response_chunk_ceiling() -> usize {
         "AETHOS_MEDIA_E2E_MISSING_RESPONSE_CHUNK_CEILING",
         E2E_MISSING_RESPONSE_CHUNK_CEILING_DEFAULT as u64,
         16,
-        512,
+        256,
     ) as usize
 }
 
