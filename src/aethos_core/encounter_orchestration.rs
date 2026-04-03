@@ -67,6 +67,7 @@ impl EncounterLifecycleState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransitionReason {
     InitialSelection,
+    BleDiscovery,
     #[allow(dead_code)]
     HealthUpgrade,
     #[allow(dead_code)]
@@ -80,6 +81,7 @@ impl TransitionReason {
     fn as_str(self) -> &'static str {
         match self {
             Self::InitialSelection => "initial-selection",
+            Self::BleDiscovery => "ble-discovery",
             Self::HealthUpgrade => "health-upgrade",
             Self::HealthDowngrade => "health-downgrade",
             Self::NoProgress => "no-progress",
@@ -410,5 +412,44 @@ mod tests {
                 file_name
             );
         }
+    }
+
+    #[test]
+    fn manager_supports_ble_bootstrap_then_non_ble_transfer() {
+        let mut manager =
+            EncounterManager::new("enc-ble", "local-ble", Some("peer-ble".to_string()));
+        manager.observe_discovery(BearerAdapter::BleBootstrap, 1000);
+        assert_eq!(manager.discovery_bearer, Some(BearerAdapter::BleBootstrap));
+        assert_eq!(manager.state, EncounterLifecycleState::DiscoveryObserved);
+
+        manager.start_control_exchange(
+            BearerAdapter::RelayWebSocket,
+            TransitionReason::InitialSelection,
+            1100,
+        );
+        manager.set_transfer_bearer(
+            BearerAdapter::LanDatagram,
+            TransitionReason::InitialSelection,
+            1200,
+        );
+
+        assert_eq!(manager.control_bearer, Some(BearerAdapter::RelayWebSocket));
+        assert_eq!(manager.transfer_bearer, Some(BearerAdapter::LanDatagram));
+        assert_eq!(manager.state, EncounterLifecycleState::TransferExecuting);
+    }
+
+    #[test]
+    fn manager_scheduler_events_transition_state_consistently() {
+        let mut manager = EncounterManager::new("enc-plan", "local-1", Some("peer-1".to_string()));
+        manager.set_transfer_bearer(
+            BearerAdapter::RelayWebSocket,
+            TransitionReason::InitialSelection,
+            1000,
+        );
+        manager.record_scheduler_plan("plan-1", 3, "budget_bytes_exhausted", "tier_size", 1010);
+        assert_eq!(manager.state, EncounterLifecycleState::TransferPlanned);
+
+        manager.record_scheduler_execution("plan-1", 2, 1020);
+        assert_eq!(manager.state, EncounterLifecycleState::TransferExecuting);
     }
 }

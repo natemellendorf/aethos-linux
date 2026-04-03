@@ -45,6 +45,12 @@ use tauri::Emitter;
 use url::Url;
 
 use crate::aethos_core::gossip_sync::record_local_payload as gossip_record_local_payload;
+use crate::aethos_core::ble_discovery::{
+    discovery_adapter_from_env, BleDiscoveryGate, BleDiscoverySource, DiscoverySignal,
+};
+use crate::aethos_core::encounter_orchestration::{
+    BearerAdapter, EncounterManager, TransitionReason,
+};
 use crate::aethos_core::gossip_sync::{
     build_hello_frame as build_gossip_hello_frame,
     build_relay_ingest_frame as build_gossip_relay_ingest_frame,
@@ -901,6 +907,14 @@ fn bootstrap_state() -> Result<BootstrapState, String> {
         settings = save_app_settings(&settings)?;
     }
     set_verbose_logging_enabled(settings.verbose_logging_enabled);
+    if e2e_enabled() {
+        let simulated_ble = std::env::var("AETHOS_BLE_SIMULATED_SIGNALS").unwrap_or_default();
+        log_info(&format!(
+            "ble_env_bootstrap simulated_signals_configured={} value_len={}",
+            !simulated_ble.is_empty(),
+            simulated_ble.len()
+        ));
+    }
     start_gossip_worker_if_needed(settings.gossip_sync_enabled);
     set_gossip_enabled(settings.gossip_sync_enabled);
     start_relay_worker_if_needed();
@@ -2397,6 +2411,9 @@ fn start_gossip_worker_if_needed(initial_enabled: bool) {
         let mut udp_peer_interactions: HashMap<String, UdpPeerInteraction> = HashMap::new();
         let mut recent_served_request_by_peer: HashMap<String, (u64, Instant)> = HashMap::new();
         let mut recent_outbound_request_by_peer: HashMap<String, (u64, Instant)> = HashMap::new();
+        let mut ble_discovery_adapter = discovery_adapter_from_env();
+        let mut ble_discovery_gate = BleDiscoveryGate::new(Duration::from_secs(5));
+        let mut ble_encounters: HashMap<String, EncounterManager> = HashMap::new();
         let mut last_missing_pulse = Instant::now() - Duration::from_millis(500);
         let tcp_listener = match bind_gossip_tcp_listener() {
             Ok(listener) => Some(listener),
@@ -2454,6 +2471,13 @@ fn start_gossip_worker_if_needed(initial_enabled: bool) {
             }
 
             flush_media_control_fastlane(&socket, &peer_addr_by_node);
+
+            process_ble_discovery_signals(
+                &mut ble_discovery_adapter,
+                &mut ble_discovery_gate,
+                &mut ble_encounters,
+                runtime,
+            );
 
             if last_missing_pulse.elapsed() >= Duration::from_millis(250) {
                 if let (Ok(identity), Ok(seed)) =
@@ -2516,6 +2540,88 @@ fn start_gossip_worker_if_needed(initial_enabled: bool) {
             }
         }
     });
+}
+
+fn process_ble_discovery_signals(
+    adapter: &mut dyn BleDiscoverySource,
+    gate: &mut BleDiscoveryGate,
+    encounters: &mut HashMap<String, EncounterManager>,
+    runtime: &GossipRuntime,
+) {
+    let identity = match ensure_local_identity() {
+        Ok(identity) => identity,
+        Err(err) => {
+            log_verbose(&format!("ble_discovery_identity_unavailable: {err}"));
+            return;
+        }
+    };
+    let now_ms = now_unix_ms();
+    let ready = gate.poll_ready(adapter, now_ms);
+    if ready.is_empty() {
+        return;
+    }
+
+    for signal in ready {
+        handle_ble_discovery_signal(encounters, &identity.wayfarer_id, &signal, runtime);
+    }
+}
+
+fn handle_ble_discovery_signal(
+    encounters: &mut HashMap<String, EncounterManager>,
+    local_wayfarer_id: &str,
+    signal: &DiscoverySignal,
+    runtime: &GossipRuntime,
+) {
+    let peer_hint = sanitize_ble_peer_hint(&signal.peer_hint);
+    let encounter = encounters.entry(peer_hint.clone()).or_insert_with(|| {
+        EncounterManager::new(
+            format!("ble-{}-{}", local_wayfarer_id, peer_hint),
+            local_wayfarer_id.to_string(),
+            Some(peer_hint.clone()),
+        )
+    });
+
+    encounter.observe_discovery(BearerAdapter::BleBootstrap, signal.observed_at_unix_ms);
+    encounter.start_control_exchange(
+        BearerAdapter::LanDatagram,
+        TransitionReason::BleDiscovery,
+        signal.observed_at_unix_ms,
+    );
+    encounter.set_transfer_bearer(
+        BearerAdapter::LanDatagram,
+        TransitionReason::BleDiscovery,
+        signal.observed_at_unix_ms,
+    );
+    log_verbose(&format!(
+        "encounter_ble_handoff peer_hint={} source={} rssi={} discovery_bearer=ble-bootstrap transfer_bearer=lan-datagram reason=ble-discovery at_unix_ms={}",
+        peer_hint,
+        signal.source,
+        signal
+            .rssi
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "na".to_string()),
+        signal.observed_at_unix_ms,
+    ));
+    runtime.force_announce.store(true, Ordering::SeqCst);
+}
+
+fn sanitize_ble_peer_hint(peer_hint: &str) -> String {
+    let filtered = peer_hint
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == ':' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let compact = filtered.trim_matches('-').to_string();
+    if compact.is_empty() {
+        "unknown-ble-peer".to_string()
+    } else {
+        compact
+    }
 }
 
 fn bind_gossip_socket() -> Result<UdpSocket, String> {
@@ -4753,6 +4859,14 @@ fn apply_cli_state_overrides() {
         } else if let Some(value) = arg.strip_prefix("--aethos-e2e-force-gossip=") {
             if !value.trim().is_empty() {
                 std::env::set_var("AETHOS_E2E_FORCE_GOSSIP", value.trim());
+            }
+        } else if let Some(value) = arg.strip_prefix("--aethos-disable-ble=") {
+            if !value.trim().is_empty() {
+                std::env::set_var("AETHOS_DISABLE_BLE", value.trim());
+            }
+        } else if let Some(value) = arg.strip_prefix("--aethos-ble-simulated-signals=") {
+            if !value.trim().is_empty() {
+                std::env::set_var("AETHOS_BLE_SIMULATED_SIGNALS", value.trim());
             }
         } else if let Some(value) = arg.strip_prefix("--aethos-lan-fallback-transfer-max-items=") {
             if !value.trim().is_empty() {

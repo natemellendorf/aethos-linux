@@ -1403,10 +1403,14 @@ fn relay_frame_type(frame: &GossipSyncFrame) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_nonfatal_remote_close, is_relay_ingest_allowed, relay_ingest_candidates_with_lookup,
-        select_relay_ingest_item_ids_for_processing, should_stop_for_no_progress,
+        is_nonfatal_remote_close, is_relay_ingest_allowed, normalize_http_endpoint,
+        relay_ingest_candidates_with_lookup, select_relay_ingest_item_ids_for_processing,
+        should_stop_for_no_progress, to_ws_endpoint, DispatcherError, RelayFrame,
+        RelayRequestDispatcher, RelaySessionConfig, RelaySessionManager,
         RELAY_INGEST_PROCESS_MAX_ITEMS,
     };
+    use serde_json::json;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn nonfatal_remote_close_patterns_match_expected_errors() {
@@ -1557,6 +1561,88 @@ mod tests {
 
         assert!(candidates.is_none());
         assert_eq!(selection.processed_item_ids.len(), 16);
+    }
+
+    #[test]
+    fn endpoint_normalization_and_ws_conversion_are_stable() {
+        assert_eq!(
+            normalize_http_endpoint("relay.example"),
+            "http://relay.example"
+        );
+        assert_eq!(
+            to_ws_endpoint("https://relay.example"),
+            "wss://relay.example/ws"
+        );
+        assert_eq!(
+            to_ws_endpoint("http://relay.example"),
+            "ws://relay.example/ws"
+        );
+        assert_eq!(
+            to_ws_endpoint("wss://relay.example/custom"),
+            "wss://relay.example/custom"
+        );
+        assert_eq!(to_ws_endpoint("not a url"), "not a url");
+    }
+
+    #[test]
+    fn relay_session_manager_respects_backoff_and_health_bounds() {
+        let mut manager = RelaySessionManager::new(
+            vec!["https://relay-1.example".to_string()],
+            RelaySessionConfig {
+                base_backoff: Duration::from_millis(10),
+                max_backoff: Duration::from_millis(40),
+                min_health_score: -2,
+                max_health_score: 2,
+            },
+        );
+
+        let now = Instant::now();
+        let selection = manager
+            .select_relay(now)
+            .expect("relay should be selectable");
+        assert_eq!(selection.relay_slot, 0);
+        manager.mark_failure(0);
+        manager.mark_failure(0);
+        manager.mark_failure(0);
+
+        let relay = &manager.relays()[0];
+        assert_eq!(relay.health_score, -2);
+        assert!(relay.next_attempt_at > now);
+
+        manager.mark_success(0);
+        manager.mark_success(0);
+        manager.mark_success(0);
+        let relay = &manager.relays()[0];
+        assert_eq!(relay.health_score, 1);
+        assert_eq!(relay.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn request_dispatcher_tracks_and_resolves_pending_messages() {
+        let mut dispatcher = RelayRequestDispatcher::default();
+        let outbound = dispatcher.register_outbound("sync", json!({"want": ["a"]}));
+        assert_eq!(dispatcher.pending_count(), 1);
+        assert_eq!(outbound.correlation_id, "linux-1");
+
+        let resolved = dispatcher
+            .resolve_response(RelayFrame {
+                correlation_id: outbound.correlation_id.clone(),
+                message_type: "sync_ack".to_string(),
+                payload: json!({"ok": true}),
+            })
+            .expect("response should resolve");
+        assert_eq!(resolved.request_message_type, "sync");
+        assert_eq!(resolved.response_message_type, "sync_ack");
+        assert_eq!(dispatcher.pending_count(), 0);
+
+        let err = dispatcher
+            .resolve_response(RelayFrame {
+                correlation_id: "linux-missing".to_string(),
+                message_type: "sync_ack".to_string(),
+                payload: json!({}),
+            })
+            .unwrap_err();
+        assert_eq!(err, DispatcherError::UnknownCorrelationId);
     }
 }
 

@@ -28,7 +28,12 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::aethos_core::encounter_orchestration::canonical_audit_points;
+use crate::aethos_core::ble_discovery::{
+    discovery_adapter_from_env, BleDiscoveryGate, BleDiscoverySource, DiscoverySignal,
+};
+use crate::aethos_core::encounter_orchestration::{
+    canonical_audit_points, BearerAdapter, EncounterManager, TransitionReason,
+};
 use crate::aethos_core::gossip_sync::{
     build_hello_frame as build_gossip_hello_frame,
     build_request_frame as build_gossip_request_frame,
@@ -241,7 +246,22 @@ fn build_ui(app: &Application) {
     apply_styles();
 
     let initial_settings = load_app_settings().unwrap_or_default();
-    set_verbose_logging_enabled(initial_settings.verbose_logging_enabled);
+    let force_verbose = std::env::var("AETHOS_E2E_FORCE_VERBOSE")
+        .ok()
+        .map(|value| {
+            let lower = value.trim().to_ascii_lowercase();
+            lower == "1" || lower == "true" || lower == "yes"
+        })
+        .unwrap_or(false);
+    set_verbose_logging_enabled(initial_settings.verbose_logging_enabled || force_verbose);
+    if std::env::var("AETHOS_E2E").ok().as_deref() == Some("1") {
+        let simulated_ble = std::env::var("AETHOS_BLE_SIMULATED_SIGNALS").unwrap_or_default();
+        shared_log_info(&format!(
+            "ble_env_bootstrap simulated_signals_configured={} value_len={}",
+            !simulated_ble.is_empty(),
+            simulated_ble.len()
+        ));
+    }
     log_encounter_audit_catalog();
     shared_log_info(&format!(
         "app_start verbose_logging_enabled={} ttl_seconds={}",
@@ -3129,6 +3149,10 @@ fn start_background_gossip_sync(
 
         let mut peer_node_by_addr: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
+        let mut ble_discovery_adapter = discovery_adapter_from_env();
+        let mut ble_discovery_gate = BleDiscoveryGate::new(Duration::from_secs(5));
+        let mut ble_encounters: std::collections::HashMap<String, EncounterManager> =
+            std::collections::HashMap::new();
         let mut last_hello_broadcast = Instant::now() - Duration::from_secs(10);
 
         loop {
@@ -3166,6 +3190,13 @@ fn start_background_gossip_sync(
                 }
                 last_hello_broadcast = Instant::now();
             }
+
+            process_ble_discovery_signals(
+                &mut ble_discovery_adapter,
+                &mut ble_discovery_gate,
+                &mut ble_encounters,
+                &gossip_force_announce,
+            );
 
             let mut buf = [0u8; 65_535];
             match socket.recv_from(&mut buf) {
@@ -3373,6 +3404,93 @@ fn start_background_gossip_sync(
             }
         }
     });
+}
+
+fn process_ble_discovery_signals(
+    adapter: &mut dyn BleDiscoverySource,
+    gate: &mut BleDiscoveryGate,
+    encounters: &mut std::collections::HashMap<String, EncounterManager>,
+    gossip_force_announce: &Arc<AtomicBool>,
+) {
+    let identity = match ensure_local_identity() {
+        Ok(identity) => identity,
+        Err(err) => {
+            append_local_log(&format!("ble_discovery_identity_unavailable: {err}"));
+            return;
+        }
+    };
+    let now_ms = now_unix_ms();
+    let ready = gate.poll_ready(adapter, now_ms);
+    if ready.is_empty() {
+        return;
+    }
+
+    for signal in ready {
+        handle_ble_signal(
+            encounters,
+            &identity.wayfarer_id,
+            &signal,
+            gossip_force_announce,
+        );
+    }
+}
+
+fn handle_ble_signal(
+    encounters: &mut std::collections::HashMap<String, EncounterManager>,
+    local_wayfarer_id: &str,
+    signal: &DiscoverySignal,
+    gossip_force_announce: &Arc<AtomicBool>,
+) {
+    let peer_hint = sanitize_peer_hint(&signal.peer_hint);
+    let encounter = encounters.entry(peer_hint.clone()).or_insert_with(|| {
+        EncounterManager::new(
+            format!("ble-{}-{}", local_wayfarer_id, peer_hint),
+            local_wayfarer_id.to_string(),
+            Some(peer_hint.clone()),
+        )
+    });
+
+    encounter.observe_discovery(BearerAdapter::BleBootstrap, signal.observed_at_unix_ms);
+    encounter.start_control_exchange(
+        BearerAdapter::LanDatagram,
+        TransitionReason::BleDiscovery,
+        signal.observed_at_unix_ms,
+    );
+    encounter.set_transfer_bearer(
+        BearerAdapter::LanDatagram,
+        TransitionReason::BleDiscovery,
+        signal.observed_at_unix_ms,
+    );
+    shared_log_verbose(&format!(
+        "encounter_ble_handoff peer_hint={} source={} rssi={} discovery_bearer=ble-bootstrap transfer_bearer=lan-datagram reason=ble-discovery at_unix_ms={}",
+        peer_hint,
+        signal.source,
+        signal
+            .rssi
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "na".to_string()),
+        signal.observed_at_unix_ms,
+    ));
+    gossip_force_announce.store(true, Ordering::SeqCst);
+}
+
+fn sanitize_peer_hint(peer_hint: &str) -> String {
+    let filtered = peer_hint
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == ':' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let compact = filtered.trim_matches('-').to_string();
+    if compact.is_empty() {
+        "unknown-ble-peer".to_string()
+    } else {
+        compact
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -5212,8 +5330,8 @@ fn apply_styles() {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_wayfarer_id_from_text, is_ping_only_chat_payload, update_relay_sync_setting,
-        AppSettings,
+        extract_wayfarer_id_from_text, is_ping_only_chat_payload, sanitize_peer_hint,
+        update_relay_sync_setting, AppSettings,
     };
     use crate::aethos_core::gossip_sync::{GossipSyncFrame, RelayIngestFrame};
     use base64::Engine;
@@ -5345,5 +5463,14 @@ mod tests {
         let sent = sink.sent.lock().expect("lock sent");
         assert_eq!(sent.len(), 1);
         assert!(sent[0].1 > 0);
+    }
+
+    #[test]
+    fn sanitize_peer_hint_normalizes_non_identifier_chars() {
+        assert_eq!(
+            sanitize_peer_hint(" peer id / unstable "),
+            "peer-id---unstable"
+        );
+        assert_eq!(sanitize_peer_hint(""), "unknown-ble-peer");
     }
 }

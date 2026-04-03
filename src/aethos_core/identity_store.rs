@@ -410,9 +410,13 @@ fn contact_aliases_file_path_for(base_dir: PathBuf) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        contact_aliases_file_path_for, identity_file_path_for, session_cache_file_path_for,
-        sha256_hex_lower,
+        cipher_from_identity, contact_aliases_file_path_for, decode_verifying_key_from_identity,
+        identity_file_path_for, session_cache_file_path_for, sha256_hex_lower, StoredIdentity,
     };
+    use base64::Engine;
+    use chacha20poly1305::aead::Aead;
+    use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+    use ed25519_dalek::SigningKey;
     use std::path::PathBuf;
 
     #[test]
@@ -453,5 +457,42 @@ mod tests {
             digest,
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    fn fixture_identity() -> StoredIdentity {
+        let seed = [7u8; 32];
+        let signing_key = SigningKey::from_bytes(&seed);
+        let verifying = signing_key.verifying_key();
+        let digest = sha256_hex_lower(&verifying.to_bytes());
+        StoredIdentity {
+            wayfarer_id: digest.clone(),
+            device_id: digest,
+            signing_key_b64: base64::engine::general_purpose::STANDARD.encode(seed),
+            device_name: "fixture-device".to_string(),
+            platform: "linux".to_string(),
+        }
+    }
+
+    #[test]
+    fn decode_verifying_key_rejects_wrong_seed_length() {
+        let mut identity = fixture_identity();
+        identity.signing_key_b64 = base64::engine::general_purpose::STANDARD.encode([1u8; 16]);
+        let err = decode_verifying_key_from_identity(&identity).unwrap_err();
+        assert!(err.contains("invalid length"));
+    }
+
+    #[test]
+    fn cipher_derivation_is_stable_for_same_identity() {
+        let identity = fixture_identity();
+        let cipher_a = cipher_from_identity(&identity).unwrap();
+        let cipher_b = cipher_from_identity(&identity).unwrap();
+
+        let nonce = Nonce::from_slice(&[0u8; 12]);
+        let plaintext = b"relay-session-cache";
+        let encrypted = cipher_a.encrypt(nonce, plaintext.as_slice()).unwrap();
+        let decrypted = cipher_b.decrypt(nonce, encrypted.as_slice()).unwrap();
+        assert_eq!(decrypted, plaintext);
+
+        let _type_check: &ChaCha20Poly1305 = &cipher_a;
     }
 }

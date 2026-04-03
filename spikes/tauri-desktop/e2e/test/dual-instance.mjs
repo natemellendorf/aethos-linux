@@ -679,6 +679,8 @@ async function openTauriSession(sessionName, stateRoot, tauriPort = 4444, extraE
       `--aethos-e2e-disable-relay=${relayDisabledValue}`,
       "--aethos-e2e-force-verbose=1",
       `--aethos-e2e-force-gossip=${forceGossipValue}`,
+      `--aethos-disable-ble=${String(extraEnv.AETHOS_DISABLE_BLE || "")}`,
+      `--aethos-ble-simulated-signals=${String(extraEnv.AETHOS_BLE_SIMULATED_SIGNALS || "")}`,
       `--aethos-lan-fallback-transfer-max-items=${String(extraEnv.AETHOS_LAN_FALLBACK_TRANSFER_MAX_ITEMS || "2")}`,
       `--aethos-lan-fallback-transfer-max-bytes=${String(extraEnv.AETHOS_LAN_FALLBACK_TRANSFER_MAX_BYTES || "1024")}`,
       `--aethos-media-e2e-max-item-payload-b64-bytes=${String(extraEnv.AETHOS_MEDIA_E2E_MAX_ITEM_PAYLOAD_B64_BYTES || "")}`,
@@ -1097,6 +1099,102 @@ describe("dual instance gossip e2e", function () {
 
       const pongInboundOnA = await waitForIncomingMessageInState(a.stateRoot, "/pong");
       expect(Boolean(pongInboundOnA?.found)).to.equal(true);
+    } finally {
+      await closeSession(a);
+      await closeSession(b);
+    }
+  });
+
+  it("emits BLE discovery and hands off to LAN transfer path", async function () {
+    this.timeout(TEST_TIMEOUT_MS);
+
+    let a;
+    let b;
+    try {
+      a = await openTauriSession("a", stateRootPath("ble-discovery-a"), TAURI_DRIVER_A_PORT, {
+        AETHOS_BLE_SIMULATED_SIGNALS: "peer-ble-a@-52,peer-ble-b@-45"
+      });
+      b = await openTauriSession("b", stateRootPath("ble-discovery-b"), TAURI_DRIVER_B_PORT, {
+        AETHOS_BLE_SIMULATED_SIGNALS: "peer-ble-a@-52,peer-ble-b@-45"
+      });
+
+      await waitForSplashToClear(a.driver);
+      await waitForSplashToClear(b.driver);
+
+      const idA = await readIdentityWayfarerId(a.stateRoot);
+      const idB = await readIdentityWayfarerId(b.stateRoot);
+      expect(idA).to.not.equal(idB);
+
+      await openContactsAndAdd(a.driver, idB, "Peer B");
+      await openContactsAndAdd(b.driver, idA, "Peer A");
+      await clickContactInChats(a.driver, idB);
+      await clickContactInChats(b.driver, idA);
+
+      const discovered = await waitForLogPattern(
+        a.logPath,
+        /encounter_discovery_observed.*bearer_adapter=ble-bootstrap/,
+        120000
+      );
+      expect(Boolean(discovered)).to.equal(true);
+
+      const controlStart = await waitForLogPattern(
+        a.logPath,
+        /encounter_control_exchange_started.*reason=ble-discovery/,
+        120000
+      );
+      expect(Boolean(controlStart)).to.equal(true);
+
+      const handoff = await waitForLogPattern(
+        a.logPath,
+        /encounter_bearer_selected.*bearer_adapter=lan-datagram.*reason=ble-discovery/,
+        120000
+      );
+      expect(Boolean(handoff)).to.equal(true);
+
+      const text = `ble-discovery-${Date.now()}`;
+      await sendChatMessage(a.driver, text);
+      await clickSyncInbox(b.driver);
+      const inbound = await waitForIncomingMessageInState(b.stateRoot, text);
+      expect(Boolean(inbound?.found)).to.equal(true);
+    } finally {
+      await closeSession(a);
+      await closeSession(b);
+    }
+  });
+
+  it("continues LAN encounter flow when BLE is disabled", async function () {
+    this.timeout(TEST_TIMEOUT_MS);
+
+    let a;
+    let b;
+    try {
+      a = await openTauriSession("a", stateRootPath("encounter-lan-a"), TAURI_DRIVER_A_PORT, {
+        AETHOS_DISABLE_BLE: "1"
+      });
+      b = await openTauriSession("b", stateRootPath("encounter-lan-b"), TAURI_DRIVER_B_PORT, {
+        AETHOS_DISABLE_BLE: "1"
+      });
+
+      await waitForSplashToClear(a.driver);
+      await waitForSplashToClear(b.driver);
+
+      const idA = await readIdentityWayfarerId(a.stateRoot);
+      const idB = await readIdentityWayfarerId(b.stateRoot);
+      expect(idA).to.not.equal(idB);
+
+      await openContactsAndAdd(a.driver, idB, "Peer B");
+      await openContactsAndAdd(b.driver, idA, "Peer A");
+      await clickContactInChats(a.driver, idB);
+      await clickContactInChats(b.driver, idA);
+
+      const text = `encounter-lan-${Date.now()}`;
+      await sendChatMessage(a.driver, text);
+      await clickSyncInbox(b.driver);
+      const inbound = await waitForIncomingMessageInState(b.stateRoot, text);
+      expect(Boolean(inbound?.found)).to.equal(true);
+
+      // BLE is explicitly disabled in both sessions; successful LAN delivery verifies
+      // encounter bootstrap/transfer does not require BLE availability.
     } finally {
       await closeSession(a);
       await closeSession(b);

@@ -113,3 +113,41 @@ fn extract_kv_fields(message: &str) -> serde_json::Value {
     }
     serde_json::Value::Object(map)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_kv_fields, infer_event_name, structured_logs_enabled};
+
+    #[test]
+    fn infer_event_name_uses_first_token_without_colon() {
+        assert_eq!(
+            infer_event_name("transfer_select_done: selected=3"),
+            "transfer_select_done"
+        );
+        assert_eq!(infer_event_name("plain-event payload=ok"), "plain-event");
+        assert_eq!(infer_event_name(""), "log");
+    }
+
+    #[test]
+    fn extract_kv_fields_parses_expected_tokens() {
+        let fields = extract_kv_fields(
+            "encounter_scheduler_plan_emitted plan_id=relay-1 selected_items=8 stop_reason=budget_bytes_exhausted tie_break_reason=tier_size",
+        );
+        assert_eq!(fields["plan_id"], "relay-1");
+        assert_eq!(fields["selected_items"], "8");
+        assert_eq!(fields["stop_reason"], "budget_bytes_exhausted");
+        assert_eq!(fields["tie_break_reason"], "tier_size");
+    }
+
+    #[test]
+    fn structured_logs_env_parser_accepts_true_values() {
+        std::env::set_var("AETHOS_STRUCTURED_LOGS", "1");
+        assert!(structured_logs_enabled());
+        std::env::set_var("AETHOS_STRUCTURED_LOGS", "true");
+        assert!(structured_logs_enabled());
+        std::env::set_var("AETHOS_STRUCTURED_LOGS", "TRUE");
+        assert!(structured_logs_enabled());
+        std::env::remove_var("AETHOS_STRUCTURED_LOGS");
+        assert!(!structured_logs_enabled());
+    }
+}
