@@ -1,0 +1,47 @@
+{
+  "manifestVersion": 1,
+  "suiteID": "encounter-ranking-golden-v1",
+  "schema": "./schema.json",
+  "fixtures": [
+    {
+      "lane": "blink encounter",
+      "fixture": "./blink-encounter-priority.json",
+      "locksIn": "Receipts/checkpoints and tiny endangered items rank ahead of bulk cargo in blink encounters."
+    },
+    {
+      "lane": "short encounter",
+      "fixture": "./short-drain-messages-before-attachments.json",
+      "locksIn": "Short encounters drain high-value messages before larger attachments."
+    },
+    {
+      "lane": "durable encounter",
+      "fixture": "./durable-allocates-cargo-without-starving-control.json",
+      "locksIn": "Durable encounters allocate cargo budget while preserving control traffic priority."
+    },
+    {
+      "lane": "same-tier exact-tie lane",
+      "fixture": "./same-tier-exact-tie-itemid-determinism.json",
+      "locksIn": "Exact same-tier ties resolve through canonical tie-break chain down to itemID."
+    },
+    {
+      "lane": "transit-vs-direct lane",
+      "fixture": "./transit-vs-direct-tier-precedence.json",
+      "locksIn": "Low-replication transit can outrank direct-only metadata due to immutable tier precedence."
+    },
+    {
+      "lane": "media-starvation-guard lane",
+      "fixture": "./media-starvation-guard-short-budget.json",
+      "locksIn": "Large media is deferred under short encounter budgets unless durable budgets permit it."
+    },
+    {
+      "lane": "receipt/checkpoint protection lane",
+      "fixture": "./receipt-checkpoint-protection.json",
+      "locksIn": "Tier 0 receipt/checkpoint traffic remains protected even when higher tiers score higher numerically."
+    },
+    {
+      "lane": "repeated-run stability lane",
+      "fixture": "./repeated-run-stability-mixed-ties.json",
+      "locksIn": "Canonical deterministic outputs remain byte-for-byte stable across repeated runs."
+    }
+  ]
+}

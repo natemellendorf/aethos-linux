@@ -1,0 +1,114 @@
+{
+  "schemaVersion": "encounter-ranking.v1",
+  "fixtureID": "durable-allocates-cargo-without-starving-control",
+  "description": "Durable lane golden fixture: control traffic stays first while durable encounters still allocate budget to cargo tiers.",
+  "encounterClass": "durable",
+  "nowUnixMs": 1760000000000,
+  "budgetProfile": {
+    "maxItems": 3,
+    "maxBytes": 38000,
+    "durableCargoRatioCap": 0.99,
+    "preferredTransferUnitBytes": 32768,
+    "expiryUrgencyHorizonMs": 900000,
+    "stagnationHorizonMs": 3600000
+  },
+  "cargoItems": [
+    {
+      "itemID": "0000000000000000000000000000000000000000000000000000000000000301",
+      "tier": 0,
+      "sizeBytes": 384,
+      "expiryAtUnixMs": 1760000150000,
+      "knownReplicaCount": 0,
+      "receiptCoverage": 0,
+      "lastForwardedAtUnixMs": 1759999800000,
+      "proximityClass": "destination-peer",
+      "contentClassScore": 0.2,
+      "destinationRank": 10
+    },
+    {
+      "itemID": "0000000000000000000000000000000000000000000000000000000000000302",
+      "tier": 4,
+      "sizeBytes": 4096,
+      "expiryAtUnixMs": 1760002400000,
+      "knownReplicaCount": 1,
+      "receiptCoverage": 0.4,
+      "lastForwardedAtUnixMs": 1759996000000,
+      "proximityClass": "likely-closer",
+      "contentClassScore": 0.5,
+      "destinationRank": 4
+    },
+    {
+      "itemID": "0000000000000000000000000000000000000000000000000000000000000303",
+      "tier": 5,
+      "sizeBytes": 32768,
+      "expiryAtUnixMs": 1760005400000,
+      "knownReplicaCount": 0,
+      "receiptCoverage": 0.1,
+      "lastForwardedAtUnixMs": 1759995000000,
+      "proximityClass": "other",
+      "contentClassScore": 0.3,
+      "destinationRank": 2
+    }
+  ],
+  "expected": {
+    "rankingOrder": [
+      "0000000000000000000000000000000000000000000000000000000000000301",
+      "0000000000000000000000000000000000000000000000000000000000000302",
+      "0000000000000000000000000000000000000000000000000000000000000303"
+    ],
+    "selectedPrefix": [
+      "0000000000000000000000000000000000000000000000000000000000000301",
+      "0000000000000000000000000000000000000000000000000000000000000302",
+      "0000000000000000000000000000000000000000000000000000000000000303"
+    ],
+    "scoreBreakdowns": [
+      {
+        "itemID": "0000000000000000000000000000000000000000000000000000000000000301",
+        "components": {
+          "scarcity": 1,
+          "safety": 1,
+          "expiry": 0.833333,
+          "stagnation": 0.055556,
+          "proximity": 1,
+          "size": 0.427421,
+          "intent": 0,
+          "contentClass": 0.2
+        },
+        "scoreNumerator": 75819368,
+        "score": 0.75819368
+      },
+      {
+        "itemID": "0000000000000000000000000000000000000000000000000000000000000302",
+        "components": {
+          "scarcity": 0.833333,
+          "safety": 0.92,
+          "expiry": 0,
+          "stagnation": 1,
+          "proximity": 0.6,
+          "size": 0.199979,
+          "intent": 0,
+          "contentClass": 0.5
+        },
+        "scoreNumerator": 62506490,
+        "score": 0.6250649
+      },
+      {
+        "itemID": "0000000000000000000000000000000000000000000000000000000000000303",
+        "components": {
+          "scarcity": 1,
+          "safety": 0.98,
+          "expiry": 0,
+          "stagnation": 1,
+          "proximity": 0,
+          "size": 0,
+          "intent": 0,
+          "contentClass": 0.3
+        },
+        "scoreNumerator": 60160000,
+        "score": 0.6016
+      }
+    ],
+    "stopReason": "completed",
+    "tieBreakReason": "none"
+  }
+}

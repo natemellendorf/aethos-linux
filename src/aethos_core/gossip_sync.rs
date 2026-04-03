@@ -7,6 +7,10 @@ use ciborium::{de::from_reader, ser::into_writer};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::aethos_core::encounter_scheduler::{
+    BudgetProfile as SchedulerBudgetProfile, CargoItem as SchedulerCargoItem, EncounterClass,
+    EncounterSchedulerV1, ProximityClass as SchedulerProximityClass,
+};
 use crate::aethos_core::gossip_store_sqlite::{
     self, ImportWriteObject, RecordPutOutcome, StoredItemRecord,
 };
@@ -475,6 +479,40 @@ pub fn transfer_items_for_request(
     max_bytes: u64,
     now_ms: u64,
 ) -> Result<Vec<TransferObject>, String> {
+    transfer_items_for_request_with_shadow_context(
+        requested_item_ids,
+        max_items,
+        max_bytes,
+        now_ms,
+        None,
+    )
+}
+
+#[derive(Debug, Clone)]
+pub struct TransferSelectionTelemetry {
+    pub planner: &'static str,
+    pub selected_items: usize,
+    pub consumed_bytes: u64,
+    pub stop_reason: String,
+    pub tie_break_reason: String,
+    pub ranking_top: Vec<String>,
+    pub selected_top: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TransferSelectionOutcome {
+    pub objects: Vec<TransferObject>,
+    pub telemetry: TransferSelectionTelemetry,
+}
+
+pub fn transfer_items_for_request_with_shadow_context_and_diagnostics(
+    requested_item_ids: &[String],
+    max_items: u32,
+    max_bytes: u64,
+    now_ms: u64,
+    peer_wayfarer_id: Option<&str>,
+) -> Result<TransferSelectionOutcome, String> {
+    let planner = "encounter-scheduler-v1";
     log_verbose(&format!(
         "transfer_select_start: requested={} max_items={} max_bytes={} now_ms={}",
         requested_item_ids.len(),
@@ -482,33 +520,158 @@ pub fn transfer_items_for_request(
         max_bytes,
         now_ms
     ));
-    let mut selected = Vec::new();
-    let mut consumed_bytes = 0u64;
-    let max_transfer_bytes = max_bytes.min(MAX_TRANSFER_BYTES);
-
-    let mut candidates =
+    let candidates =
         gossip_store_sqlite::transfer_candidates_for_request(requested_item_ids, now_ms)?;
-    candidates.sort_by(|a, b| {
-        a.envelope_b64
-            .len()
-            .cmp(&b.envelope_b64.len())
-            .then_with(|| a.item_id.cmp(&b.item_id))
-    });
+    let scheduler_plan =
+        build_scheduler_transfer_plan(&candidates, max_items, max_bytes, now_ms, peer_wayfarer_id)?;
 
-    for stored in candidates {
-        if selected.len() >= max_items as usize || selected.len() >= MAX_TRANSFER_ITEMS {
-            break;
-        }
+    transfer_legacy_debug::maybe_log_scheduler_vs_legacy_diff(
+        &candidates,
+        &scheduler_plan.result,
+        max_items,
+        max_bytes,
+        now_ms,
+        peer_wayfarer_id,
+    );
 
-        let envelope_raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(&stored.envelope_b64)
-            .map_err(|err| format!("stored envelope decode failed: {err}"))?;
-        let projected = consumed_bytes.saturating_add(envelope_raw.len() as u64);
-        if projected > max_transfer_bytes {
-            continue;
-        }
+    if should_use_legacy_transfer_fallback() {
+        let mut legacy_sorted = candidates.clone();
+        legacy_sorted.sort_by(|a, b| {
+            a.envelope_b64
+                .len()
+                .cmp(&b.envelope_b64.len())
+                .then_with(|| a.item_id.cmp(&b.item_id))
+        });
+        let legacy_plan = transfer_legacy_debug::build_legacy_transfer_plan(
+            &legacy_sorted,
+            max_items,
+            max_bytes,
+        )?;
+        log_verbose(&format!(
+            "transfer_select_legacy_fallback: selected_items={} consumed_bytes={} stop_reason={}",
+            legacy_plan.selected.len(),
+            legacy_plan.consumed_bytes,
+            legacy_plan.stop_reason.as_str(),
+        ));
+        return Ok(TransferSelectionOutcome {
+            objects: legacy_plan.selected.clone(),
+            telemetry: TransferSelectionTelemetry {
+                planner: "legacy-fallback",
+                selected_items: legacy_plan.selected.len(),
+                consumed_bytes: legacy_plan.consumed_bytes,
+                stop_reason: legacy_plan.stop_reason.as_str().to_string(),
+                tie_break_reason: "none".to_string(),
+                ranking_top: legacy_plan.ranking_order.into_iter().take(5).collect(),
+                selected_top: legacy_plan
+                    .selected
+                    .iter()
+                    .map(|item| item.item_id.clone())
+                    .take(5)
+                    .collect(),
+            },
+        });
+    }
 
-        consumed_bytes = projected;
+    let ranking_top = scheduler_plan
+        .result
+        .ranking_order()
+        .into_iter()
+        .take(5)
+        .collect::<Vec<_>>();
+    let selected_top = scheduler_plan
+        .result
+        .selected_prefix_item_ids()
+        .into_iter()
+        .take(5)
+        .collect::<Vec<_>>();
+    let selected_items_total = scheduler_plan.selected.len();
+    log_verbose(&format!(
+        "transfer_select_done: planner={} selected_items={} consumed_bytes={} stop_reason={} tie_break_reason={} ranking_top={} selected_top={}",
+        planner,
+        scheduler_plan.selected.len(),
+        scheduler_plan.consumed_bytes,
+        scheduler_plan.result.stop_reason.as_str(),
+        scheduler_plan.result.tie_break_reason.as_str(),
+        json_string_array(&ranking_top),
+        json_string_array(&selected_top),
+    ));
+
+    Ok(TransferSelectionOutcome {
+        objects: scheduler_plan.selected,
+        telemetry: TransferSelectionTelemetry {
+            planner,
+            selected_items: selected_items_total,
+            consumed_bytes: scheduler_plan.consumed_bytes,
+            stop_reason: scheduler_plan.result.stop_reason.as_str().to_string(),
+            tie_break_reason: scheduler_plan.result.tie_break_reason.as_str().to_string(),
+            ranking_top,
+            selected_top,
+        },
+    })
+}
+
+pub fn transfer_items_for_request_with_shadow_context(
+    requested_item_ids: &[String],
+    max_items: u32,
+    max_bytes: u64,
+    now_ms: u64,
+    peer_wayfarer_id: Option<&str>,
+) -> Result<Vec<TransferObject>, String> {
+    transfer_items_for_request_with_shadow_context_and_diagnostics(
+        requested_item_ids,
+        max_items,
+        max_bytes,
+        now_ms,
+        peer_wayfarer_id,
+    )
+    .map(|outcome| outcome.objects)
+}
+
+#[derive(Debug)]
+struct SchedulerTransferPlan {
+    selected: Vec<TransferObject>,
+    consumed_bytes: u64,
+    result: crate::aethos_core::encounter_scheduler::EncounterSchedulerResult,
+}
+
+fn build_scheduler_transfer_plan(
+    candidates: &[StoredItemRecord],
+    max_items: u32,
+    max_bytes: u64,
+    now_ms: u64,
+    peer_wayfarer_id: Option<&str>,
+) -> Result<SchedulerTransferPlan, String> {
+    let mut scheduler_items = Vec::with_capacity(candidates.len());
+    let mut item_to_stored = BTreeMap::<String, &StoredItemRecord>::new();
+    let mut item_to_wire_size = BTreeMap::<String, u64>::new();
+    for candidate in candidates {
+        let (profile, scheduler_item) =
+            shadow_profile_from_stored(candidate, now_ms, peer_wayfarer_id)?;
+        item_to_stored.insert(profile.item_id.clone(), candidate);
+        item_to_wire_size.insert(profile.item_id, profile.decoded_wire_bytes as u64);
+        scheduler_items.push(scheduler_item);
+    }
+
+    let result = schedule_transfer_candidates_with_encounter_scheduler(
+        EncounterClass::Short,
+        max_items,
+        max_bytes,
+        now_ms,
+        &scheduler_items,
+    )?;
+
+    let mut selected = Vec::with_capacity(result.selected_prefix.len());
+    let mut consumed_bytes = 0u64;
+    for ranked in &result.selected_prefix {
+        let item_id = ranked.cargo_item.item_id.as_str();
+        let stored = item_to_stored
+            .get(item_id)
+            .ok_or_else(|| format!("scheduler selected unknown item_id: {item_id}"))?;
+        let fallback_wire_size = stored.envelope_b64.len() as u64;
+        let wire_size = *item_to_wire_size
+            .get(item_id)
+            .unwrap_or(&fallback_wire_size);
+        consumed_bytes = consumed_bytes.saturating_add(wire_size);
         selected.push(TransferObject {
             item_id: stored.item_id.clone(),
             envelope_b64: stored.envelope_b64.clone(),
@@ -517,13 +680,494 @@ pub fn transfer_items_for_request(
         });
     }
 
-    log_verbose(&format!(
-        "transfer_select_done: selected_items={} consumed_bytes={}",
-        selected.len(),
-        consumed_bytes
-    ));
+    Ok(SchedulerTransferPlan {
+        selected,
+        consumed_bytes,
+        result,
+    })
+}
 
-    Ok(selected)
+fn schedule_transfer_candidates_with_encounter_scheduler(
+    encounter_class: EncounterClass,
+    max_items: u32,
+    max_bytes: u64,
+    now_ms: u64,
+    scheduler_items: &[SchedulerCargoItem],
+) -> Result<crate::aethos_core::encounter_scheduler::EncounterSchedulerResult, String> {
+    let scheduler_budget = SchedulerBudgetProfile {
+        max_items: std::cmp::min(max_items as i32, MAX_TRANSFER_ITEMS as i32),
+        max_bytes: std::cmp::min(max_bytes, MAX_TRANSFER_BYTES) as i32,
+        max_duration_ms: None,
+        durable_cargo_ratio_cap: None,
+        preferred_transfer_unit_bytes: 32_768,
+        expiry_urgency_horizon_ms: 900_000,
+        stagnation_horizon_ms: 3_600_000,
+        target_replica_count_default: 6,
+    };
+
+    EncounterSchedulerV1::new()
+        .schedule(encounter_class, &scheduler_budget, now_ms, scheduler_items)
+        .map_err(|err| format!("encounter scheduler primary planning failed: {err:?}"))
+}
+
+fn should_use_legacy_transfer_fallback() -> bool {
+    if !cfg!(any(debug_assertions, test)) {
+        return false;
+    }
+    std::env::var("AETHOS_ROUTING_LEGACY_FALLBACK")
+        .map(|raw| {
+            let normalized = raw.trim().to_ascii_lowercase();
+            normalized == "1" || normalized == "true" || normalized == "on"
+        })
+        .unwrap_or(false)
+}
+
+mod transfer_legacy_debug {
+    use super::*;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum LegacyPlannerStopReason {
+        Completed,
+        BudgetItemsExhausted,
+        BudgetBytesExhausted,
+    }
+
+    impl LegacyPlannerStopReason {
+        pub(super) fn as_str(self) -> &'static str {
+            match self {
+                Self::Completed => "completed",
+                Self::BudgetItemsExhausted => "budget-items-exhausted",
+                Self::BudgetBytesExhausted => "budget-bytes-exhausted",
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    pub(super) struct LegacyTransferPlan {
+        pub(super) selected: Vec<TransferObject>,
+        pub(super) consumed_bytes: u64,
+        pub(super) stop_reason: LegacyPlannerStopReason,
+        pub(super) ranking_order: Vec<String>,
+    }
+
+    pub(super) fn build_legacy_transfer_plan(
+        sorted_candidates: &[StoredItemRecord],
+        max_items: u32,
+        max_bytes: u64,
+    ) -> Result<LegacyTransferPlan, String> {
+        let mut selected = Vec::new();
+        let mut consumed_bytes = 0u64;
+        let mut stop_reason = LegacyPlannerStopReason::Completed;
+        let max_transfer_bytes = max_bytes.min(MAX_TRANSFER_BYTES);
+        let ranking_order = sorted_candidates
+            .iter()
+            .map(|stored| stored.item_id.clone())
+            .collect::<Vec<_>>();
+
+        for stored in sorted_candidates {
+            if selected.len() >= max_items as usize || selected.len() >= MAX_TRANSFER_ITEMS {
+                stop_reason = LegacyPlannerStopReason::BudgetItemsExhausted;
+                break;
+            }
+
+            let envelope_raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(&stored.envelope_b64)
+                .map_err(|err| format!("stored envelope decode failed: {err}"))?;
+            let projected = consumed_bytes.saturating_add(envelope_raw.len() as u64);
+            if projected > max_transfer_bytes {
+                stop_reason = LegacyPlannerStopReason::BudgetBytesExhausted;
+                break;
+            }
+
+            consumed_bytes = projected;
+            selected.push(TransferObject {
+                item_id: stored.item_id.clone(),
+                envelope_b64: stored.envelope_b64.clone(),
+                expiry_unix_ms: stored.expiry_unix_ms,
+                hop_count: stored.hop_count.saturating_add(1),
+            });
+        }
+
+        Ok(LegacyTransferPlan {
+            selected,
+            consumed_bytes,
+            stop_reason,
+            ranking_order,
+        })
+    }
+
+    #[derive(Debug, Clone, Copy, Default)]
+    struct SelectionRoutingStats {
+        direct_count: usize,
+        transit_count: usize,
+        other_count: usize,
+    }
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    struct SelectionTierDistribution {
+        tier0: usize,
+        tier1: usize,
+        tier2: usize,
+        tier3: usize,
+        tier4: usize,
+        tier5: usize,
+    }
+
+    impl SelectionTierDistribution {
+        fn increment(&mut self, tier: i32) {
+            match tier {
+                0 => self.tier0 += 1,
+                1 => self.tier1 += 1,
+                2 => self.tier2 += 1,
+                3 => self.tier3 += 1,
+                4 => self.tier4 += 1,
+                5 => self.tier5 += 1,
+                _ => {}
+            }
+        }
+
+        fn as_json(self) -> String {
+            format!(
+                "{{\"tier0\":{},\"tier1\":{},\"tier2\":{},\"tier3\":{},\"tier4\":{},\"tier5\":{}}}",
+                self.tier0, self.tier1, self.tier2, self.tier3, self.tier4, self.tier5
+            )
+        }
+    }
+
+    impl SelectionRoutingStats {
+        fn increment(&mut self, proximity: SchedulerProximityClass) {
+            match proximity {
+                SchedulerProximityClass::DestinationPeer => self.direct_count += 1,
+                SchedulerProximityClass::LikelyCloser => self.transit_count += 1,
+                SchedulerProximityClass::Other => self.other_count += 1,
+            }
+        }
+
+        fn transit_direct_ratio(self) -> String {
+            let total = self.direct_count + self.transit_count;
+            if total == 0 {
+                return "null".to_string();
+            }
+            format!("{:.6}", self.transit_count as f64 / total as f64)
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    pub(super) struct SchedulerCandidateProfile {
+        pub(super) item_id: String,
+        pub(super) tier: i32,
+        pub(super) proximity: SchedulerProximityClass,
+        pub(super) decoded_wire_bytes: usize,
+    }
+
+    #[derive(Debug)]
+    pub(super) struct ShadowComparisonTelemetry {
+        pub(super) old_top_n: Vec<String>,
+        pub(super) new_top_n: Vec<String>,
+        pub(super) changed_first_selected_item: bool,
+        pub(super) old_first_selected_item: Option<String>,
+        pub(super) new_first_selected_item: Option<String>,
+        pub(super) changed_stop_reason: bool,
+        pub(super) old_stop_reason: String,
+        pub(super) new_stop_reason: String,
+        pub(super) changed_tier_distribution: bool,
+        old_tier_distribution: SelectionTierDistribution,
+        new_tier_distribution: SelectionTierDistribution,
+        pub(super) changed_transit_direct_ratio: bool,
+        pub(super) old_transit_direct_ratio: String,
+        pub(super) new_transit_direct_ratio: String,
+    }
+
+    impl ShadowComparisonTelemetry {
+        fn has_diff(&self) -> bool {
+            self.old_top_n != self.new_top_n
+                || self.changed_first_selected_item
+                || self.changed_stop_reason
+                || self.changed_tier_distribution
+                || self.changed_transit_direct_ratio
+        }
+
+        fn as_json_fragment(&self) -> String {
+            format!(
+            "{{\"old_top_n\":{},\"new_top_n\":{},\"changed_first_selected_item\":{},\"old_first_selected_item\":{},\"new_first_selected_item\":{},\"changed_stop_reason\":{},\"old_stop_reason\":\"{}\",\"new_stop_reason\":\"{}\",\"changed_tier_distribution\":{},\"old_tier_distribution\":{},\"new_tier_distribution\":{},\"changed_transit_direct_ratio\":{},\"old_transit_direct_ratio\":{},\"new_transit_direct_ratio\":{}}}",
+            json_string_array(&self.old_top_n),
+            json_string_array(&self.new_top_n),
+            self.changed_first_selected_item,
+            json_option_string(self.old_first_selected_item.as_deref()),
+            json_option_string(self.new_first_selected_item.as_deref()),
+            self.changed_stop_reason,
+            self.old_stop_reason,
+            self.new_stop_reason,
+            self.changed_tier_distribution,
+            self.old_tier_distribution.as_json(),
+            self.new_tier_distribution.as_json(),
+            self.changed_transit_direct_ratio,
+            json_raw_or_null(&self.old_transit_direct_ratio),
+            json_raw_or_null(&self.new_transit_direct_ratio)
+        )
+        }
+    }
+
+    pub(super) fn maybe_log_scheduler_vs_legacy_diff(
+        candidates: &[StoredItemRecord],
+        scheduler_result: &crate::aethos_core::encounter_scheduler::EncounterSchedulerResult,
+        max_items: u32,
+        max_bytes: u64,
+        now_ms: u64,
+        peer_wayfarer_id: Option<&str>,
+    ) {
+        if !scheduler_shadow_mode_enabled() {
+            return;
+        }
+
+        let mut candidate_profiles = Vec::with_capacity(candidates.len());
+        let mut scheduler_items = Vec::with_capacity(candidates.len());
+        let mut legacy_sorted = candidates.to_vec();
+        legacy_sorted.sort_by(|a, b| {
+            a.envelope_b64
+                .len()
+                .cmp(&b.envelope_b64.len())
+                .then_with(|| a.item_id.cmp(&b.item_id))
+        });
+        let legacy_plan = match build_legacy_transfer_plan(&legacy_sorted, max_items, max_bytes) {
+            Ok(plan) => plan,
+            Err(err) => {
+                log_verbose(&format!(
+                "transfer_scheduler_shadow_error: mode=debug reason=legacy_plan_failed error={err}"
+            ));
+                return;
+            }
+        };
+
+        for candidate in candidates {
+            let (profile, scheduler_item) =
+                match shadow_profile_from_stored(candidate, now_ms, peer_wayfarer_id) {
+                    Ok(profile) => profile,
+                    Err(_) => continue,
+                };
+            candidate_profiles.push(profile);
+            scheduler_items.push(scheduler_item);
+        }
+
+        if scheduler_items.is_empty() {
+            return;
+        }
+
+        let shadow_scheduler_result = match schedule_transfer_candidates_with_encounter_scheduler(
+            EncounterClass::Short,
+            max_items,
+            max_bytes,
+            now_ms,
+            &scheduler_items,
+        ) {
+            Ok(result) => result,
+            Err(err) => {
+                log_verbose(&format!(
+                "transfer_scheduler_shadow_error: mode=debug reason=scheduler_failed error={:?}",
+                err
+            ));
+                return;
+            }
+        };
+
+        let telemetry = build_shadow_comparison_telemetry(
+            &candidate_profiles,
+            &legacy_plan,
+            scheduler_result,
+            5,
+        );
+        if telemetry.has_diff() {
+            log_verbose(&format!(
+            "transfer_scheduler_shadow_diff: mode=debug payload={} scheduler_shadow_stop_reason={} scheduler_shadow_tie_break_reason={}",
+            telemetry.as_json_fragment(),
+            shadow_scheduler_result.stop_reason.as_str(),
+            shadow_scheduler_result.tie_break_reason.as_str(),
+        ));
+        }
+    }
+
+    pub(super) fn build_shadow_comparison_telemetry(
+        candidate_profiles: &[SchedulerCandidateProfile],
+        legacy_plan: &LegacyTransferPlan,
+        scheduler_result: &crate::aethos_core::encounter_scheduler::EncounterSchedulerResult,
+        top_n: usize,
+    ) -> ShadowComparisonTelemetry {
+        let old_top_n = legacy_plan
+            .ranking_order
+            .iter()
+            .take(top_n)
+            .cloned()
+            .collect::<Vec<_>>();
+        let new_top_n = scheduler_result
+            .ranking_order()
+            .iter()
+            .take(top_n)
+            .cloned()
+            .collect::<Vec<_>>();
+        let old_first_selected_item = legacy_plan
+            .selected
+            .first()
+            .map(|item| item.item_id.clone());
+        let new_first_selected_item = scheduler_result
+            .selected_prefix
+            .first()
+            .map(|item| item.cargo_item.item_id.clone());
+        let old_stop_reason = legacy_plan.stop_reason.as_str().to_string();
+        let new_stop_reason = scheduler_result.stop_reason.as_str().to_string();
+
+        let old_selected_ids = legacy_plan
+            .selected
+            .iter()
+            .map(|item| item.item_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let new_selected_ids = scheduler_result
+            .selected_prefix
+            .iter()
+            .map(|item| item.cargo_item.item_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        let mut old_tier_distribution = SelectionTierDistribution::default();
+        let mut new_tier_distribution = SelectionTierDistribution::default();
+        let mut old_routing_stats = SelectionRoutingStats::default();
+        let mut new_routing_stats = SelectionRoutingStats::default();
+        for profile in candidate_profiles {
+            if old_selected_ids.contains(profile.item_id.as_str()) {
+                old_tier_distribution.increment(profile.tier);
+                old_routing_stats.increment(profile.proximity);
+            }
+            if new_selected_ids.contains(profile.item_id.as_str()) {
+                new_tier_distribution.increment(profile.tier);
+                new_routing_stats.increment(profile.proximity);
+            }
+        }
+
+        let old_transit_direct_ratio = old_routing_stats.transit_direct_ratio();
+        let new_transit_direct_ratio = new_routing_stats.transit_direct_ratio();
+
+        ShadowComparisonTelemetry {
+            changed_first_selected_item: old_first_selected_item != new_first_selected_item,
+            changed_stop_reason: old_stop_reason != new_stop_reason,
+            changed_tier_distribution: old_tier_distribution != new_tier_distribution,
+            changed_transit_direct_ratio: old_transit_direct_ratio != new_transit_direct_ratio,
+            old_top_n,
+            new_top_n,
+            old_first_selected_item,
+            new_first_selected_item,
+            old_stop_reason,
+            new_stop_reason,
+            old_tier_distribution,
+            new_tier_distribution,
+            old_transit_direct_ratio,
+            new_transit_direct_ratio,
+        }
+    }
+
+    fn scheduler_shadow_mode_enabled() -> bool {
+        if cfg!(any(debug_assertions, test)) {
+            return std::env::var("AETHOS_ROUTING_SHADOW_MODE")
+                .map(|raw| {
+                    let normalized = raw.trim().to_ascii_lowercase();
+                    !(normalized == "0" || normalized == "false" || normalized == "off")
+                })
+                .unwrap_or(true);
+        }
+        false
+    }
+}
+
+fn shadow_profile_from_stored(
+    stored: &StoredItemRecord,
+    now_ms: u64,
+    peer_wayfarer_id: Option<&str>,
+) -> Result<
+    (
+        transfer_legacy_debug::SchedulerCandidateProfile,
+        SchedulerCargoItem,
+    ),
+    String,
+> {
+    let decoded = decode_envelope_payload_b64(&stored.envelope_b64)
+        .map_err(|err| format!("decode transfer candidate payload failed: {err}"))?;
+    let decoded_wire_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(&stored.envelope_b64)
+        .map_err(|err| format!("decode transfer candidate envelope bytes failed: {err}"))?
+        .len();
+    let proximity = if let Some(peer) = peer_wayfarer_id {
+        if decoded.to_wayfarer_id_hex == peer {
+            SchedulerProximityClass::DestinationPeer
+        } else {
+            SchedulerProximityClass::LikelyCloser
+        }
+    } else {
+        SchedulerProximityClass::Other
+    };
+
+    let ttl_ms = stored.expiry_unix_ms.saturating_sub(now_ms);
+    let tier = if decoded.body.len() <= 1024 {
+        if ttl_ms <= 900_000 {
+            if proximity == SchedulerProximityClass::DestinationPeer {
+                1
+            } else {
+                2
+            }
+        } else {
+            4
+        }
+    } else {
+        4
+    };
+
+    let profile = transfer_legacy_debug::SchedulerCandidateProfile {
+        item_id: stored.item_id.clone(),
+        tier,
+        proximity,
+        decoded_wire_bytes,
+    };
+    let scheduler_item = SchedulerCargoItem {
+        item_id: stored.item_id.clone(),
+        tier,
+        size_bytes: std::cmp::max(1, decoded.body.len() as i32),
+        expiry_at_unix_ms: stored.expiry_unix_ms,
+        known_replica_count: Some(stored.hop_count as i32),
+        target_replica_count: Some(6),
+        durably_stored: Some(false),
+        relay_ingested: Some(stored.hop_count > 0),
+        receipt_coverage: Some(0.0),
+        last_forwarded_at_unix_ms: Some(stored.recorded_at_unix_ms),
+        proximity_class: Some(proximity),
+        explicit_user_initiated: Some(false),
+        content_class_score: Some(0.0),
+        destination_rank: if proximity == SchedulerProximityClass::DestinationPeer {
+            1
+        } else {
+            0
+        },
+        estimated_duration_ms: None,
+    };
+    Ok((profile, scheduler_item))
+}
+
+fn json_string_array(values: &[String]) -> String {
+    let encoded = values
+        .iter()
+        .map(|value| format!("\"{}\"", value))
+        .collect::<Vec<_>>();
+    format!("[{}]", encoded.join(","))
+}
+
+fn json_option_string(value: Option<&str>) -> String {
+    match value {
+        Some(value) => format!("\"{}\"", value),
+        None => "null".to_string(),
+    }
+}
+
+fn json_raw_or_null(value: &str) -> String {
+    if value == "null" {
+        "null".to_string()
+    } else {
+        value.to_string()
+    }
 }
 
 pub fn import_transfer_items(
@@ -963,6 +1607,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::aethos_core::encounter_scheduler::EncounterTieBreakReason;
     use crate::aethos_core::vectors::load_envelope_vectors;
 
     use super::*;
@@ -1444,5 +2089,340 @@ mod tests {
             imported.new_messages[0].body_bytes,
             vec![0xff, 0xfe, 0xfd, 0x00]
         );
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ShadowFixtureManifest {
+        fixtures: Vec<ShadowFixtureRef>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ShadowFixtureRef {
+        fixture: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ShadowFixture {
+        #[serde(rename = "nowUnixMs")]
+        now_unix_ms: u64,
+        #[serde(rename = "budgetProfile")]
+        budget_profile: ShadowFixtureBudget,
+        #[serde(rename = "cargoItems")]
+        cargo_items: Vec<ShadowFixtureCargoItem>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ShadowFixtureBudget {
+        #[serde(rename = "maxItems")]
+        max_items: i32,
+        #[serde(rename = "maxBytes")]
+        max_bytes: i32,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ShadowFixtureCargoItem {
+        #[serde(rename = "itemID")]
+        item_id: String,
+        #[serde(rename = "sizeBytes")]
+        size_bytes: i32,
+        #[serde(rename = "expiryAtUnixMs")]
+        expiry_at_unix_ms: u64,
+        #[serde(rename = "knownReplicaCount")]
+        known_replica_count: Option<i32>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct PrimaryFixture {
+        #[serde(rename = "encounterClass")]
+        encounter_class: EncounterClass,
+        #[serde(rename = "nowUnixMs")]
+        now_unix_ms: u64,
+        #[serde(rename = "budgetProfile")]
+        budget_profile: PrimaryFixtureBudget,
+        #[serde(rename = "cargoItems")]
+        cargo_items: Vec<PrimaryFixtureCargoItem>,
+        expected: PrimaryFixtureExpected,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct PrimaryFixtureBudget {
+        #[serde(rename = "maxItems")]
+        max_items: i32,
+        #[serde(rename = "maxBytes")]
+        max_bytes: i32,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct PrimaryFixtureCargoItem {
+        #[serde(rename = "itemID")]
+        item_id: String,
+        tier: i32,
+        #[serde(rename = "sizeBytes")]
+        size_bytes: i32,
+        #[serde(rename = "expiryAtUnixMs")]
+        expiry_at_unix_ms: u64,
+        #[serde(rename = "knownReplicaCount")]
+        known_replica_count: Option<i32>,
+        #[serde(rename = "targetReplicaCount")]
+        target_replica_count: Option<i32>,
+        #[serde(rename = "durablyStored")]
+        durably_stored: Option<bool>,
+        #[serde(rename = "relayIngested")]
+        relay_ingested: Option<bool>,
+        #[serde(rename = "receiptCoverage")]
+        receipt_coverage: Option<f64>,
+        #[serde(rename = "lastForwardedAtUnixMs")]
+        last_forwarded_at_unix_ms: Option<u64>,
+        #[serde(rename = "proximityClass")]
+        proximity_class: Option<SchedulerProximityClass>,
+        #[serde(rename = "explicitUserInitiated")]
+        explicit_user_initiated: Option<bool>,
+        #[serde(rename = "contentClassScore")]
+        content_class_score: Option<f64>,
+        #[serde(rename = "destinationRank")]
+        destination_rank: i32,
+        #[serde(rename = "estimatedDurationMs")]
+        estimated_duration_ms: Option<i32>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct PrimaryFixtureExpected {
+        #[serde(rename = "rankingOrder")]
+        ranking_order: Vec<String>,
+        #[serde(rename = "selectedPrefix")]
+        selected_prefix: Vec<String>,
+        #[serde(rename = "stopReason")]
+        stop_reason: String,
+        #[serde(rename = "tieBreakReason")]
+        tie_break_reason: Option<String>,
+    }
+
+    #[test]
+    fn primary_transfer_scheduler_path_matches_canonical_fixture_outputs() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("test-data/routing/encounter-ranking");
+        let manifest_bytes = std::fs::read(root.join("manifest.json")).expect("read manifest");
+        let manifest: ShadowFixtureManifest =
+            serde_json::from_slice(&manifest_bytes).expect("parse manifest");
+
+        for fixture_ref in manifest.fixtures {
+            let fixture_path = fixture_ref.fixture.trim_start_matches("./");
+            let fixture_bytes = std::fs::read(root.join(fixture_path)).expect("read fixture");
+            let fixture: PrimaryFixture =
+                serde_json::from_slice(&fixture_bytes).expect("parse fixture");
+
+            let scheduler_items = fixture
+                .cargo_items
+                .iter()
+                .map(|item| SchedulerCargoItem {
+                    item_id: item.item_id.clone(),
+                    tier: item.tier,
+                    size_bytes: item.size_bytes,
+                    expiry_at_unix_ms: item.expiry_at_unix_ms,
+                    known_replica_count: item.known_replica_count,
+                    target_replica_count: item.target_replica_count,
+                    durably_stored: item.durably_stored,
+                    relay_ingested: item.relay_ingested,
+                    receipt_coverage: item.receipt_coverage,
+                    last_forwarded_at_unix_ms: item.last_forwarded_at_unix_ms,
+                    proximity_class: item.proximity_class,
+                    explicit_user_initiated: item.explicit_user_initiated,
+                    content_class_score: item.content_class_score,
+                    destination_rank: item.destination_rank,
+                    estimated_duration_ms: item.estimated_duration_ms,
+                })
+                .collect::<Vec<_>>();
+
+            let result = schedule_transfer_candidates_with_encounter_scheduler(
+                fixture.encounter_class,
+                fixture.budget_profile.max_items.max(0) as u32,
+                fixture.budget_profile.max_bytes.max(0) as u64,
+                fixture.now_unix_ms,
+                &scheduler_items,
+            )
+            .expect("schedule fixture via primary transfer helper");
+
+            assert_eq!(result.ranking_order(), fixture.expected.ranking_order);
+            assert_eq!(
+                result.selected_prefix_item_ids(),
+                fixture.expected.selected_prefix
+            );
+            assert_eq!(result.stop_reason.as_str(), fixture.expected.stop_reason);
+            assert_eq!(
+                result.tie_break_reason.as_str(),
+                fixture
+                    .expected
+                    .tie_break_reason
+                    .as_deref()
+                    .unwrap_or(EncounterTieBreakReason::None.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn shadow_comparison_runs_against_canonical_fixture_suite() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("test-data/routing/encounter-ranking");
+        let manifest_bytes = std::fs::read(root.join("manifest.json")).expect("read manifest");
+        let manifest: ShadowFixtureManifest =
+            serde_json::from_slice(&manifest_bytes).expect("parse manifest");
+
+        for fixture_ref in manifest.fixtures {
+            let fixture_path = fixture_ref.fixture.trim_start_matches("./");
+            let fixture_bytes = std::fs::read(root.join(fixture_path)).expect("read fixture");
+            let fixture: ShadowFixture =
+                serde_json::from_slice(&fixture_bytes).expect("parse fixture");
+
+            let candidates = fixture
+                .cargo_items
+                .iter()
+                .map(|fixture_item| StoredItemRecord {
+                    item_id: fixture_item.item_id.clone(),
+                    envelope_b64: crate::aethos_core::protocol::build_envelope_payload_b64(
+                        &item(0x42),
+                        &vec![0x61; fixture_item.size_bytes.max(1) as usize],
+                        &[9u8; 32],
+                    )
+                    .expect("build payload"),
+                    expiry_unix_ms: fixture_item.expiry_at_unix_ms,
+                    hop_count: fixture_item.known_replica_count.unwrap_or(0).max(0) as u16,
+                    recorded_at_unix_ms: fixture.now_unix_ms.saturating_sub(1_000),
+                })
+                .collect::<Vec<_>>();
+
+            let legacy = transfer_legacy_debug::build_legacy_transfer_plan(
+                &candidates,
+                fixture.budget_profile.max_items.max(0) as u32,
+                fixture.budget_profile.max_bytes.max(0) as u64,
+            )
+            .expect("legacy plan");
+
+            let mut profiles = Vec::new();
+            let mut scheduler_items = Vec::new();
+            for candidate in &candidates {
+                let (profile, scheduler_item) =
+                    shadow_profile_from_stored(candidate, fixture.now_unix_ms, None)
+                        .expect("shadow profile");
+                profiles.push(profile);
+                scheduler_items.push(scheduler_item);
+            }
+
+            let scheduler_budget = SchedulerBudgetProfile {
+                max_items: fixture.budget_profile.max_items.max(0),
+                max_bytes: fixture.budget_profile.max_bytes.max(0),
+                max_duration_ms: None,
+                durable_cargo_ratio_cap: None,
+                preferred_transfer_unit_bytes: 32_768,
+                expiry_urgency_horizon_ms: 900_000,
+                stagnation_horizon_ms: 3_600_000,
+                target_replica_count_default: 6,
+            };
+            let scheduler_result = EncounterSchedulerV1::new()
+                .schedule(
+                    EncounterClass::Short,
+                    &scheduler_budget,
+                    fixture.now_unix_ms,
+                    &scheduler_items,
+                )
+                .expect("scheduler result");
+
+            let telemetry = transfer_legacy_debug::build_shadow_comparison_telemetry(
+                &profiles,
+                &legacy,
+                &scheduler_result,
+                5,
+            );
+            assert!(!telemetry.old_top_n.is_empty() || !telemetry.new_top_n.is_empty());
+            assert_eq!(
+                telemetry.old_top_n.len(),
+                std::cmp::min(5, legacy.ranking_order.len())
+            );
+        }
+    }
+
+    #[test]
+    fn shadow_comparison_detects_changed_first_item_and_stop_reason() {
+        let now_ms = 1_760_000_000_000u64;
+        let direct_peer = item(0x99);
+        let far_peer = item(0x66);
+        let small_transit_payload = crate::aethos_core::protocol::build_envelope_payload_b64(
+            &far_peer, b"tiny", &[1u8; 32],
+        )
+        .expect("build small payload");
+        let direct_tiny_payload = crate::aethos_core::protocol::build_envelope_payload_b64(
+            &direct_peer,
+            &vec![0x62; 1000],
+            &[2u8; 32],
+        )
+        .expect("build direct tiny payload");
+
+        let transit_bytes_len = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&small_transit_payload)
+            .expect("decode transit payload")
+            .len() as u64;
+        let direct_bytes_len = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&direct_tiny_payload)
+            .expect("decode direct payload")
+            .len() as u64;
+        let max_bytes = direct_bytes_len.saturating_add(1);
+        assert!(transit_bytes_len.saturating_add(direct_bytes_len) > max_bytes);
+
+        let candidates = vec![
+            StoredItemRecord {
+                item_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1"
+                    .to_string(),
+                envelope_b64: small_transit_payload,
+                expiry_unix_ms: now_ms + 120_000,
+                hop_count: 0,
+                recorded_at_unix_ms: now_ms - 10_000,
+            },
+            StoredItemRecord {
+                item_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb1"
+                    .to_string(),
+                envelope_b64: direct_tiny_payload,
+                expiry_unix_ms: now_ms + 60_000,
+                hop_count: 0,
+                recorded_at_unix_ms: now_ms - 20_000,
+            },
+        ];
+
+        let legacy = transfer_legacy_debug::build_legacy_transfer_plan(&candidates, 2, max_bytes)
+            .expect("legacy plan");
+        let mut profiles = Vec::new();
+        let mut scheduler_items = Vec::new();
+        for candidate in &candidates {
+            let (profile, scheduler_item) =
+                shadow_profile_from_stored(candidate, now_ms, Some(&direct_peer))
+                    .expect("shadow profile");
+            profiles.push(profile);
+            scheduler_items.push(scheduler_item);
+        }
+
+        let scheduler_result = EncounterSchedulerV1::new()
+            .schedule(
+                EncounterClass::Short,
+                &SchedulerBudgetProfile {
+                    max_items: 2,
+                    max_bytes: max_bytes as i32,
+                    max_duration_ms: None,
+                    durable_cargo_ratio_cap: None,
+                    preferred_transfer_unit_bytes: 32_768,
+                    expiry_urgency_horizon_ms: 900_000,
+                    stagnation_horizon_ms: 3_600_000,
+                    target_replica_count_default: 6,
+                },
+                now_ms,
+                &scheduler_items,
+            )
+            .expect("scheduler result");
+
+        let telemetry = transfer_legacy_debug::build_shadow_comparison_telemetry(
+            &profiles,
+            &legacy,
+            &scheduler_result,
+            5,
+        );
+        assert!(telemetry.changed_first_selected_item);
+        assert!(telemetry.changed_stop_reason || telemetry.old_top_n != telemetry.new_top_n);
     }
 }

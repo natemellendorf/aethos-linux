@@ -1,0 +1,349 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aethos.dev/fixtures/routing/encounter-ranking/v1/schema.json",
+  "title": "Aethos Encounter Ranking Fixture Schema v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "fixtureID",
+    "encounterClass",
+    "nowUnixMs",
+    "budgetProfile",
+    "cargoItems",
+    "expected"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "encounter-ranking.v1"
+    },
+    "fixtureID": {
+      "type": "string",
+      "minLength": 1
+    },
+    "description": {
+      "type": "string"
+    },
+    "encounterClass": {
+      "$ref": "#/$defs/encounterClass"
+    },
+    "nowUnixMs": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "budgetProfile": {
+      "$ref": "#/$defs/budgetProfile"
+    },
+    "cargoItems": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "description": "Harness MUST enforce uniqueness of cargo itemID values; uniqueItems only catches fully identical objects.",
+      "items": {
+        "$ref": "#/$defs/cargoItem"
+      }
+    },
+    "expected": {
+      "$ref": "#/$defs/expected"
+    }
+  },
+  "$defs": {
+    "encounterClass": {
+      "type": "string",
+      "enum": [
+        "blink",
+        "short",
+        "durable"
+      ]
+    },
+    "proximityClass": {
+      "type": "string",
+      "enum": [
+        "destination-peer",
+        "likely-closer",
+        "other"
+      ]
+    },
+    "budgetProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "maxItems",
+        "maxBytes"
+      ],
+      "properties": {
+        "maxItems": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "maxBytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "maxDurationMs": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "durableCargoRatioCap": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "preferredTransferUnitBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 32768
+        },
+        "expiryUrgencyHorizonMs": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 900000
+        },
+        "stagnationHorizonMs": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 3600000
+        },
+        "targetReplicaCountDefault": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 6
+        }
+      }
+    },
+    "cargoItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "itemID",
+        "tier",
+        "sizeBytes",
+        "expiryAtUnixMs",
+        "destinationRank"
+      ],
+      "properties": {
+        "itemID": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "tier": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 5
+        },
+        "sizeBytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "expiryAtUnixMs": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "knownReplicaCount": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0
+        },
+        "targetReplicaCount": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 6
+        },
+        "durablyStored": {
+          "type": "boolean",
+          "default": false
+        },
+        "relayIngested": {
+          "type": "boolean",
+          "default": false
+        },
+        "receiptCoverage": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0
+        },
+        "lastForwardedAtUnixMs": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615,
+          "default": 0
+        },
+        "proximityClass": {
+          "$ref": "#/$defs/proximityClass",
+          "default": "other"
+        },
+        "explicitUserInitiated": {
+          "type": "boolean",
+          "default": false
+        },
+        "contentClassScore": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0
+        },
+        "destinationRank": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "scoreBreakdown": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "itemID",
+        "components",
+        "scoreNumerator",
+        "score"
+      ],
+      "properties": {
+        "itemID": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "components": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "scarcity",
+            "safety",
+            "expiry",
+            "stagnation",
+            "proximity",
+            "size",
+            "intent",
+            "contentClass"
+          ],
+          "properties": {
+            "scarcity": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "multipleOf": 0.000001
+            },
+            "safety": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "multipleOf": 0.000001
+            },
+            "expiry": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "multipleOf": 0.000001
+            },
+            "stagnation": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "multipleOf": 0.000001
+            },
+            "proximity": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "multipleOf": 0.000001
+            },
+            "size": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "multipleOf": 0.000001
+            },
+            "intent": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "multipleOf": 0.000001
+            },
+            "contentClass": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "multipleOf": 0.000001
+            }
+          }
+        },
+        "scoreNumerator": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100000000
+        },
+        "score": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "multipleOf": 0.00000001
+        }
+      }
+    },
+    "stopReason": {
+      "type": "string",
+      "enum": [
+        "completed",
+        "budget-items-exhausted",
+        "budget-bytes-exhausted",
+        "encounter-time-exhausted",
+        "durable-ratio-cap-reached",
+        "no-eligible-items"
+      ]
+    },
+    "tieBreakReason": {
+      "type": "string",
+      "enum": [
+        "none",
+        "sizeBytes",
+        "expiryAtUnixMs",
+        "knownReplicaCount",
+        "lastForwardedAtUnixMs",
+        "destinationRank",
+        "itemID"
+      ]
+    },
+    "expected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rankingOrder",
+        "selectedPrefix",
+        "scoreBreakdowns",
+        "stopReason"
+      ],
+      "properties": {
+        "rankingOrder": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "uniqueItems": true
+        },
+        "selectedPrefix": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "uniqueItems": true
+        },
+        "scoreBreakdowns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/scoreBreakdown"
+          }
+        },
+        "stopReason": {
+          "$ref": "#/$defs/stopReason"
+        },
+        "tieBreakReason": {
+          "$ref": "#/$defs/tieBreakReason"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,113 @@
+{
+  "schemaVersion": "encounter-ranking.v1",
+  "fixtureID": "short-drain-messages-before-attachments",
+  "description": "Short lane golden fixture: high-value messages drain before larger attachments under byte-constrained budgets.",
+  "encounterClass": "short",
+  "nowUnixMs": 1760000000000,
+  "budgetProfile": {
+    "maxItems": 4,
+    "maxBytes": 13000,
+    "preferredTransferUnitBytes": 32768,
+    "expiryUrgencyHorizonMs": 900000,
+    "stagnationHorizonMs": 3600000
+  },
+  "cargoItems": [
+    {
+      "itemID": "0000000000000000000000000000000000000000000000000000000000000201",
+      "tier": 1,
+      "sizeBytes": 512,
+      "expiryAtUnixMs": 1760000090000,
+      "knownReplicaCount": 0,
+      "receiptCoverage": 0,
+      "lastForwardedAtUnixMs": 1759998200000,
+      "proximityClass": "destination-peer",
+      "explicitUserInitiated": true,
+      "contentClassScore": 0.9,
+      "destinationRank": 9
+    },
+    {
+      "itemID": "0000000000000000000000000000000000000000000000000000000000000202",
+      "tier": 4,
+      "sizeBytes": 2048,
+      "expiryAtUnixMs": 1760001800000,
+      "knownReplicaCount": 2,
+      "receiptCoverage": 0.7,
+      "lastForwardedAtUnixMs": 1759997600000,
+      "proximityClass": "likely-closer",
+      "contentClassScore": 0.6,
+      "destinationRank": 6
+    },
+    {
+      "itemID": "0000000000000000000000000000000000000000000000000000000000000203",
+      "tier": 4,
+      "sizeBytes": 12000,
+      "expiryAtUnixMs": 1760001800000,
+      "knownReplicaCount": 1,
+      "receiptCoverage": 0.6,
+      "lastForwardedAtUnixMs": 1759999000000,
+      "proximityClass": "other",
+      "contentClassScore": 0.4,
+      "destinationRank": 5
+    }
+  ],
+  "expected": {
+    "rankingOrder": [
+      "0000000000000000000000000000000000000000000000000000000000000201",
+      "0000000000000000000000000000000000000000000000000000000000000202",
+      "0000000000000000000000000000000000000000000000000000000000000203"
+    ],
+    "selectedPrefix": [
+      "0000000000000000000000000000000000000000000000000000000000000201",
+      "0000000000000000000000000000000000000000000000000000000000000202"
+    ],
+    "scoreBreakdowns": [
+      {
+        "itemID": "0000000000000000000000000000000000000000000000000000000000000201",
+        "components": {
+          "scarcity": 1,
+          "safety": 1,
+          "expiry": 0.9,
+          "stagnation": 0.5,
+          "proximity": 1,
+          "size": 0.399814,
+          "intent": 1,
+          "contentClass": 0.9
+        },
+        "scoreNumerator": 87398512,
+        "score": 0.87398512
+      },
+      {
+        "itemID": "0000000000000000000000000000000000000000000000000000000000000202",
+        "components": {
+          "scarcity": 0.666667,
+          "safety": 0.86,
+          "expiry": 0,
+          "stagnation": 0.666667,
+          "proximity": 0.6,
+          "size": 0.266622,
+          "intent": 0,
+          "contentClass": 0.6
+        },
+        "scoreNumerator": 53586322,
+        "score": 0.53586322
+      },
+      {
+        "itemID": "0000000000000000000000000000000000000000000000000000000000000203",
+        "components": {
+          "scarcity": 0.833333,
+          "safety": 0.88,
+          "expiry": 0,
+          "stagnation": 0.277778,
+          "proximity": 0,
+          "size": 0.096612,
+          "intent": 0,
+          "contentClass": 0.4
+        },
+        "scoreNumerator": 45932890,
+        "score": 0.4593289
+      }
+    ],
+    "stopReason": "budget-bytes-exhausted",
+    "tieBreakReason": "none"
+  }
+}

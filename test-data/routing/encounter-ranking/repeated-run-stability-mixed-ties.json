@@ -1,0 +1,142 @@
+{
+  "schemaVersion": "encounter-ranking.v1",
+  "fixtureID": "repeated-run-stability-mixed-ties",
+  "description": "Repeated-run stability lane: deterministic ranking with mixed tiers and exact same-tier ties must produce byte-for-byte stable outputs across repeated runs.",
+  "encounterClass": "durable",
+  "nowUnixMs": 1760000000000,
+  "budgetProfile": {
+    "maxItems": 4,
+    "maxBytes": 20000,
+    "preferredTransferUnitBytes": 32768,
+    "expiryUrgencyHorizonMs": 900000,
+    "stagnationHorizonMs": 3600000
+  },
+  "cargoItems": [
+    {
+      "itemID": "f111111111111111111111111111111111111111111111111111111111111111",
+      "tier": 3,
+      "sizeBytes": 1024,
+      "expiryAtUnixMs": 1760000500000,
+      "knownReplicaCount": 2,
+      "receiptCoverage": 0.4,
+      "lastForwardedAtUnixMs": 1759999100000,
+      "proximityClass": "likely-closer",
+      "contentClassScore": 0.5,
+      "destinationRank": 4
+    },
+    {
+      "itemID": "e222222222222222222222222222222222222222222222222222222222222222",
+      "tier": 3,
+      "sizeBytes": 1024,
+      "expiryAtUnixMs": 1760000500000,
+      "knownReplicaCount": 2,
+      "receiptCoverage": 0.4,
+      "lastForwardedAtUnixMs": 1759999100000,
+      "proximityClass": "likely-closer",
+      "contentClassScore": 0.5,
+      "destinationRank": 4
+    },
+    {
+      "itemID": "0000000000000000000000000000000000000000000000000000000000000803",
+      "tier": 1,
+      "sizeBytes": 640,
+      "expiryAtUnixMs": 1760000250000,
+      "knownReplicaCount": 1,
+      "receiptCoverage": 0.1,
+      "lastForwardedAtUnixMs": 1759998200000,
+      "proximityClass": "destination-peer",
+      "contentClassScore": 0.8,
+      "destinationRank": 9
+    },
+    {
+      "itemID": "0000000000000000000000000000000000000000000000000000000000000804",
+      "tier": 5,
+      "sizeBytes": 8192,
+      "expiryAtUnixMs": 1760004000000,
+      "knownReplicaCount": 0,
+      "receiptCoverage": 0.2,
+      "lastForwardedAtUnixMs": 1759999000000,
+      "proximityClass": "other",
+      "contentClassScore": 0.2,
+      "destinationRank": 1
+    }
+  ],
+  "expected": {
+    "rankingOrder": [
+      "0000000000000000000000000000000000000000000000000000000000000803",
+      "f111111111111111111111111111111111111111111111111111111111111111",
+      "e222222222222222222222222222222222222222222222222222222222222222",
+      "0000000000000000000000000000000000000000000000000000000000000804"
+    ],
+    "selectedPrefix": [
+      "0000000000000000000000000000000000000000000000000000000000000803",
+      "f111111111111111111111111111111111111111111111111111111111111111",
+      "e222222222222222222222222222222222222222222222222222222222222222",
+      "0000000000000000000000000000000000000000000000000000000000000804"
+    ],
+    "scoreBreakdowns": [
+      {
+        "itemID": "0000000000000000000000000000000000000000000000000000000000000803",
+        "components": {
+          "scarcity": 0.833333,
+          "safety": 0.98,
+          "expiry": 0.722222,
+          "stagnation": 0.5,
+          "proximity": 1,
+          "size": 0.37839,
+          "intent": 0,
+          "contentClass": 0.8
+        },
+        "scoreNumerator": 75409330,
+        "score": 0.7540933
+      },
+      {
+        "itemID": "f111111111111111111111111111111111111111111111111111111111111111",
+        "components": {
+          "scarcity": 0.666667,
+          "safety": 0.92,
+          "expiry": 0.444444,
+          "stagnation": 0.25,
+          "proximity": 0.6,
+          "size": 0.333241,
+          "intent": 0,
+          "contentClass": 0.5
+        },
+        "scoreNumerator": 57350374,
+        "score": 0.57350374
+      },
+      {
+        "itemID": "e222222222222222222222222222222222222222222222222222222222222222",
+        "components": {
+          "scarcity": 0.666667,
+          "safety": 0.92,
+          "expiry": 0.444444,
+          "stagnation": 0.25,
+          "proximity": 0.6,
+          "size": 0.333241,
+          "intent": 0,
+          "contentClass": 0.5
+        },
+        "scoreNumerator": 57350374,
+        "score": 0.57350374
+      },
+      {
+        "itemID": "0000000000000000000000000000000000000000000000000000000000000804",
+        "components": {
+          "scarcity": 1,
+          "safety": 0.96,
+          "expiry": 0,
+          "stagnation": 0.277778,
+          "proximity": 0,
+          "size": 0.133324,
+          "intent": 0,
+          "contentClass": 0.2
+        },
+        "scoreNumerator": 51919928,
+        "score": 0.51919928
+      }
+    ],
+    "stopReason": "completed",
+    "tieBreakReason": "itemID"
+  }
+}

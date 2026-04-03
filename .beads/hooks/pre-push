@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+remote_name="${1:-}"
+
+if [[ "${remote_name}" != "origin" ]]; then
+  exit 0
+fi
+
+should_create_prerelease="0"
+
+# Explicit opt-in via environment variable:
+#   AETHOS_CREATE_PRERELEASE=1 git push origin main
+if [[ "${AETHOS_CREATE_PRERELEASE:-0}" == "1" ]]; then
+  should_create_prerelease="1"
+fi
+
+# Explicit opt-in via push option:
+#   git push -o prerelease origin main
+push_option_count="${GIT_PUSH_OPTION_COUNT:-0}"
+if [[ "${push_option_count}" =~ ^[0-9]+$ ]] && [[ "${push_option_count}" -gt 0 ]]; then
+  for ((i = 0; i < push_option_count; i++)); do
+    option_var="GIT_PUSH_OPTION_${i}"
+    option_value="${!option_var:-}"
+    if [[ "${option_value}" == "prerelease" ]]; then
+      should_create_prerelease="1"
+      break
+    fi
+  done
+fi
+
+ROOT_DIR="$(git rev-parse --show-toplevel)"
+release_script="${ROOT_DIR}/scripts/release/create-prerelease.sh"
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  if [[ "${local_ref}" == "refs/heads/main" && "${remote_ref}" == "refs/heads/main" ]]; then
+    if [[ "${local_sha}" == "0000000000000000000000000000000000000000" ]]; then
+      continue
+    fi
+    if [[ "${should_create_prerelease}" == "1" ]]; then
+      printf '[git-hook:pre-push] push to origin/main detected with prerelease request\n'
+      bash "${release_script}"
+    else
+      printf '[git-hook:pre-push] push to origin/main detected (prerelease skipped; opt-in required)\n'
+    fi
+    break
+  fi
+done
+
+# --- BEGIN BEADS INTEGRATION v1.0.0 ---
+# This section is managed by beads. Do not remove these markers.
+if command -v bd >/dev/null 2>&1; then
+  export BD_GIT_HOOK=1
+  _bd_timeout=${BEADS_HOOK_TIMEOUT:-300}
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$_bd_timeout" bd hooks run pre-push "$@"
+    _bd_exit=$?
+    if [ $_bd_exit -eq 124 ]; then
+      echo >&2 "beads: hook 'pre-push' timed out after ${_bd_timeout}s — continuing without beads"
+      _bd_exit=0
+    fi
+  else
+    bd hooks run pre-push "$@"
+    _bd_exit=$?
+  fi
+  if [ $_bd_exit -eq 3 ]; then
+    echo >&2 "beads: database not initialized — skipping hook 'pre-push'"
+    _bd_exit=0
+  fi
+  if [ $_bd_exit -ne 0 ]; then exit $_bd_exit; fi
+fi
+# --- END BEADS INTEGRATION v1.0.0 ---

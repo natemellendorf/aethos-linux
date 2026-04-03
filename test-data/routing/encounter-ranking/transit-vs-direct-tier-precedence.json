@@ -1,0 +1,84 @@
+{
+  "schemaVersion": "encounter-ranking.v1",
+  "fixtureID": "transit-vs-direct-tier-precedence",
+  "description": "Transit-vs-direct lane: low-replication transit in tier 2 outranks direct-only metadata in tier 3, proving hard tier precedence cannot be bypassed by score.",
+  "encounterClass": "short",
+  "nowUnixMs": 1760000000000,
+  "budgetProfile": {
+    "maxItems": 2,
+    "maxBytes": 6000,
+    "preferredTransferUnitBytes": 32768,
+    "expiryUrgencyHorizonMs": 900000,
+    "stagnationHorizonMs": 3600000
+  },
+  "cargoItems": [
+    {
+      "itemID": "0000000000000000000000000000000000000000000000000000000000000501",
+      "tier": 2,
+      "sizeBytes": 768,
+      "expiryAtUnixMs": 1760000700000,
+      "knownReplicaCount": 0,
+      "receiptCoverage": 0.2,
+      "lastForwardedAtUnixMs": 1759997500000,
+      "proximityClass": "likely-closer",
+      "contentClassScore": 0.4,
+      "destinationRank": 3
+    },
+    {
+      "itemID": "0000000000000000000000000000000000000000000000000000000000000502",
+      "tier": 3,
+      "sizeBytes": 512,
+      "expiryAtUnixMs": 1760000200000,
+      "knownReplicaCount": 4,
+      "receiptCoverage": 0.9,
+      "lastForwardedAtUnixMs": 1759999700000,
+      "proximityClass": "destination-peer",
+      "contentClassScore": 0.9,
+      "destinationRank": 9
+    }
+  ],
+  "expected": {
+    "rankingOrder": [
+      "0000000000000000000000000000000000000000000000000000000000000501",
+      "0000000000000000000000000000000000000000000000000000000000000502"
+    ],
+    "selectedPrefix": [
+      "0000000000000000000000000000000000000000000000000000000000000501",
+      "0000000000000000000000000000000000000000000000000000000000000502"
+    ],
+    "scoreBreakdowns": [
+      {
+        "itemID": "0000000000000000000000000000000000000000000000000000000000000501",
+        "components": {
+          "scarcity": 1,
+          "safety": 0.96,
+          "expiry": 0.222222,
+          "stagnation": 0.694444,
+          "proximity": 0.6,
+          "size": 0.360879,
+          "intent": 0,
+          "contentClass": 0.4
+        },
+        "scoreNumerator": 68695912,
+        "score": 0.68695912
+      },
+      {
+        "itemID": "0000000000000000000000000000000000000000000000000000000000000502",
+        "components": {
+          "scarcity": 0.333333,
+          "safety": 0.82,
+          "expiry": 0.777778,
+          "stagnation": 0.083333,
+          "proximity": 1,
+          "size": 0.399814,
+          "intent": 0,
+          "contentClass": 0.9
+        },
+        "scoreNumerator": 55149614,
+        "score": 0.55149614
+      }
+    ],
+    "stopReason": "completed",
+    "tieBreakReason": "none"
+  }
+}

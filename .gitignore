@@ -5,3 +5,8 @@ spikes/tauri-desktop/e2e/workdir/
 spikes/tauri-desktop/e2e/artifacts/
 tests/e2e-harness/artifacts/
 tests/artifacts/relay-smoke/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key

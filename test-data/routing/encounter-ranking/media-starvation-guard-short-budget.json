@@ -1,0 +1,112 @@
+{
+  "schemaVersion": "encounter-ranking.v1",
+  "fixtureID": "media-starvation-guard-short-budget",
+  "description": "Media-starvation-guard lane: short encounter budget defers large media even when ranked, preserving control and metadata transfer first.",
+  "encounterClass": "short",
+  "nowUnixMs": 1760000000000,
+  "budgetProfile": {
+    "maxItems": 5,
+    "maxBytes": 9000,
+    "preferredTransferUnitBytes": 32768,
+    "expiryUrgencyHorizonMs": 900000,
+    "stagnationHorizonMs": 3600000
+  },
+  "cargoItems": [
+    {
+      "itemID": "0000000000000000000000000000000000000000000000000000000000000601",
+      "tier": 0,
+      "sizeBytes": 256,
+      "expiryAtUnixMs": 1760000180000,
+      "knownReplicaCount": 0,
+      "receiptCoverage": 0,
+      "lastForwardedAtUnixMs": 1759999700000,
+      "proximityClass": "destination-peer",
+      "contentClassScore": 0.2,
+      "destinationRank": 10
+    },
+    {
+      "itemID": "0000000000000000000000000000000000000000000000000000000000000602",
+      "tier": 3,
+      "sizeBytes": 1024,
+      "expiryAtUnixMs": 1760000800000,
+      "knownReplicaCount": 1,
+      "receiptCoverage": 0.4,
+      "lastForwardedAtUnixMs": 1759998000000,
+      "proximityClass": "destination-peer",
+      "contentClassScore": 0.7,
+      "destinationRank": 8
+    },
+    {
+      "itemID": "0000000000000000000000000000000000000000000000000000000000000603",
+      "tier": 5,
+      "sizeBytes": 16384,
+      "expiryAtUnixMs": 1760007200000,
+      "knownReplicaCount": 0,
+      "receiptCoverage": 0.2,
+      "lastForwardedAtUnixMs": 1759999900000,
+      "proximityClass": "other",
+      "contentClassScore": 0.3,
+      "destinationRank": 1
+    }
+  ],
+  "expected": {
+    "rankingOrder": [
+      "0000000000000000000000000000000000000000000000000000000000000601",
+      "0000000000000000000000000000000000000000000000000000000000000602",
+      "0000000000000000000000000000000000000000000000000000000000000603"
+    ],
+    "selectedPrefix": [
+      "0000000000000000000000000000000000000000000000000000000000000601",
+      "0000000000000000000000000000000000000000000000000000000000000602"
+    ],
+    "scoreBreakdowns": [
+      {
+        "itemID": "0000000000000000000000000000000000000000000000000000000000000601",
+        "components": {
+          "scarcity": 1,
+          "safety": 1,
+          "expiry": 0.8,
+          "stagnation": 0.083333,
+          "proximity": 1,
+          "size": 0.466293,
+          "intent": 0,
+          "contentClass": 0.2
+        },
+        "scoreNumerator": 75930340,
+        "score": 0.7593034
+      },
+      {
+        "itemID": "0000000000000000000000000000000000000000000000000000000000000602",
+        "components": {
+          "scarcity": 0.833333,
+          "safety": 0.92,
+          "expiry": 0.111111,
+          "stagnation": 0.555556,
+          "proximity": 1,
+          "size": 0.333241,
+          "intent": 0,
+          "contentClass": 0.7
+        },
+        "scoreNumerator": 64417034,
+        "score": 0.64417034
+      },
+      {
+        "itemID": "0000000000000000000000000000000000000000000000000000000000000603",
+        "components": {
+          "scarcity": 1,
+          "safety": 0.96,
+          "expiry": 0,
+          "stagnation": 0.027778,
+          "proximity": 0,
+          "size": 0.066664,
+          "intent": 0,
+          "contentClass": 0.3
+        },
+        "scoreNumerator": 48586648,
+        "score": 0.48586648
+      }
+    ],
+    "stopReason": "budget-bytes-exhausted",
+    "tieBreakReason": "none"
+  }
+}

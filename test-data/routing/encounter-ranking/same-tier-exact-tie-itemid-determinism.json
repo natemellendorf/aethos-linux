@@ -1,0 +1,84 @@
+{
+  "schemaVersion": "encounter-ranking.v1",
+  "fixtureID": "same-tier-exact-tie-itemid-determinism",
+  "description": "Same-tier exact tie lane: all score and tie fields match until final itemID comparator, forcing deterministic descending-hex ordering.",
+  "encounterClass": "short",
+  "nowUnixMs": 1760000000000,
+  "budgetProfile": {
+    "maxItems": 2,
+    "maxBytes": 6000,
+    "preferredTransferUnitBytes": 32768,
+    "expiryUrgencyHorizonMs": 900000,
+    "stagnationHorizonMs": 3600000
+  },
+  "cargoItems": [
+    {
+      "itemID": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1",
+      "tier": 4,
+      "sizeBytes": 2048,
+      "expiryAtUnixMs": 1760000600000,
+      "knownReplicaCount": 2,
+      "receiptCoverage": 0.5,
+      "lastForwardedAtUnixMs": 1759998800000,
+      "proximityClass": "likely-closer",
+      "contentClassScore": 0.5,
+      "destinationRank": 7
+    },
+    {
+      "itemID": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2",
+      "tier": 4,
+      "sizeBytes": 2048,
+      "expiryAtUnixMs": 1760000600000,
+      "knownReplicaCount": 2,
+      "receiptCoverage": 0.5,
+      "lastForwardedAtUnixMs": 1759998800000,
+      "proximityClass": "likely-closer",
+      "contentClassScore": 0.5,
+      "destinationRank": 7
+    }
+  ],
+  "expected": {
+    "rankingOrder": [
+      "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2",
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1"
+    ],
+    "selectedPrefix": [
+      "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2",
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1"
+    ],
+    "scoreBreakdowns": [
+      {
+        "itemID": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2",
+        "components": {
+          "scarcity": 0.666667,
+          "safety": 0.9,
+          "expiry": 0.333333,
+          "stagnation": 0.333333,
+          "proximity": 0.6,
+          "size": 0.266622,
+          "intent": 0,
+          "contentClass": 0.5
+        },
+        "scoreNumerator": 55599642,
+        "score": 0.55599642
+      },
+      {
+        "itemID": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1",
+        "components": {
+          "scarcity": 0.666667,
+          "safety": 0.9,
+          "expiry": 0.333333,
+          "stagnation": 0.333333,
+          "proximity": 0.6,
+          "size": 0.266622,
+          "intent": 0,
+          "contentClass": 0.5
+        },
+        "scoreNumerator": 55599642,
+        "score": 0.55599642
+      }
+    ],
+    "stopReason": "completed",
+    "tieBreakReason": "itemID"
+  }
+}

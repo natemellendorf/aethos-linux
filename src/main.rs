@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::aethos_core::encounter_orchestration::canonical_audit_points;
 use crate::aethos_core::gossip_sync::{
     build_hello_frame as build_gossip_hello_frame,
     build_request_frame as build_gossip_request_frame,
@@ -241,6 +242,7 @@ fn build_ui(app: &Application) {
 
     let initial_settings = load_app_settings().unwrap_or_default();
     set_verbose_logging_enabled(initial_settings.verbose_logging_enabled);
+    log_encounter_audit_catalog();
     shared_log_info(&format!(
         "app_start verbose_logging_enabled={} ttl_seconds={}",
         initial_settings.verbose_logging_enabled, initial_settings.message_ttl_seconds
@@ -2464,6 +2466,15 @@ fn build_ui(app: &Application) {
     force_initial_thread_bottom(messages_scroll, Rc::clone(&auto_scroll_locked));
 }
 
+fn log_encounter_audit_catalog() {
+    for point in canonical_audit_points() {
+        shared_log_verbose(&format!(
+            "encounter_audit_catalog_entry stage={} module_path={} function_name={}",
+            point.stage, point.module_path, point.function_name
+        ));
+    }
+}
+
 fn spawn_relay_checks(
     relay_http_endpoints: Vec<String>,
     identity: crate::aethos_core::identity_store::LocalIdentitySummary,
@@ -3188,6 +3199,14 @@ fn start_background_gossip_sync(
 
                     match frame {
                         GossipSyncFrame::Hello(hello) if hello.node_id != local_wayfarer => {
+                            shared_log_verbose(&format!(
+                                "encounter_discovery_observed encounter_id=lan-{}-{} peer_wayfarer_id={} bearer_role=discovery-bootstrap bearer_adapter=lan-datagram source_addr={} at_unix_ms={}",
+                                local_wayfarer,
+                                hello.node_id,
+                                hello.node_id,
+                                source,
+                                now_unix_ms()
+                            ));
                             peer_node_by_addr.insert(source_key.clone(), hello.node_id.clone());
                             peer_node_by_addr.insert(source_ip_key, hello.node_id);
                             if let Ok(summary) = build_gossip_summary_frame(now_unix_ms()) {

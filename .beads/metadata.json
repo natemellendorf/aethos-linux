@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "aethos_client",
+  "project_id": "ee1ca0fb-6fd6-44bc-bceb-c1aad068cf16"
+}

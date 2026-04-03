@@ -11,11 +11,15 @@ use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{connect, Message};
 use url::Url;
 
+use crate::aethos_core::encounter_orchestration::{
+    BearerAdapter, EncounterManager, TransitionReason,
+};
 use crate::aethos_core::gossip_sync::{
     build_hello_frame, build_relay_ingest_frame, build_request_frame, build_summary_frame,
     import_transfer_items, missing_item_ids, parse_frame,
     select_request_item_ids_from_summary_with_candidates, serialize_frame,
-    transfer_items_for_request, GossipSyncFrame, HelloFrame, RelayIngestFrame,
+    transfer_items_for_request_with_shadow_context_and_diagnostics, GossipSyncFrame, HelloFrame,
+    RelayIngestFrame,
 };
 use crate::aethos_core::identity_store::LocalIdentitySummary;
 use crate::aethos_core::logging::log_verbose;
@@ -564,6 +568,24 @@ fn run_relay_round_on_socket(
     encounter_window: Duration,
     send_initial_inventory: bool,
 ) -> Result<EncounterReport, String> {
+    let mut encounter_manager = EncounterManager::new(
+        format!("relay-{}-{}", relay_ws, peer_hello.node_id),
+        identity.wayfarer_id.clone(),
+        Some(peer_hello.node_id.clone()),
+    );
+    let now_ms = now_unix_ms();
+    encounter_manager.observe_discovery(BearerAdapter::RelayWebSocket, now_ms);
+    encounter_manager.start_control_exchange(
+        BearerAdapter::RelayWebSocket,
+        TransitionReason::InitialSelection,
+        now_ms,
+    );
+    encounter_manager.set_transfer_bearer(
+        BearerAdapter::RelayWebSocket,
+        TransitionReason::InitialSelection,
+        now_ms,
+    );
+
     if send_initial_inventory {
         log_verbose(&format!(
             "relay_encounter_post_hello_send_summary: relay_ws={}",
@@ -614,6 +636,8 @@ fn run_relay_round_on_socket(
             Err(err) => {
                 if is_nonfatal_remote_close(&err) {
                     remote_closed = true;
+                    encounter_manager
+                        .mark_interrupted(TransitionReason::RemoteClose, now_unix_ms());
                     log_verbose(&format!(
                         "relay_encounter_loop_remote_close: relay_ws={} elapsed_ms={} recv_frames={} error={}",
                         relay_ws,
@@ -746,12 +770,29 @@ fn run_relay_round_on_socket(
                     relay_ws,
                     request.want.len()
                 ));
-                let objects = transfer_items_for_request(
+                let selection = transfer_items_for_request_with_shadow_context_and_diagnostics(
                     &request.want,
                     peer_hello.max_transfer as u32,
                     crate::aethos_core::gossip_sync::MAX_TRANSFER_BYTES,
                     now_unix_ms(),
+                    Some(&peer_hello.node_id),
                 )?;
+                log_verbose(&format!(
+                    "encounter_scheduler_plan_detail relay_ws={} planner={} consumed_bytes={} ranking_top={} selected_top={}",
+                    relay_ws,
+                    selection.telemetry.planner,
+                    selection.telemetry.consumed_bytes,
+                    selection.telemetry.ranking_top.len(),
+                    selection.telemetry.selected_top.len(),
+                ));
+                encounter_manager.record_scheduler_plan(
+                    &format!("relay-{}-{}", relay_ws, recv_frame_count),
+                    selection.telemetry.selected_items,
+                    &selection.telemetry.stop_reason,
+                    &selection.telemetry.tie_break_reason,
+                    now_unix_ms(),
+                );
+                let objects = selection.objects;
                 let trace_sent_in_transfer = trace_item_id.map(|item_id| {
                     objects
                         .iter()
@@ -765,6 +806,11 @@ fn run_relay_round_on_socket(
                         objects,
                     }),
                 )?;
+                encounter_manager.record_scheduler_execution(
+                    &format!("relay-{}-{}", relay_ws, recv_frame_count),
+                    transferred_items,
+                    now_unix_ms(),
+                );
                 if let Some(trace_item_id) = trace_item_id {
                     log_verbose(&format!(
                         "relay_trace_transfer_contains_item: relay_ws={} item_id={} sent_in_transfer={}",
@@ -847,9 +893,16 @@ fn run_relay_round_on_socket(
 
         if made_progress {
             no_progress_streak = 0;
+            encounter_manager.mark_resumed(now_unix_ms());
         } else {
             no_progress_streak = no_progress_streak.saturating_add(1);
             if should_stop_for_no_progress(no_progress_streak) {
+                encounter_manager.mark_interrupted(TransitionReason::NoProgress, now_unix_ms());
+                encounter_manager.downgrade_transfer_bearer(
+                    BearerAdapter::RelayWebSocket,
+                    TransitionReason::NoProgress,
+                    now_unix_ms(),
+                );
                 log_verbose(&format!(
                     "relay_encounter_converged: relay_ws={} reason=no_progress_streak rounds={} recv_frames={}",
                     relay_ws, no_progress_streak, recv_frame_count
@@ -858,6 +911,9 @@ fn run_relay_round_on_socket(
             }
         }
     }
+
+    encounter_manager.mark_transfer_completed(transferred_items, now_unix_ms());
+    encounter_manager.close(now_unix_ms());
 
     log_verbose(&format!(
         "relay_encounter_done: relay_ws={} transferred_items={} pulled_messages={} recv_frames={} saw_summary={} saw_request={} saw_transfer={} saw_relay_ingest={} saw_receipt={} elapsed_ms={}",
