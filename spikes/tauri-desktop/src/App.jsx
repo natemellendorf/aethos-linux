@@ -317,7 +317,7 @@ export default function App() {
   const [networkPulseTs, setNetworkPulseTs] = useState(0);
   const [logTail, setLogTail] = useState({ logFilePath: "", totalLines: 0, shownLines: 0, content: "" });
   const [logFollow, setLogFollow] = useState(true);
-  const [logStreaming, setLogStreaming] = useState(true);
+  const [logStreaming, setLogStreaming] = useState(false);
   const [logFilter, setLogFilter] = useState("all");
   const [arrivingMessageIds, setArrivingMessageIds] = useState({});
   const [confirmDialog, setConfirmDialog] = useState(null);
@@ -624,6 +624,29 @@ export default function App() {
   }, [tab, logStreaming]);
 
   useEffect(() => {
+    if (tab !== "settings" || !logStreaming) return;
+
+    let cancelled = false;
+    const fetchEncounterActivity = async () => {
+      try {
+        const snapshot = await invoke("encounter_activity_snapshot");
+        if (!cancelled) {
+          setEncounterActivity(snapshot);
+        }
+      } catch {
+        // keep settings page responsive
+      }
+    };
+
+    fetchEncounterActivity();
+    const timer = setInterval(fetchEncounterActivity, 1500);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [tab, logStreaming]);
+
+  useEffect(() => {
     if (!logFollow || tab !== "settings") return;
     const el = logContainerRef.current;
     if (!el) return;
@@ -671,14 +694,12 @@ export default function App() {
   useEffect(() => {
     const timer = setInterval(async () => {
       try {
-        const [gossip, relay, encounter] = await Promise.all([
+        const [gossip, relay] = await Promise.all([
           invoke("gossip_status"),
-          invoke("relay_health_status"),
-          invoke("encounter_activity_snapshot")
+          invoke("relay_health_status")
         ]);
         setGossipStatus(gossip);
         setRelayHealth(relay);
-        setEncounterActivity(encounter);
         if (gossip.lastActivityMs > 0 || relay.chipState === "ok" || relay.chipState === "warn") {
           setNetworkPulseTs(Date.now());
         }
@@ -1702,6 +1723,9 @@ export default function App() {
                 <p className="text-xs text-muted-foreground">
                   See nearby discovery activity and which connection actually moved data.
                 </p>
+                <p className="text-xs text-muted-foreground">
+                  Live updates follow the "Live logs + encounter timeline" setting below.
+                </p>
               </CardHeader>
               <CardContent className="space-y-2 p-3 pt-1 text-sm text-muted-foreground">
                 <p data-testid="encounter-ble-status">{encounterActivity.bleDiscoveryStatus}</p>
@@ -1790,19 +1814,20 @@ export default function App() {
                     />
                     Auto-follow
                   </label>
+                  <label className="inline-flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={logStreaming}
+                      onChange={(event) => setLogStreaming(event.target.checked)}
+                    />
+                    Live logs + encounter timeline (may impact performance)
+                  </label>
                   <Button
                     size="sm"
                     variant="ghost"
                     onClick={async () => setLogTail(await invoke("read_app_log", { maxLines: 500 }))}
                   >
                     Refresh Logs
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    onClick={() => setLogStreaming((value) => !value)}
-                  >
-                    {logStreaming ? "Stop Live Logs" : "Start Live Logs"}
                   </Button>
                   <Button
                     size="sm"
