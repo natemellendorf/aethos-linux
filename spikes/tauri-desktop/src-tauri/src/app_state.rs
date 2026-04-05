@@ -11,11 +11,13 @@ use crate::relay::client::normalize_http_endpoint;
 
 const CHAT_HISTORY_FILE_NAME: &str = "chat-history.json";
 const APP_SETTINGS_FILE_NAME: &str = "settings.json";
+const ENCOUNTER_ACTIVITY_FILE_NAME: &str = "encounter-activity.json";
 const DEFAULT_RELAY_ENDPOINT: &str = "wss://aethos-relay.network";
 const DEFAULT_MESSAGE_TTL_SECONDS: u64 = 3600;
 const MIN_MESSAGE_TTL_SECONDS: u64 = 60;
 const MAX_MESSAGE_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 const DEFAULT_ENTER_TO_SEND: bool = true;
+pub const ENCOUNTER_ACTIVITY_RING_CAPACITY: usize = 80;
 
 fn default_enter_to_send() -> bool {
     DEFAULT_ENTER_TO_SEND
@@ -156,6 +158,79 @@ pub struct AppSettings {
     pub enter_to_send: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EncounterActivityCode {
+    BleDiscoveryObserved,
+    BleDiscoveryDeduped,
+    EncounterStarted,
+    TransferPathSelected,
+    TransferStarted,
+    TransferProgressed,
+    TransferFailed,
+    HandoffSucceeded,
+    HandoffInterrupted,
+    HandoffTimeout,
+    NoTransferPath,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EncounterActivityEvent {
+    pub seq: u64,
+    pub at_unix_ms: u64,
+    pub code: EncounterActivityCode,
+    pub message: String,
+    #[serde(default)]
+    pub discovery_bearer: Option<String>,
+    #[serde(default)]
+    pub transfer_bearer: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EncounterActivityState {
+    #[serde(default = "default_encounter_activity_next_seq")]
+    pub next_seq: u64,
+    #[serde(default)]
+    pub events: Vec<EncounterActivityEvent>,
+}
+
+impl Default for EncounterActivityState {
+    fn default() -> Self {
+        Self {
+            next_seq: 1,
+            events: Vec::new(),
+        }
+    }
+}
+
+impl EncounterActivityState {
+    pub fn record(
+        &mut self,
+        code: EncounterActivityCode,
+        at_unix_ms: u64,
+        message: String,
+        discovery_bearer: Option<&str>,
+        transfer_bearer: Option<&str>,
+    ) {
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.saturating_add(1);
+        self.events.push(EncounterActivityEvent {
+            seq,
+            at_unix_ms,
+            code,
+            message,
+            discovery_bearer: discovery_bearer.map(|value| value.to_string()),
+            transfer_bearer: transfer_bearer.map(|value| value.to_string()),
+        });
+        if self.events.len() > ENCOUNTER_ACTIVITY_RING_CAPACITY {
+            let trim = self.events.len() - ENCOUNTER_ACTIVITY_RING_CAPACITY;
+            self.events.drain(0..trim);
+        }
+    }
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
@@ -270,6 +345,44 @@ pub fn save_app_settings(settings: &AppSettings) -> Result<AppSettings, String> 
     Ok(normalized)
 }
 
+pub fn load_encounter_activity_state() -> Result<EncounterActivityState, String> {
+    let path = encounter_activity_file_path();
+    if !path.exists() {
+        return Ok(EncounterActivityState::default());
+    }
+
+    let content = fs::read_to_string(&path).map_err(|err| {
+        format!(
+            "failed reading encounter activity at {}: {err}",
+            path.display()
+        )
+    })?;
+    if content.trim().is_empty() {
+        let reset = EncounterActivityState::default();
+        save_encounter_activity_state(&reset)?;
+        return Ok(reset);
+    }
+
+    let mut state: EncounterActivityState = serde_json::from_str(&content).map_err(|err| {
+        format!(
+            "failed parsing encounter activity at {}: {err}",
+            path.display()
+        )
+    })?;
+    normalize_encounter_activity_state(&mut state);
+    Ok(state)
+}
+
+pub fn save_encounter_activity_state(state: &EncounterActivityState) -> Result<(), String> {
+    let mut normalized = state.clone();
+    normalize_encounter_activity_state(&mut normalized);
+    let path = encounter_activity_file_path();
+    ensure_parent_dir(&path)?;
+    let serialized = serde_json::to_string_pretty(&normalized)
+        .map_err(|err| format!("failed serializing encounter activity: {err}"))?;
+    atomic_write_string(&path, &serialized)
+}
+
 fn atomic_write_string(path: &Path, serialized: &str) -> Result<(), String> {
     ensure_parent_dir(path)?;
     let temp_path = path.with_extension(format!(
@@ -306,6 +419,20 @@ fn normalize_settings(settings: &mut AppSettings) {
 pub fn normalize_chat_state(chat: &mut PersistedChatState) {
     chat.new_contacts.sort();
     chat.new_contacts.dedup();
+}
+
+fn normalize_encounter_activity_state(state: &mut EncounterActivityState) {
+    if state.next_seq == 0 {
+        state.next_seq = state
+            .events
+            .last()
+            .map(|event| event.seq.saturating_add(1))
+            .unwrap_or(1);
+    }
+    if state.events.len() > ENCOUNTER_ACTIVITY_RING_CAPACITY {
+        let trim = state.events.len() - ENCOUNTER_ACTIVITY_RING_CAPACITY;
+        state.events.drain(0..trim);
+    }
 }
 
 fn ensure_parent_dir(path: &Path) -> Result<(), String> {
@@ -367,6 +494,10 @@ fn chat_history_file_path() -> PathBuf {
 
 fn app_settings_file_path() -> PathBuf {
     app_state_base_dir().join(APP_SETTINGS_FILE_NAME)
+}
+
+fn encounter_activity_file_path() -> PathBuf {
+    app_state_base_dir().join(ENCOUNTER_ACTIVITY_FILE_NAME)
 }
 
 pub fn now_unix_ms() -> u64 {
@@ -454,8 +585,58 @@ mod tests {
         let persisted = fs::read_to_string(chat_path).expect("read persisted chat");
         assert!(!persisted.trim().is_empty());
     }
+
+    #[test]
+    fn encounter_activity_ring_retains_recent_ordered_events() {
+        let mut state = EncounterActivityState::default();
+        for idx in 0..(ENCOUNTER_ACTIVITY_RING_CAPACITY + 6) {
+            state.record(
+                EncounterActivityCode::BleDiscoveryObserved,
+                idx as u64,
+                format!("event-{idx}"),
+                Some("ble-discovery"),
+                None,
+            );
+        }
+
+        assert_eq!(state.events.len(), ENCOUNTER_ACTIVITY_RING_CAPACITY);
+        assert_eq!(state.events.first().map(|event| event.seq), Some(7));
+        assert_eq!(
+            state.events.last().map(|event| event.message.as_str()),
+            Some("event-85")
+        );
+    }
+
+    #[test]
+    fn encounter_activity_file_roundtrip_persists_events() {
+        let _lock = shared_test_env_lock().lock().expect("lock");
+        let state_dir = unique_state_dir("aethos-encounter-activity");
+        let _guard = EnvVarGuard::set("AETHOS_STATE_DIR", &state_dir);
+        fs::create_dir_all(&state_dir).expect("mkdir");
+
+        let mut state = EncounterActivityState::default();
+        state.record(
+            EncounterActivityCode::TransferPathSelected,
+            99,
+            "Transfer path selected: relay connection".to_string(),
+            None,
+            Some("relay-websocket"),
+        );
+
+        save_encounter_activity_state(&state).expect("save encounter activity");
+        let loaded = load_encounter_activity_state().expect("load encounter activity");
+        assert_eq!(loaded.events.len(), 1);
+        assert_eq!(
+            loaded.events[0].message,
+            "Transfer path selected: relay connection"
+        );
+    }
 }
 
 fn default_message_ttl_seconds() -> u64 {
     DEFAULT_MESSAGE_TTL_SECONDS
+}
+
+fn default_encounter_activity_next_seq() -> u64 {
+    1
 }

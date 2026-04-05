@@ -5,8 +5,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUNTIME_ROOT="${XDG_RUNTIME_DIR:-/tmp}"
 STATE_DIR="${RUNTIME_ROOT}/aethos-linux-dev"
 LOG_DIR="${ROOT_DIR}/.dev/logs"
+APP_DIR="${ROOT_DIR}/spikes/tauri-desktop"
 
-APP_BIN="${ROOT_DIR}/target/debug/aethos"
+APP_CMD="cd \"${APP_DIR}\" && npm run tauri:dev"
 APP_LOG="${LOG_DIR}/app.log"
 APP_PID="${STATE_DIR}/app.pid"
 
@@ -21,7 +22,7 @@ NO_BUILD="0"
 
 usage() {
   cat <<'EOF'
-Aethos Linux local development lifecycle script
+Aethos local development lifecycle script (Tauri desktop)
 
 Usage:
   scripts/dev.sh <command> [options]
@@ -34,7 +35,7 @@ Commands:
   logs       Follow logs (app by default)
 
 Options:
-  --no-build            Skip cargo build for start/restart
+  --no-build            Skip dependency install for start/restart
   --service <name>      logs only: app|relay-primary|relay-secondary
   -h, --help            Show this help
 
@@ -135,13 +136,11 @@ cmd_start() {
   ensure_dirs
 
   if [[ "${NO_BUILD}" != "1" ]]; then
-    log "building debug binary"
-    cargo build --manifest-path "${ROOT_DIR}/Cargo.toml"
+    log "installing/updating Tauri desktop dependencies"
+    npm --prefix "${APP_DIR}" install
   fi
 
-  [[ -x "${APP_BIN}" ]] || fail "app binary not found at ${APP_BIN}; run without --no-build first"
-
-  start_managed "app" "\"${APP_BIN}\"" "${APP_LOG}" "${APP_PID}"
+  start_managed "app" "${APP_CMD}" "${APP_LOG}" "${APP_PID}"
   start_managed "relay-primary" "${RELAY1_CMD}" "${RELAY1_LOG}" "${RELAY1_PID}"
   start_managed "relay-secondary" "${RELAY2_CMD}" "${RELAY2_LOG}" "${RELAY2_PID}"
 }

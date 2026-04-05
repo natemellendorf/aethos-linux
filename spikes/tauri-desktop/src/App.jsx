@@ -35,6 +35,19 @@ const TABS = [
 
 const emptyRelay = { chipText: "Relays: idle", chipState: "idle", primaryStatus: "idle", secondaryStatus: "idle" };
 const emptyGossip = { enabled: false, running: false, lastActivityMs: 0, lastEvent: "unknown" };
+const emptyEncounterActivity = {
+  bleDiscoveryStatus: "Checking BLE discovery status...",
+  lastBleSightingUnixMs: null,
+  recentBleSightingsCount: 0,
+  lastBleTriggeredEncounterUnixMs: null,
+  lastTransferBearer: null,
+  lastDiscoveryBearer: null,
+  lastTransferProgressMessage: null,
+  lastTransferProgressUnixMs: null,
+  noTransferPathMessage: null,
+  noTransferPathUnixMs: null,
+  events: []
+};
 const LOG_FILTERS = {
   all: [],
   errors: ["failed", "error", "rejected", "panic"],
@@ -54,6 +67,16 @@ function tinyId(id = "") {
   if (!id) return "-";
   if (id.length <= 24) return id;
   return `${id.slice(0, 10)}...${id.slice(-8)}`;
+}
+
+function formatActivityTime(unixMs) {
+  const value = Number(unixMs || 0);
+  if (!Number.isFinite(value) || value <= 0) return "none yet";
+  return new Date(value).toLocaleTimeString([], {
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit"
+  });
 }
 
 function formatMessageTimestamp(message) {
@@ -280,6 +303,7 @@ export default function App() {
   const [copyToast, setCopyToast] = useState("");
   const [relayHealth, setRelayHealth] = useState(emptyRelay);
   const [gossipStatus, setGossipStatus] = useState(emptyGossip);
+  const [encounterActivity, setEncounterActivity] = useState(emptyEncounterActivity);
   const [shareQr, setShareQr] = useState(null);
   const [diagnostics, setDiagnostics] = useState(null);
   const [composer, setComposer] = useState("");
@@ -424,11 +448,12 @@ export default function App() {
   const runBootstrap = async () => {
     const startedAt = Date.now();
     try {
-      const [boot, diag, gossip, relay, log] = await Promise.all([
+      const [boot, diag, gossip, relay, encounter, log] = await Promise.all([
         invoke("bootstrap_state"),
         invoke("app_diagnostics"),
         invoke("gossip_status"),
         invoke("relay_health_status"),
+        invoke("encounter_activity_snapshot"),
         invoke("read_app_log", { maxLines: 500 })
       ]);
       setIdentity(boot.identity);
@@ -443,6 +468,7 @@ export default function App() {
       setDiagnostics(diag);
       setGossipStatus(gossip);
       setRelayHealth(relay);
+      setEncounterActivity(encounter);
       setLogTail(log);
       setStatus("Ready");
       setNetworkPulseTs(Date.now());
@@ -645,9 +671,14 @@ export default function App() {
   useEffect(() => {
     const timer = setInterval(async () => {
       try {
-        const [gossip, relay] = await Promise.all([invoke("gossip_status"), invoke("relay_health_status")]);
+        const [gossip, relay, encounter] = await Promise.all([
+          invoke("gossip_status"),
+          invoke("relay_health_status"),
+          invoke("encounter_activity_snapshot")
+        ]);
         setGossipStatus(gossip);
         setRelayHealth(relay);
+        setEncounterActivity(encounter);
         if (gossip.lastActivityMs > 0 || relay.chipState === "ok" || relay.chipState === "warn") {
           setNetworkPulseTs(Date.now());
         }
@@ -1664,6 +1695,69 @@ export default function App() {
               </CardContent>
               </Card>
             </div>
+
+            <Card data-testid="settings-encounter-activity">
+              <CardHeader className="p-3 pb-1">
+                <CardTitle className="text-base">BLE & Encounter Activity</CardTitle>
+                <p className="text-xs text-muted-foreground">
+                  See nearby discovery activity and which connection actually moved data.
+                </p>
+              </CardHeader>
+              <CardContent className="space-y-2 p-3 pt-1 text-sm text-muted-foreground">
+                <p data-testid="encounter-ble-status">{encounterActivity.bleDiscoveryStatus}</p>
+                <p>
+                  Last BLE sighting: <span className="text-foreground">{formatActivityTime(encounterActivity.lastBleSightingUnixMs)}</span>
+                </p>
+                <p>
+                  Recent nearby discoveries (10m): <span className="text-foreground">{encounterActivity.recentBleSightingsCount}</span>
+                </p>
+                <p>
+                  Last BLE-triggered encounter: <span className="text-foreground">{formatActivityTime(encounterActivity.lastBleTriggeredEncounterUnixMs)}</span>
+                </p>
+                <p>
+                  Last transfer bearer: <span className="text-foreground">{encounterActivity.lastTransferBearer || "unknown"}</span>
+                  {encounterActivity.lastDiscoveryBearer ? (
+                    <span className="text-muted-foreground"> (discovery: {encounterActivity.lastDiscoveryBearer})</span>
+                  ) : (
+                    <span className="text-muted-foreground"> (discovery: not BLE-triggered)</span>
+                  )}
+                </p>
+                <p>
+                  Last transfer progress: <span className="text-foreground">{encounterActivity.lastTransferProgressMessage || "none yet"}</span>
+                  {encounterActivity.lastTransferProgressUnixMs ? (
+                    <span className="text-muted-foreground"> at {formatActivityTime(encounterActivity.lastTransferProgressUnixMs)}</span>
+                  ) : null}
+                </p>
+                <p>
+                  No transfer path available: <span className="text-foreground">{encounterActivity.noTransferPathMessage || "none recently"}</span>
+                  {encounterActivity.noTransferPathUnixMs ? (
+                    <span className="text-muted-foreground"> at {formatActivityTime(encounterActivity.noTransferPathUnixMs)}</span>
+                  ) : null}
+                </p>
+
+                <div className="rounded border border-border/50 bg-background/30 p-2 text-xs">
+                  <p className="mb-1 font-semibold text-foreground">Recent activity timeline</p>
+                  {Array.isArray(encounterActivity.events) && encounterActivity.events.length > 0 ? (
+                    <div className="max-h-52 overflow-auto space-y-1" data-testid="encounter-activity-timeline">
+                      {encounterActivity.events.map((event) => (
+                        <div key={`${event.seq}-${event.atUnixMs}`} className="rounded border border-border/40 bg-background/50 p-1.5">
+                          <p className="text-foreground">{event.message}</p>
+                          <p className="text-muted-foreground">
+                            {formatActivityTime(event.atUnixMs)}
+                            {event.transferBearer ? ` · transfer: ${event.transferBearer}` : ""}
+                            {event.discoveryBearer ? ` · discovery: ${event.discoveryBearer}` : ""}
+                          </p>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-muted-foreground" data-testid="encounter-activity-empty">
+                      Waiting for BLE or encounter activity.
+                    </p>
+                  )}
+                </div>
+              </CardContent>
+            </Card>
 
             <Card>
               <CardHeader className="p-3 pb-1">

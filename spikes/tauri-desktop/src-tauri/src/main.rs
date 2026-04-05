@@ -31,9 +31,11 @@ use app_body::{
     ClassificationOutcome, OutboundMediaAsset, OutboundMediaManifestInput,
 };
 use app_state::{
-    load_app_settings, load_chat_state, normalize_chat_state, now_unix_ms, now_unix_secs,
-    save_app_settings, save_chat_state, AppSettings, ChatAttachment, ChatDirection,
-    ChatMediaTransfer, ChatMessage, MediaTransferStatus, OutboundState, PersistedChatState,
+    load_app_settings, load_chat_state, load_encounter_activity_state, normalize_chat_state,
+    now_unix_ms, now_unix_secs, save_app_settings, save_chat_state, save_encounter_activity_state,
+    AppSettings, ChatAttachment, ChatDirection, ChatMediaTransfer, ChatMessage,
+    EncounterActivityCode, EncounterActivityEvent, EncounterActivityState, MediaTransferStatus,
+    OutboundState, PersistedChatState,
 };
 use base64::Engine;
 use image::{imageops::FilterType, ImageBuffer, Luma, Rgba, RgbaImage};
@@ -44,13 +46,13 @@ use socket2::{Domain, Protocol, Socket, Type};
 use tauri::Emitter;
 use url::Url;
 
-use crate::aethos_core::gossip_sync::record_local_payload as gossip_record_local_payload;
 use crate::aethos_core::ble_discovery::{
     discovery_adapter_from_env, BleDiscoveryGate, BleDiscoverySource, DiscoverySignal,
 };
 use crate::aethos_core::encounter_orchestration::{
     BearerAdapter, EncounterManager, TransitionReason,
 };
+use crate::aethos_core::gossip_sync::record_local_payload as gossip_record_local_payload;
 use crate::aethos_core::gossip_sync::{
     build_hello_frame as build_gossip_hello_frame,
     build_relay_ingest_frame as build_gossip_relay_ingest_frame,
@@ -115,6 +117,8 @@ const GOSSIP_UDP_SOCKET_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 const E2E_UDP_TRANSFER_FRAME_MAX_BYTES_DEFAULT: usize = 32 * 1024;
 const UDP_TRANSFER_FRAME_HARD_MAX_BYTES: usize = 65_507;
 const E2E_MEDIA_HOUSEKEEPING_MIN_INTERVAL_MS_DEFAULT: u64 = 2_000;
+const RECENT_BLE_SIGHTINGS_WINDOW_MS: u64 = 10 * 60 * 1000;
+const RECENT_ENCOUNTER_ACTIVITY_LIMIT: usize = 20;
 
 fn lan_fallback_transfer_max_bytes() -> u64 {
     std::env::var("AETHOS_LAN_FALLBACK_TRANSFER_MAX_BYTES")
@@ -552,6 +556,38 @@ struct GossipStatus {
 static GOSSIP_RUNTIME: OnceLock<GossipRuntime> = OnceLock::new();
 static APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
 static RELAY_WORKER_RUNTIME: OnceLock<RelayWorkerRuntime> = OnceLock::new();
+static ENCOUNTER_ACTIVITY_RUNTIME: OnceLock<EncounterActivityRuntime> = OnceLock::new();
+
+struct EncounterActivityRuntime {
+    state: Mutex<EncounterActivityState>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EncounterActivityViewEvent {
+    seq: u64,
+    at_unix_ms: u64,
+    code: String,
+    message: String,
+    discovery_bearer: Option<String>,
+    transfer_bearer: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EncounterActivitySnapshot {
+    ble_discovery_status: String,
+    last_ble_sighting_unix_ms: Option<u64>,
+    recent_ble_sightings_count: usize,
+    last_ble_triggered_encounter_unix_ms: Option<u64>,
+    last_transfer_bearer: Option<String>,
+    last_discovery_bearer: Option<String>,
+    last_transfer_progress_message: Option<String>,
+    last_transfer_progress_unix_ms: Option<u64>,
+    no_transfer_path_message: Option<String>,
+    no_transfer_path_unix_ms: Option<u64>,
+    events: Vec<EncounterActivityViewEvent>,
+}
 
 struct RelayWorkerRuntime {
     running: AtomicBool,
@@ -579,6 +615,48 @@ impl RelayWorkerRuntime {
 
 fn relay_worker_runtime() -> &'static RelayWorkerRuntime {
     RELAY_WORKER_RUNTIME.get_or_init(RelayWorkerRuntime::new)
+}
+
+fn encounter_activity_runtime() -> &'static EncounterActivityRuntime {
+    ENCOUNTER_ACTIVITY_RUNTIME.get_or_init(|| EncounterActivityRuntime {
+        state: Mutex::new(load_encounter_activity_state().unwrap_or_default()),
+    })
+}
+
+fn encounter_activity_record(
+    code: EncounterActivityCode,
+    message: impl Into<String>,
+    discovery_bearer: Option<&str>,
+    transfer_bearer: Option<&str>,
+    at_unix_ms: u64,
+) {
+    let snapshot = {
+        let runtime = encounter_activity_runtime();
+        let mut guard = runtime
+            .state
+            .lock()
+            .expect("encounter activity state lock poisoned");
+        guard.record(
+            code,
+            at_unix_ms,
+            message.into(),
+            discovery_bearer,
+            transfer_bearer,
+        );
+        guard.clone()
+    };
+
+    if let Err(err) = save_encounter_activity_state(&snapshot) {
+        log_verbose(&format!("encounter_activity_persist_failed: {err}"));
+    }
+}
+
+fn encounter_activity_snapshot_state() -> EncounterActivityState {
+    encounter_activity_runtime()
+        .state
+        .lock()
+        .expect("encounter activity state lock poisoned")
+        .clone()
 }
 
 fn set_relay_worker_status(status: &str) {
@@ -982,6 +1060,137 @@ fn gossip_announce_now() -> GossipStatus {
         set_gossip_event("announce queued");
     }
     current_gossip_status()
+}
+
+#[tauri::command]
+fn encounter_activity_snapshot() -> Result<EncounterActivitySnapshot, String> {
+    let settings = load_app_settings()?;
+    let state = encounter_activity_snapshot_state();
+    Ok(build_encounter_activity_snapshot(
+        &state.events,
+        settings.gossip_sync_enabled,
+        now_unix_ms(),
+        ble_discovery_env_disabled(),
+    ))
+}
+
+fn build_encounter_activity_snapshot(
+    events: &[EncounterActivityEvent],
+    gossip_sync_enabled: bool,
+    now_ms: u64,
+    ble_env_disabled: bool,
+) -> EncounterActivitySnapshot {
+    let ble_discovery_status = if ble_env_disabled {
+        "BLE discovery inactive (disabled by environment)".to_string()
+    } else if gossip_sync_enabled {
+        "BLE discovery active".to_string()
+    } else {
+        "BLE discovery inactive (local network transfer disabled)".to_string()
+    };
+
+    let last_ble_sighting_unix_ms = events
+        .iter()
+        .rev()
+        .find(|event| event.code == EncounterActivityCode::BleDiscoveryObserved)
+        .map(|event| event.at_unix_ms);
+
+    let recent_ble_sightings_count = events
+        .iter()
+        .filter(|event| {
+            event.code == EncounterActivityCode::BleDiscoveryObserved
+                && now_ms.saturating_sub(event.at_unix_ms) <= RECENT_BLE_SIGHTINGS_WINDOW_MS
+        })
+        .count();
+
+    let last_ble_triggered_encounter_unix_ms = events
+        .iter()
+        .rev()
+        .find(|event| event.code == EncounterActivityCode::EncounterStarted)
+        .map(|event| event.at_unix_ms);
+
+    let latest_transfer_event = events.iter().rev().find(|event| {
+        event.code == EncounterActivityCode::TransferPathSelected
+            || event.code == EncounterActivityCode::TransferStarted
+            || event.code == EncounterActivityCode::TransferProgressed
+            || event.code == EncounterActivityCode::HandoffSucceeded
+    });
+
+    let last_transfer_bearer = latest_transfer_event
+        .and_then(|event| event.transfer_bearer.as_deref())
+        .map(friendly_bearer_label)
+        .map(str::to_string);
+
+    let last_discovery_bearer = latest_transfer_event
+        .and_then(|event| event.discovery_bearer.as_deref())
+        .map(friendly_bearer_label)
+        .map(str::to_string);
+
+    let last_transfer_progress = events.iter().rev().find(|event| {
+        event.code == EncounterActivityCode::TransferProgressed
+            || event.code == EncounterActivityCode::HandoffSucceeded
+    });
+
+    let last_transfer_progress_message = last_transfer_progress.map(|event| event.message.clone());
+    let last_transfer_progress_unix_ms = last_transfer_progress.map(|event| event.at_unix_ms);
+
+    let no_transfer_path = events
+        .iter()
+        .rev()
+        .find(|event| event.code == EncounterActivityCode::NoTransferPath);
+    let no_transfer_path_message = no_transfer_path.map(|event| event.message.clone());
+    let no_transfer_path_unix_ms = no_transfer_path.map(|event| event.at_unix_ms);
+
+    let events = events
+        .iter()
+        .rev()
+        .take(RECENT_ENCOUNTER_ACTIVITY_LIMIT)
+        .map(|event| EncounterActivityViewEvent {
+            seq: event.seq,
+            at_unix_ms: event.at_unix_ms,
+            code: format!("{:?}", event.code),
+            message: event.message.clone(),
+            discovery_bearer: event
+                .discovery_bearer
+                .as_deref()
+                .map(friendly_bearer_label)
+                .map(str::to_string),
+            transfer_bearer: event
+                .transfer_bearer
+                .as_deref()
+                .map(friendly_bearer_label)
+                .map(str::to_string),
+        })
+        .collect::<Vec<_>>();
+
+    EncounterActivitySnapshot {
+        ble_discovery_status,
+        last_ble_sighting_unix_ms,
+        recent_ble_sightings_count,
+        last_ble_triggered_encounter_unix_ms,
+        last_transfer_bearer,
+        last_discovery_bearer,
+        last_transfer_progress_message,
+        last_transfer_progress_unix_ms,
+        no_transfer_path_message,
+        no_transfer_path_unix_ms,
+        events,
+    }
+}
+
+fn friendly_bearer_label(raw: &str) -> &'static str {
+    match raw {
+        "ble-bootstrap" | "ble-discovery" => "BLE discovery",
+        "lan-datagram" | "local-network" => "Local network",
+        "relay-websocket" | "relay" => "Relay connection",
+        _ => "Unknown",
+    }
+}
+
+fn ble_discovery_env_disabled() -> bool {
+    std::env::var("AETHOS_DISABLE_BLE")
+        .ok()
+        .map(|value| value.trim() == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 #[tauri::command]
@@ -1436,12 +1645,27 @@ fn send_message_blocking(request: SendMessageRequest) -> Result<SendMessageRespo
         .cloned()
         .map(|endpoint| normalize_http_endpoint(&endpoint));
     let relay_enabled = settings.relay_sync_enabled && relay_http.is_some();
+    let gossip_enabled = settings.gossip_sync_enabled;
 
     let mut encounter_status = "message queued locally (LAN-only)".to_string();
     let pulled_messages_count = 0usize;
 
     if relay_enabled {
         let relay_ws = to_ws_endpoint(relay_http.as_deref().unwrap_or_default());
+        encounter_activity_record(
+            EncounterActivityCode::TransferPathSelected,
+            "Transfer path selected: relay connection",
+            None,
+            Some("relay"),
+            now_ms,
+        );
+        encounter_activity_record(
+            EncounterActivityCode::TransferStarted,
+            "Transfer started over relay connection",
+            None,
+            Some("relay"),
+            now_ms,
+        );
         request_relay_sync("send_message");
         encounter_status =
             if let Some(active) = relay_session_snapshot(&relay_ws, &identity.wayfarer_id) {
@@ -1454,6 +1678,24 @@ fn send_message_blocking(request: SendMessageRequest) -> Result<SendMessageRespo
             };
         mark_outgoing_message(&mut chat, wayfarer_id, &local_id, &item_id, None);
     } else {
+        if gossip_enabled {
+            encounter_activity_record(
+                EncounterActivityCode::TransferPathSelected,
+                "Transfer path selected: local network",
+                None,
+                Some("local-network"),
+                now_ms,
+            );
+        } else {
+            encounter_activity_record(
+                EncounterActivityCode::NoTransferPath,
+                "No transfer path available: relay and local network transfer are off",
+                None,
+                None,
+                now_ms,
+            );
+            encounter_status = "message queued locally; no transfer path available".to_string();
+        }
         mark_outgoing_message(&mut chat, wayfarer_id, &local_id, &item_id, None);
     }
 
@@ -2124,6 +2366,23 @@ fn start_relay_worker_if_needed() {
                                                 }
 
                                                 if transferred > 0 || pulled > 0 {
+                                                    encounter_activity_record(
+                                                        EncounterActivityCode::TransferProgressed,
+                                                        format!(
+                                                            "Transfer progressed over relay ({} transfer(s), {} received)",
+                                                            transferred, pulled
+                                                        ),
+                                                        None,
+                                                        Some("relay"),
+                                                        now_unix_ms(),
+                                                    );
+                                                    encounter_activity_record(
+                                                        EncounterActivityCode::HandoffSucceeded,
+                                                        "Discovery led to successful transfer over relay",
+                                                        None,
+                                                        Some("relay"),
+                                                        now_unix_ms(),
+                                                    );
                                                     saw_inbound_activity = true;
                                                     set_relay_worker_status(&format!(
                                                         "active slot={} relay={} transfers={} pulled={}",
@@ -2292,6 +2551,33 @@ fn start_relay_worker_if_needed() {
                         "relay_worker_sync_success: slot={} relay_ws={} transfers={} pulled={}",
                         relay_slot, relay_ws, report.transferred_items, pulled
                     ));
+                    if report.transferred_items > 0 || pulled > 0 {
+                        encounter_activity_record(
+                            EncounterActivityCode::TransferProgressed,
+                            format!(
+                                "Transfer progressed over relay ({} transfer(s), {} received)",
+                                report.transferred_items, pulled
+                            ),
+                            None,
+                            Some("relay"),
+                            now_unix_ms(),
+                        );
+                        encounter_activity_record(
+                            EncounterActivityCode::HandoffSucceeded,
+                            "Discovery led to successful transfer over relay",
+                            None,
+                            Some("relay"),
+                            now_unix_ms(),
+                        );
+                    } else {
+                        encounter_activity_record(
+                            EncounterActivityCode::HandoffTimeout,
+                            "Relay path opened, but no transfer progress was seen",
+                            None,
+                            Some("relay"),
+                            now_unix_ms(),
+                        );
+                    }
                     if report.remote_closed {
                         if let Some(session) = relay_sessions[relay_slot].take() {
                             close_relay_persistent_session(session, "remote_closed");
@@ -2324,6 +2610,23 @@ fn start_relay_worker_if_needed() {
                         err,
                         backoff_secs.min(60)
                     ));
+                    encounter_activity_record(
+                        EncounterActivityCode::TransferFailed,
+                        format!(
+                            "Relay transfer failed: {}",
+                            truncate_activity_message(&err, 96)
+                        ),
+                        None,
+                        Some("relay"),
+                        now_unix_ms(),
+                    );
+                    encounter_activity_record(
+                        EncounterActivityCode::HandoffInterrupted,
+                        "Relay transfer interrupted; waiting for next path",
+                        None,
+                        Some("relay"),
+                        now_unix_ms(),
+                    );
                 }
             }
         }
@@ -2556,12 +2859,24 @@ fn process_ble_discovery_signals(
         }
     };
     let now_ms = now_unix_ms();
-    let ready = gate.poll_ready(adapter, now_ms);
-    if ready.is_empty() {
+    let gate_result = gate.poll_ready_with_stats(adapter, now_ms);
+    if gate_result.deduped_count > 0 {
+        encounter_activity_record(
+            EncounterActivityCode::BleDiscoveryDeduped,
+            format!(
+                "Nearby discovery repeated {} time(s); duplicates hidden",
+                gate_result.deduped_count
+            ),
+            Some("ble-discovery"),
+            None,
+            now_ms,
+        );
+    }
+    if gate_result.ready.is_empty() {
         return;
     }
 
-    for signal in ready {
+    for signal in gate_result.ready {
         handle_ble_discovery_signal(encounters, &identity.wayfarer_id, &signal, runtime);
     }
 }
@@ -2582,14 +2897,38 @@ fn handle_ble_discovery_signal(
     });
 
     encounter.observe_discovery(BearerAdapter::BleBootstrap, signal.observed_at_unix_ms);
+    encounter_activity_record(
+        EncounterActivityCode::BleDiscoveryObserved,
+        format!(
+            "Nearby peer discovered over BLE ({})",
+            summarize_peer_hint_for_activity(&peer_hint)
+        ),
+        Some("ble-discovery"),
+        None,
+        signal.observed_at_unix_ms,
+    );
     encounter.start_control_exchange(
         BearerAdapter::LanDatagram,
         TransitionReason::BleDiscovery,
         signal.observed_at_unix_ms,
     );
+    encounter_activity_record(
+        EncounterActivityCode::EncounterStarted,
+        "Encounter started from BLE discovery",
+        Some("ble-discovery"),
+        Some("local-network"),
+        signal.observed_at_unix_ms,
+    );
     encounter.set_transfer_bearer(
         BearerAdapter::LanDatagram,
         TransitionReason::BleDiscovery,
+        signal.observed_at_unix_ms,
+    );
+    encounter_activity_record(
+        EncounterActivityCode::TransferPathSelected,
+        "Transfer path selected: local network (discovered via BLE)",
+        Some("ble-discovery"),
+        Some("local-network"),
         signal.observed_at_unix_ms,
     );
     log_verbose(&format!(
@@ -2622,6 +2961,26 @@ fn sanitize_ble_peer_hint(peer_hint: &str) -> String {
     } else {
         compact
     }
+}
+
+fn summarize_peer_hint_for_activity(peer_hint: &str) -> String {
+    let normalized = sanitize_ble_peer_hint(peer_hint);
+    if normalized.len() <= 16 {
+        return normalized;
+    }
+    format!("{}...", &normalized[..16])
+}
+
+fn truncate_activity_message(input: &str, max_chars: usize) -> String {
+    if input.chars().count() <= max_chars {
+        return input.to_string();
+    }
+    let mut out = String::new();
+    for ch in input.chars().take(max_chars.saturating_sub(3)) {
+        out.push(ch);
+    }
+    out.push_str("...");
+    out
 }
 
 fn bind_gossip_socket() -> Result<UdpSocket, String> {
@@ -3028,6 +3387,23 @@ fn handle_gossip_frame(
             }
 
             if imported_count > 0 {
+                encounter_activity_record(
+                    EncounterActivityCode::TransferProgressed,
+                    format!(
+                        "Transfer progressed on local network ({} message(s) received)",
+                        imported_count
+                    ),
+                    None,
+                    Some("local-network"),
+                    now_unix_ms(),
+                );
+                encounter_activity_record(
+                    EncounterActivityCode::HandoffSucceeded,
+                    "Discovery led to successful local network transfer",
+                    None,
+                    Some("local-network"),
+                    now_unix_ms(),
+                );
                 let merge_started = Instant::now();
                 let mut chat = load_chat_state()?;
                 let mut contacts = load_contact_aliases()?;
@@ -4796,6 +5172,7 @@ pub fn run() {
             sync_inbox,
             gossip_status,
             gossip_announce_now,
+            encounter_activity_snapshot,
             relay_health_status,
             generate_share_qr,
             decode_wayfarer_id_from_qr_bytes,
@@ -5120,6 +5497,68 @@ mod tests {
             }
             other => panic!("expected REQUEST frame, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn encounter_activity_snapshot_distinguishes_discovery_vs_transfer() {
+        let events = vec![
+            EncounterActivityEvent {
+                seq: 1,
+                at_unix_ms: 1_000,
+                code: EncounterActivityCode::BleDiscoveryObserved,
+                message: "Nearby peer discovered over BLE".to_string(),
+                discovery_bearer: Some("ble-discovery".to_string()),
+                transfer_bearer: None,
+            },
+            EncounterActivityEvent {
+                seq: 2,
+                at_unix_ms: 1_200,
+                code: EncounterActivityCode::TransferPathSelected,
+                message: "Transfer path selected: local network".to_string(),
+                discovery_bearer: Some("ble-discovery".to_string()),
+                transfer_bearer: Some("local-network".to_string()),
+            },
+            EncounterActivityEvent {
+                seq: 3,
+                at_unix_ms: 1_300,
+                code: EncounterActivityCode::TransferProgressed,
+                message: "Transfer progressed on local network".to_string(),
+                discovery_bearer: None,
+                transfer_bearer: Some("local-network".to_string()),
+            },
+        ];
+
+        let snapshot = build_encounter_activity_snapshot(&events, true, 1_350, false);
+        assert_eq!(snapshot.ble_discovery_status, "BLE discovery active");
+        assert_eq!(snapshot.recent_ble_sightings_count, 1);
+        assert_eq!(
+            snapshot.last_transfer_bearer.as_deref(),
+            Some("Local network")
+        );
+        assert_eq!(
+            snapshot.last_transfer_progress_message.as_deref(),
+            Some("Transfer progressed on local network")
+        );
+    }
+
+    #[test]
+    fn encounter_activity_snapshot_surfaces_no_transfer_path() {
+        let events = vec![EncounterActivityEvent {
+            seq: 7,
+            at_unix_ms: 5_000,
+            code: EncounterActivityCode::NoTransferPath,
+            message: "No transfer path available: relay and local network transfer are off"
+                .to_string(),
+            discovery_bearer: None,
+            transfer_bearer: None,
+        }];
+
+        let snapshot = build_encounter_activity_snapshot(&events, false, 6_000, false);
+        assert_eq!(
+            snapshot.no_transfer_path_message.as_deref(),
+            Some("No transfer path available: relay and local network transfer are off")
+        );
+        assert_eq!(snapshot.no_transfer_path_unix_ms, Some(5_000));
     }
 
     #[test]

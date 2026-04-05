@@ -1,8 +1,8 @@
 # Tauri Desktop Rewrite Track
 
-This directory is the active Tauri rewrite track for the desktop client.
+This directory is the active and only desktop client implementation.
 
-The GTK implementation remains in `src/main.rs` during migration, but this path is now the target for cross-platform GUI delivery.
+The legacy GTK desktop UI has been retired. Use this Tauri app for Linux/macOS/Windows desktop delivery.
 
 ## Goals
 

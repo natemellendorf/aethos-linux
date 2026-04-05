@@ -4,7 +4,7 @@
 
 # aethos-client
 
-Cross-platform desktop client for Aethos (Linux, macOS, Windows).
+Cross-platform desktop client for Aethos (Linux, macOS, Windows) using Tauri.
 
 ## Install
 
@@ -23,8 +23,7 @@ powershell -ExecutionPolicy Bypass -Command "$tmp = Join-Path $env:TEMP 'install
 This installer will:
 
 - download the selected release artifact from GitHub for the local OS/arch
-- install the binary to your local bin directory as `aethos` (with compatibility alias `aethos-linux`)
-- on macOS, validate Homebrew + `gtk4` runtime availability (and fail with install guidance if missing)
+- install the desktop client artifacts for your OS/arch
 
 By default, if `--ref` is not provided, installers resolve the latest official GitHub release tag and download a prebuilt binary artifact for the local OS/arch.
 
@@ -136,12 +135,16 @@ src/
   relay/
     mod.rs
     client.rs
-  main.rs
+
+spikes/
+  tauri-desktop/
+    src/
+    src-tauri/
 ```
 
 ## Prerequisites (source build)
 
-If building from source, install Rust and platform GTK4 development/runtime dependencies.
+If building from source, install Rust and Tauri prerequisites.
 
 Ubuntu/Debian example:
 
@@ -150,8 +153,9 @@ sudo apt update
 sudo apt install -y \
   build-essential \
   pkg-config \
-  libgtk-4-dev \
-  libglib2.0-dev \
+  libwebkit2gtk-4.1-dev \
+  libayatana-appindicator3-dev \
+  librsvg2-dev \
   curl
 
 curl https://sh.rustup.rs -sSf | sh -s -- -y
@@ -160,24 +164,22 @@ source "$HOME/.cargo/env"
 
 ## Build, run, and test
 
-From this repository root:
+From the Tauri desktop directory:
 
 ```bash
-# Compile
-cargo build
+cd spikes/tauri-desktop
 
-# Run the GUI app
-cargo run --bin aethos
+# Install web dependencies
+npm install
 
-# Run installed binary
-aethos
+# Run desktop app in development mode
+npm run tauri:dev
 
-# Run tests
-cargo test
+# Build desktop bundle
+npm run tauri:build
 
-# Formatting / lint checks
-cargo fmt --all
-cargo clippy --all-targets --all-features -- -D warnings
+# Run backend tests
+cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
 ## Local dev lifecycle script
